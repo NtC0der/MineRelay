@@ -1,0 +1,110 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <!-- Squircle Background Gradient -->
+    <linearGradient id="bgGrad" x1="12" y1="8" x2="116" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#111a2e"/>
+      <stop offset="55%" stop-color="#0a101d"/>
+      <stop offset="100%" stop-color="#060911"/>
+    </linearGradient>
+
+    <!-- Squircle Rim Specular Gradient -->
+    <linearGradient id="rimGrad" x1="16" y1="8" x2="112" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34d399" stop-opacity="0.65"/>
+      <stop offset="45%" stop-color="#38bdf8" stop-opacity="0.28"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0.45"/>
+    </linearGradient>
+
+    <!-- Ambient Core Radial Glow -->
+    <radialGradient id="coreGlow" cx="64" cy="64" r="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.38"/>
+      <stop offset="55%" stop-color="#38bdf8" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#070a12" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Cube Top Face (Bright Mint Emerald) -->
+    <linearGradient id="cubeTop" x1="64" y1="24" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#a7f3d0"/>
+      <stop offset="35%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+
+    <!-- Cube Left Face (Vibrant Emerald) -->
+    <linearGradient id="cubeLeft" x1="29" y1="44" x2="64" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="45%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+
+    <!-- Cube Right Face (Deep Obsidian Emerald) -->
+    <linearGradient id="cubeRight" x1="99" y1="44" x2="64" y2="104" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="50%" stop-color="#059669"/>
+      <stop offset="100%" stop-color="#064e3b"/>
+    </linearGradient>
+
+    <!-- Relay Orbit Gradient -->
+    <linearGradient id="orbitGrad" x1="14" y1="78" x2="114" y2="50" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="50%" stop-color="#6ee7b7"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+
+    <!-- Soft Drop Shadow for Cube -->
+    <filter id="cubeShadow" x="12" y="14" width="104" height="104" filterUnits="userSpaceOnUse">
+      <feDropShadow dx="0" dy="6" stdDeviation="6" flood-color="#020617" flood-opacity="0.7"/>
+    </filter>
+  </defs>
+
+  <!-- Outer App Squircle Base -->
+  <rect x="6" y="6" width="116" height="116" rx="28" fill="url(#bgGrad)"/>
+  <rect x="7" y="7" width="114" height="114" rx="27" stroke="url(#rimGrad)" stroke-width="2"/>
+
+  <!-- Subtle Inner Grid / Ambient Glow -->
+  <circle cx="64" cy="64" r="48" fill="url(#coreGlow)"/>
+
+  <!-- Back Half of Relay Orbit Ring (Behind Cube) -->
+  <path d="M 18 74 A 49 18 -16 0 1 110 50" stroke="url(#orbitGrad)" stroke-width="3" stroke-linecap="round" stroke-dasharray="5 5" opacity="0.45"/>
+
+  <!-- Isometric Voxel Cube ("Mine") -->
+  <g filter="url(#cubeShadow)">
+    <!-- Top Diamond Facet -->
+    <polygon points="64,24 98,44 64,64 30,44" fill="url(#cubeTop)"/>
+    <!-- Inner Top Crystalline Inlay -->
+    <polygon points="64,32 85,44 64,56 43,44" fill="#064e3b" fill-opacity="0.32" stroke="#d1fae5" stroke-width="1.2" stroke-opacity="0.65"/>
+    <polygon points="64,37 76,44 64,51 52,44" fill="#ecfdf5" fill-opacity="0.85"/>
+
+    <!-- Left Facet -->
+    <polygon points="30,44 64,64 64,103 30,83" fill="url(#cubeLeft)"/>
+    <!-- Left Voxel Detail Slots -->
+    <polygon points="38,56 56,66.5 56,73.5 38,63" fill="#064e3b" fill-opacity="0.45"/>
+    <polygon points="38,69 50,76 50,83 38,76" fill="#a7f3d0" fill-opacity="0.75"/>
+
+    <!-- Right Facet -->
+    <polygon points="64,64 98,44 98,83 64,103" fill="url(#cubeRight)"/>
+    <!-- Right Voxel Relay Nodes -->
+    <polygon points="90,56 72,66.5 72,73.5 90,63" fill="#022c22" fill-opacity="0.55"/>
+    <polygon points="90,69 78,76 78,83 90,76" fill="#38bdf8" fill-opacity="0.75"/>
+
+    <!-- Specular Isometric Y-Edges -->
+    <polyline points="30,44 64,64 98,44" stroke="#ecfdf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" stroke-opacity="0.85"/>
+    <line x1="64" y1="64" x2="64" y2="103" stroke="#a7f3d0" stroke-width="2" stroke-linecap="round" stroke-opacity="0.75"/>
+    <!-- Outer Cube Contour -->
+    <polygon points="64,24 98,44 98,83 64,103 30,83 30,44" stroke="#6ee7b7" stroke-width="1.5" stroke-linejoin="round" stroke-opacity="0.5"/>
+  </g>
+
+  <!-- Front Half of Relay Orbit Ring (Wrapping in front of Cube) -->
+  <path d="M 110 50 A 49 18 -16 0 1 18 74" stroke="url(#orbitGrad)" stroke-width="4" stroke-linecap="round"/>
+  <path d="M 104 58 A 49 18 -16 0 1 26 77" stroke="#ecfdf5" stroke-width="1.5" stroke-linecap="round" opacity="0.75"/>
+
+  <!-- Relay Signal Nodes (Host-to-Host Handoff Satellites) -->
+  <!-- Left Cyan Relay Node -->
+  <circle cx="18" cy="74" r="7" fill="#070a12" stroke="#38bdf8" stroke-width="2.5"/>
+  <circle cx="18" cy="74" r="3.2" fill="#e0f2fe"/>
+
+  <!-- Right Emerald Relay Node -->
+  <circle cx="110" cy="50" r="7" fill="#070a12" stroke="#34d399" stroke-width="2.5"/>
+  <circle cx="110" cy="50" r="3.2" fill="#ecfdf5"/>
+
+  <!-- Center Front Pulse Node -->
+  <circle cx="64" cy="76" r="4.5" fill="#ecfdf5" stroke="#10b981" stroke-width="2"/>
+</svg>

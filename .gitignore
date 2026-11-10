@@ -1,0 +1,24 @@
+# Local MineRelay runtime data, world saves, passkeys & playit secrets
+data/
+.sync-state.json
+
+# PyInstaller build outputs & specs (MineRelay.exe is published on GitHub Releases)
+build/
+dist/
+*.spec
+
+# Python caches & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# IDE, OS & internal agent metadata
+.vscode/
+.idea/
+.agents/
+.DS_Store
+Thumbs.db
+*.log

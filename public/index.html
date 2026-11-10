@@ -1,0 +1,1200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MineRelay — Distributed Minecraft Server Dashboard</title>
+  <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+  <link rel="alternate icon" type="image/x-icon" href="/favicon.ico" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script>
+    try {
+      if (localStorage.getItem("minerelay_token")) {
+        document.documentElement.classList.add("session-restoring");
+      }
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <!-- Session Restoring Veil (Shown only while validating a saved token so login screen never flashes) -->
+  <div id="session-boot-veil" class="session-boot-veil" aria-hidden="true">
+    <div class="session-boot-card">
+      <img src="/logo.svg" alt="" class="brand-logo-img" style="width:42px;height:42px;" />
+      <span>Opening Dashboard...</span>
+    </div>
+  </div>
+  <!-- Toast Notifications Container -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <!-- Passkey Reveal Modal (Shown when Admin creates cluster or creates/rotates a Member passkey) -->
+  <div id="passkey-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="passkey-modal-title">Account Passkey Generated</h3>
+        <button id="passkey-modal-close" class="btn-icon" aria-label="Close modal" title="Close">&times;</button>
+      </div>
+      <p id="passkey-modal-desc" class="modal-subtitle">
+        Copy and save this unique passkey now. Share it with the account holder so they can sign in and host the server.
+      </p>
+      <div class="passkey-display-box">
+        <code id="passkey-modal-value">MC-HOST-XXXX-XXXX-XXXX</code>
+        <button id="passkey-modal-copy" class="btn btn-primary btn-sm">Copy Passkey</button>
+      </div>
+      <div class="alert-box alert-warning">
+        <strong>Important:</strong> For security, only the salted cryptographic hash is stored in the shared config. Keep this passkey safe!
+      </div>
+      <div class="modal-footer">
+        <button id="passkey-modal-done" class="btn btn-secondary">I've Saved the Passkey</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- AUTH & SETUP VIEW                                                     -->
+  <!-- ===================================================================== -->
+  <div id="auth-view" class="auth-wrapper">
+    <div class="auth-card">
+      <div class="brand-header">
+        <div class="brand-logo" aria-hidden="true">
+          <img src="/logo.svg" alt="" class="brand-logo-img" />
+        </div>
+        <div>
+          <h1>MineRelay</h1>
+          <p class="brand-tagline">Distributed Java Minecraft Server Host &amp; Zero-Port-Forward Dashboard</p>
+        </div>
+      </div>
+
+      <!-- Shared Sync Folder Selector Bar -->
+      <div class="sync-folder-bar">
+        <div class="sync-folder-info">
+          <span class="badge badge-outline">Shared Sync Folder</span>
+          <code id="auth-sync-dir-label" class="sync-path-code">Loading...</code>
+        </div>
+        <button id="btn-toggle-sync-config" class="btn btn-ghost btn-sm">Change Folder</button>
+      </div>
+
+      <div id="sync-folder-editor" class="sync-editor-panel hidden">
+        <label class="form-label" for="input-sync-dir">Shared Cloud Folder Path (Google Drive / OneDrive / Dropbox / LAN)</label>
+        <p class="form-hint">Point all members' apps to the same synced cloud folder so world saves, passkeys, and the active host lock stay in sync automatically.</p>
+        <div class="input-row">
+          <input type="text" id="input-sync-dir" class="form-input" placeholder="G:\My Drive\MineRelay-Shared" />
+          <button type="button" id="btn-browse-sync-dir" class="btn btn-secondary">Browse...</button>
+          <button type="button" id="btn-save-sync-dir" class="btn btn-primary">Apply Folder</button>
+        </div>
+        <div id="cloud-folder-presets" class="preset-chips"></div>
+      </div>
+
+      <!-- Auth Mode Switcher -->
+      <div class="auth-tabs">
+        <button id="tab-btn-login" class="auth-tab active">Sign In with Passkey</button>
+        <button id="tab-btn-setup" class="auth-tab">Initialize New Server Cluster</button>
+      </div>
+
+      <!-- Sign In Form -->
+      <form id="form-login" class="auth-form">
+        <div id="cluster-uninit-notice" class="alert-box alert-info hidden">
+          No cluster found in the selected Shared Folder yet. Switch to <strong>Initialize New Server Cluster</strong> to create the Admin account, or point to an existing shared folder above.
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="login-passkey">Personal Passkey</label>
+          <input
+            type="password"
+            id="login-passkey"
+            class="form-input passkey-input"
+            placeholder="MC-ADMIN-XXXX-XXXX-XXXX or MC-HOST-XXXX-XXXX-XXXX"
+            autocomplete="off"
+            required
+          />
+          <div class="form-hint-row">
+            <span>Enter your Admin or Member passkey.</span>
+            <button type="button" id="btn-toggle-passkey-vis" class="btn-link">Show Passkey</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="login-machine-name">Your Device Name (Shown when you host)</label>
+          <input type="text" id="login-machine-name" class="form-input" placeholder="e.g. Alex-Desktop-PC" />
+        </div>
+        <button type="submit" class="btn btn-primary btn-block btn-lg">Access Server Dashboard</button>
+      </form>
+
+      <!-- Initial Cluster Setup Form (Creates the single Admin account) -->
+      <form id="form-setup" class="auth-form hidden">
+        <div class="alert-box alert-info">
+          Creates a new shared cluster with <strong>1 Admin account</strong> (full permissions). You can then generate Member passkeys for friends who can start, stop, and host.
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="setup-server-name">Minecraft Server Name (MOTD)</label>
+          <input type="text" id="setup-server-name" class="form-input" value="Our Shared Survival Server" required />
+        </div>
+        <div class="form-row-2">
+          <div class="form-group">
+            <label class="form-label" for="setup-admin-user">Admin Username</label>
+            <input type="text" id="setup-admin-user" class="form-input" value="Admin" required />
+          </div>
+          <div class="form-group">
+            <label class="form-label" for="setup-machine-name">This PC's Name</label>
+            <input type="text" id="setup-machine-name" class="form-input" placeholder="Admin-PC" />
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="setup-custom-passkey">Custom Admin Passkey (Optional — leave blank to auto-generate)</label>
+          <input type="text" id="setup-custom-passkey" class="form-input passkey-input" placeholder="Auto-generate secure MC-ADMIN-XXXX-XXXX-XXXX" />
+        </div>
+        <button type="submit" class="btn btn-success btn-block btn-lg">Create Cluster &amp; Generate Admin Passkey</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- ===================================================================== -->
+  <!-- MAIN DASHBOARD VIEW                                                   -->
+  <!-- ===================================================================== -->
+  <div id="dashboard-view" class="dashboard-layout hidden">
+    <!-- Top Navigation Header -->
+    <header class="topbar">
+      <div class="topbar-left">
+        <span class="brand-logo-sm" aria-hidden="true">
+          <img src="/logo.svg" alt="" class="brand-logo-img" />
+        </span>
+        <div>
+          <h2 id="top-server-name" class="top-title">Shared Minecraft Server</h2>
+          <span id="top-version-badge" class="meta-subtitle">Paper 26.3</span>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <div class="user-pill">
+          <span id="user-role-badge" class="badge badge-admin">ADMIN</span>
+          <span id="user-name-label" class="user-name">Admin</span>
+          <span id="user-machine-label" class="user-machine">@PC</span>
+        </div>
+        <button id="btn-logout" class="btn btn-ghost btn-sm">Sign Out</button>
+      </div>
+    </header>
+
+    <!-- Distributed Host Status & Action Hero Banner -->
+    <section class="host-hero-banner" id="host-hero-banner">
+      <div class="host-hero-status">
+        <div class="status-indicator-wrap">
+          <span id="hero-status-dot" class="status-dot status-idle"></span>
+          <div>
+            <div class="hero-status-overline">DISTRIBUTED HOST STATUS</div>
+            <h3 id="hero-status-headline">Server is Idle — Ready to Host</h3>
+            <p id="hero-status-detail" class="hero-status-sub">
+              No member is currently hosting. Click "Host Server on My PC" to pull the latest world and start!
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Zero-Port-Forward Public Address Box -->
+      <div class="host-hero-address">
+        <div class="address-label-row">
+          <span class="address-label">JOIN ADDRESS (PLAYIT.GG / LAN)</span>
+          <span id="hero-tunnel-badge" class="badge badge-outline">TUNNEL STANDBY</span>
+        </div>
+        <div class="address-copy-box">
+          <code id="hero-join-ip">minerelay.gl.joinmc.link</code>
+          <div style="display:flex; gap:0.35rem;">
+            <button id="btn-copy-ip" class="btn btn-secondary btn-xs" title="Copy Public Join IP">Copy Public IP</button>
+            <button id="btn-copy-local-ip" class="btn btn-ghost btn-xs" title="Copy localhost:25565 for playing on this PC">Local IP</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Primary Start / Stop / Restart Controls -->
+      <div class="host-hero-actions" style="display:flex; gap:0.55rem; align-items:center;">
+        <button id="btn-start-host" class="btn btn-success btn-hero">
+          ▶ Host Server on My PC
+        </button>
+        <button id="btn-restart-host" class="btn btn-secondary btn-hero hidden" title="Save world and restart server">
+          ↻ Restart
+        </button>
+        <button id="btn-stop-host" class="btn btn-danger btn-hero hidden">
+          ⏹ Stop &amp; Sync World
+        </button>
+      </div>
+    </section>
+
+    <!-- Prominent One-Time playit.gg Claim Banner (Shown automatically when playit.exe needs initial pairing) -->
+    <div id="hero-claim-banner" class="alert-box alert-warning hidden" style="display:flex; align-items:center; justify-content:space-between; gap:1rem;">
+      <div>
+        <strong>One-Time Zero-Port-Forward Setup (`playit.gg`):</strong>
+        To get your permanent public address for friends outside your Wi-Fi, click <strong>Claim Public Tunnel</strong>, sign in to playit.gg, and add a <strong>Minecraft Java (Port 25565)</strong> tunnel. (On this PC, you can already join right now using <code>localhost:25565</code> or your LAN IP!)
+      </div>
+      <a id="hero-claim-btn" href="#" target="_blank" rel="noopener" class="btn btn-primary btn-sm">
+        Claim Public Tunnel
+      </a>
+    </div>
+
+    <!-- Segmented Navigation Bar -->
+    <nav class="dashboard-nav" aria-label="Dashboard sections">
+      <button class="nav-tab active" data-tab="tab-overview">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+          <polyline points="4 17 10 11 4 5" />
+          <line x1="12" y1="19" x2="20" y2="19" />
+        </svg>
+        Overview &amp; Console
+      </button>
+      <button class="nav-tab admin-only" data-tab="tab-accounts">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+        </svg>
+        Accounts &amp; Passkeys
+      </button>
+      <button class="nav-tab admin-only" data-tab="tab-config">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+          <line x1="4" y1="21" x2="4" y2="14" />
+          <line x1="4" y1="10" x2="4" y2="3" />
+          <line x1="12" y1="21" x2="12" y2="12" />
+          <line x1="12" y1="8" x2="12" y2="3" />
+          <line x1="20" y1="21" x2="20" y2="16" />
+          <line x1="20" y1="12" x2="20" y2="3" />
+          <line x1="1" y1="14" x2="7" y2="14" />
+          <line x1="9" y1="8" x2="15" y2="8" />
+          <line x1="17" y1="16" x2="23" y2="16" />
+        </svg>
+        Server Config &amp; Gamerules
+      </button>
+      <button class="nav-tab admin-only" data-tab="tab-players">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+          <circle cx="9" cy="7" r="4" />
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+          <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+        </svg>
+        Players &amp; Permissions
+      </button>
+      <button class="nav-tab admin-only" data-tab="tab-files">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+        </svg>
+        Plugins, Files &amp; Backups
+      </button>
+      <button class="nav-tab admin-only" data-tab="tab-network">
+        <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" />
+          <line x1="2" y1="12" x2="22" y2="12" />
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z" />
+        </svg>
+        Zero-Port-Forward &amp; Sync
+      </button>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main class="dashboard-content">
+      <!-- ================================================================= -->
+      <!-- TAB 1: OVERVIEW & LIVE CONSOLE (Accessible to Admin & Members)    -->
+      <!-- ================================================================= -->
+      <section id="tab-overview" class="tab-panel active">
+        <!-- Member Role Notice Banner -->
+        <div id="member-role-banner" class="alert-box alert-member hidden">
+          <div>
+            <strong>Member Host Account:</strong> You have permission to <strong>Start, Stop, and Host</strong> the Minecraft server locally on your PC whenever no other member is hosting. Server configuration, console commands, and passkey management are reserved for the Admin.
+          </div>
+        </div>
+
+        <!-- Telemetry Bento Cards Grid -->
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-card-top">
+              <div class="metric-label">ACTIVE HOST</div>
+              <span class="metric-icon-badge metric-icon-emerald" aria-hidden="true">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24">
+                  <rect x="2" y="2" width="20" height="8" rx="2" ry="2" />
+                  <rect x="2" y="14" width="20" height="8" rx="2" ry="2" />
+                  <line x1="6" y1="6" x2="6.01" y2="6" />
+                  <line x1="6" y1="18" x2="6.01" y2="18" />
+                </svg>
+              </span>
+            </div>
+            <div id="metric-host-user" class="metric-value">None (Available)</div>
+            <div id="metric-host-machine" class="metric-sub">Any member can claim host</div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-card-top">
+              <div class="metric-label">ONLINE PLAYERS</div>
+              <span class="metric-icon-badge metric-icon-cyan" aria-hidden="true">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24">
+                  <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                  <circle cx="9" cy="7" r="4" />
+                  <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+                  <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                </svg>
+              </span>
+            </div>
+            <div id="metric-players" class="metric-value">0 / 20</div>
+            <div id="metric-players-list" class="metric-sub">No players online</div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-card-top">
+              <div class="metric-label">SERVER TPS &amp; CPU</div>
+              <span class="metric-icon-badge" aria-hidden="true">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24">
+                  <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                </svg>
+              </span>
+            </div>
+            <div id="metric-tps" class="metric-value">0.0 TPS</div>
+            <div id="metric-cpu" class="metric-sub">CPU Load: 0%</div>
+          </div>
+
+          <div class="metric-card">
+            <div class="metric-card-top">
+              <div class="metric-label">RAM ALLOCATION</div>
+              <span class="metric-icon-badge metric-icon-amber" aria-hidden="true">
+                <svg class="ui-icon ui-icon-sm" viewBox="0 0 24 24">
+                  <rect x="4" y="4" width="16" height="16" rx="2" ry="2" />
+                  <rect x="9" y="9" width="6" height="6" />
+                  <line x1="9" y1="1" x2="9" y2="4" />
+                  <line x1="15" y1="1" x2="15" y2="4" />
+                  <line x1="9" y1="20" x2="9" y2="23" />
+                  <line x1="15" y1="20" x2="15" y2="23" />
+                </svg>
+              </span>
+            </div>
+            <div id="metric-ram" class="metric-value">0 / 4096 MB</div>
+            <div id="metric-uptime" class="metric-sub">Uptime: 0m 0s</div>
+          </div>
+        </div>
+
+        <!-- Console Card -->
+        <div class="panel-card console-card">
+          <div class="panel-header">
+            <div>
+              <h3>Live Server Console &amp; Sync Log</h3>
+              <p class="panel-subtitle">Real-time output from the Minecraft Server, World Sync Engine, and playit.gg Tunnel</p>
+            </div>
+            <div id="admin-quick-cmds" class="quick-cmd-group admin-only">
+              <button class="btn btn-secondary btn-xs quick-cmd" data-cmd="list">List Players</button>
+              <button class="btn btn-secondary btn-xs quick-cmd" data-cmd="save-all">Save World</button>
+              <button class="btn btn-secondary btn-xs quick-cmd" data-cmd="time set day">Set Day</button>
+              <button class="btn btn-secondary btn-xs quick-cmd" data-cmd="time set night">Set Night</button>
+              <button class="btn btn-secondary btn-xs quick-cmd" data-cmd="weather clear">Clear Weather</button>
+              <button class="btn btn-secondary btn-xs quick-cmd" data-cmd="gamerule keepInventory true">KeepInv ON</button>
+              <button class="btn btn-secondary btn-xs quick-cmd" data-cmd="gamerule playersSleepingPercentage 1">1-Player Sleep</button>
+            </div>
+          </div>
+
+          <!-- Console Filter & Search Toolbar -->
+          <div class="console-toolbar">
+            <div class="console-filter-pills" id="console-filter-pills">
+              <button type="button" class="filter-pill active" data-filter="ALL">All Logs</button>
+              <button type="button" class="filter-pill" data-filter="Minecraft">Minecraft</button>
+              <button type="button" class="filter-pill" data-filter="SyncEngine">Sync</button>
+              <button type="button" class="filter-pill" data-filter="Tunnel">Tunnel</button>
+              <button type="button" class="filter-pill" data-filter="WARN">Warnings &amp; Errors</button>
+            </div>
+            <div style="display:flex; align-items:center; gap:0.55rem; flex-wrap:wrap;">
+              <input
+                type="text"
+                id="console-search"
+                class="form-input"
+                placeholder="Filter logs..."
+                aria-label="Filter console logs"
+                style="width:175px; padding:0.28rem 0.65rem; font-size:0.78rem;"
+              />
+              <label style="display:flex; align-items:center; gap:0.35rem; font-size:0.76rem; color:var(--text-secondary); cursor:pointer;">
+                <input type="checkbox" id="console-autoscroll" checked /> Auto-Scroll
+              </label>
+              <button type="button" id="btn-copy-console" class="btn btn-ghost btn-xs">Copy</button>
+              <button type="button" id="btn-clear-console" class="btn btn-ghost btn-xs admin-only">Clear</button>
+            </div>
+          </div>
+
+          <div id="console-output" class="console-terminal"></div>
+
+          <!-- Admin Command Input -->
+          <form id="form-console-cmd" class="console-input-bar admin-only">
+            <span class="console-prompt">&gt;</span>
+            <input
+              type="text"
+              id="input-console-cmd"
+              class="console-input"
+              placeholder="Enter Minecraft command (Up/Down arrows for history, e.g. say Hello, op Steve, gamemode creative)..."
+              autocomplete="off"
+            />
+            <button type="submit" class="btn btn-primary btn-sm">Send Command</button>
+          </form>
+
+          <!-- Member Read-Only Footer -->
+          <div id="member-console-footer" class="console-readonly-bar hidden">
+            Console command execution is restricted to the Admin account.
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 2: ACCOUNTS & PASSKEYS (Admin Only)                           -->
+      <!-- ================================================================= -->
+      <section id="tab-accounts" class="tab-panel hidden">
+        <div class="grid-2col">
+          <!-- Create Member Passkey Form -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h3>Create Member Account &amp; Passkey</h3>
+                <p class="panel-subtitle">
+                  Each member gets their own personal passkey. Members can only Start, Stop, and Host the server.
+                </p>
+              </div>
+            </div>
+            <form id="form-create-member" class="stack-form">
+              <div class="form-group">
+                <label class="form-label" for="new-member-username">Member Username</label>
+                <input type="text" id="new-member-username" class="form-input" placeholder="e.g. Jordan" required />
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="new-member-passkey">Custom Passkey (Optional — leave blank to auto-generate)</label>
+                <input type="text" id="new-member-passkey" class="form-input passkey-input" placeholder="Auto-generate MC-HOST-XXXX-XXXX-XXXX" />
+              </div>
+              <div class="role-preview-box">
+                <div class="role-preview-title">Assigned Permissions (Member Account):</div>
+                <ul class="perm-list">
+                  <li class="perm-yes">✓ Claim Host Lock &amp; Start Server locally (when not hosted by another member)</li>
+                  <li class="perm-yes">✓ Stop Server &amp; automatically sync world back to Shared Folder</li>
+                  <li class="perm-yes">✓ View server status, active host, and public join IP</li>
+                  <li class="perm-no">✗ Cannot execute console commands, edit settings/files, or manage accounts</li>
+                </ul>
+              </div>
+              <button type="submit" class="btn btn-primary">Generate Member Account &amp; Passkey</button>
+            </form>
+          </div>
+
+          <!-- Accounts List -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h3>Registered Cluster Accounts</h3>
+                <p class="panel-subtitle">1 Admin account + Member Host accounts</p>
+              </div>
+            </div>
+            <div id="accounts-table-wrap" class="table-responsive">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Username</th>
+                    <th>Role</th>
+                    <th>Passkey Hint</th>
+                    <th>Hosted</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="accounts-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 3: SERVER CONFIG, PROPERTIES & GAMERULES (Admin Only)         -->
+      <!-- ================================================================= -->
+      <section id="tab-config" class="tab-panel hidden">
+        <div class="grid-2col">
+          <!-- Left Column: Server Version/JVM + World Map & Seed Generator -->
+          <div style="display:flex; flex-direction:column; gap:1.35rem;">
+            <!-- Server Version & JVM Config -->
+            <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h3>Java Runtime &amp; Server Version Installer</h3>
+                <p class="panel-subtitle">Download official PaperMC or Vanilla Minecraft `server.jar` and set RAM allocation</p>
+              </div>
+            </div>
+            <div class="env-status-box" id="jar-env-status"></div>
+
+            <div class="installer-box">
+              <h4>Automatic Server `.jar` Downloader</h4>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label class="form-label" for="cfg-mc-software">Server Software</label>
+                  <select id="cfg-mc-software" class="form-select">
+                    <option value="paper">PaperMC (Recommended - Fast &amp; Plugins)</option>
+                    <option value="vanilla">Mojang Official Vanilla</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="cfg-mc-version">Minecraft Version</label>
+                  <select id="cfg-mc-version" class="form-select">
+                    <option value="26.3">26.3 (Latest Official Release)</option>
+                    <option value="26.2">26.2</option>
+                    <option value="26.1.2">26.1.2</option>
+                    <option value="26.1.1">26.1.1</option>
+                    <option value="26.1">26.1</option>
+                    <option value="1.21.11">1.21.11</option>
+                    <option value="1.21.10">1.21.10</option>
+                    <option value="1.21.8">1.21.8</option>
+                    <option value="1.21.5">1.21.5</option>
+                    <option value="1.21.4">1.21.4</option>
+                    <option value="1.21.3">1.21.3</option>
+                    <option value="1.21.1">1.21.1</option>
+                    <option value="1.20.6">1.20.6</option>
+                    <option value="1.20.4">1.20.4</option>
+                    <option value="1.20.1">1.20.1</option>
+                  </select>
+                </div>
+              </div>
+              <button type="button" id="btn-download-jar" class="btn btn-secondary btn-block">
+                Download &amp; Install Selected server.jar
+              </button>
+              <div id="jar-download-progress-wrap" class="progress-wrap hidden">
+                <div class="progress-bar"><div id="jar-download-bar" class="progress-fill" style="width: 0%"></div></div>
+                <span id="jar-download-label" class="progress-text">Downloading...</span>
+              </div>
+            </div>
+
+            <form id="form-jvm-settings" class="stack-form" style="margin-top: 1.25rem;">
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label class="form-label" for="cfg-server-name">Server Display Name</label>
+                  <input type="text" id="cfg-server-name" class="form-input" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="cfg-idle-shutdown">Idle Auto-Stop Timer (0 Players)</label>
+                  <select id="cfg-idle-shutdown" class="form-select">
+                    <option value="0">Disabled (Stay Online Until Stopped)</option>
+                    <option value="10">Stop after 10 mins empty</option>
+                    <option value="15">Stop after 15 mins empty</option>
+                    <option value="30">Stop after 30 mins empty</option>
+                    <option value="60">Stop after 60 mins empty</option>
+                    <option value="120">Stop after 2 hours empty</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label class="form-label" for="cfg-mem-min">Min RAM (MB)</label>
+                  <input type="number" id="cfg-mem-min" class="form-input" min="512" step="512" value="2048" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="cfg-mem-max">Max RAM (MB)</label>
+                  <input type="number" id="cfg-mem-max" class="form-input" min="1024" step="512" value="4096" />
+                </div>
+              </div>
+              <div class="form-row-2">
+                <div class="form-group">
+                  <label class="form-label" for="cfg-java-path">Java Executable Path</label>
+                  <input type="text" id="cfg-java-path" class="form-input" value="java" />
+                </div>
+                <div class="form-group">
+                  <label class="form-label" for="cfg-server-port">Server Local Port</label>
+                  <input type="number" id="cfg-server-port" class="form-input" value="25565" />
+                </div>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="cfg-jvm-flags">JVM Flags (Aikar's G1GC Flags)</label>
+                <input type="text" id="cfg-jvm-flags" class="form-input" />
+              </div>
+              <button type="submit" class="btn btn-primary">Save JVM &amp; Cluster Settings</button>
+            </form>
+          </div>
+
+            <!-- World Map & Seed Generator Card -->
+            <div class="panel-card world-generator-card">
+              <div class="panel-header">
+                <div>
+                  <h3>World Map &amp; Seed Generator</h3>
+                  <p class="panel-subtitle">
+                    Change the server world map randomly or generate a fresh world from a specific seed
+                  </p>
+                </div>
+                <span id="world-status-badge" class="badge badge-outline">Checking...</span>
+              </div>
+
+              <!-- Current World Summary Bar -->
+              <div class="world-summary-bar">
+                <div class="world-summary-item">
+                  <span class="world-summary-label">ACTIVE SEED</span>
+                  <div class="world-summary-val-row">
+                    <code id="world-current-seed-display">Random / Default</code>
+                    <button
+                      type="button"
+                      id="btn-copy-world-seed"
+                      class="btn btn-ghost btn-xs"
+                      title="Copy active world seed"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+                <div class="world-summary-item">
+                  <span class="world-summary-label">WORLD TYPE</span>
+                  <strong id="world-current-type-display" class="world-summary-text">Normal</strong>
+                </div>
+                <div class="world-summary-item">
+                  <span class="world-summary-label">WORLD FOLDER</span>
+                  <code id="world-current-name-display">world</code>
+                </div>
+              </div>
+
+              <div class="stack-form" style="margin-top: 1rem;">
+                <div class="form-group">
+                  <label class="form-label" for="world-seed-input">
+                    Specific World Seed (Numbers or Text — or click Roll to preview a random seed)
+                  </label>
+                  <div class="seed-input-row">
+                    <input
+                      type="text"
+                      id="world-seed-input"
+                      class="form-input passkey-input"
+                      placeholder="e.g. -343522682 or CherryValley"
+                      autocomplete="off"
+                    />
+                    <button
+                      type="button"
+                      id="btn-roll-seed"
+                      class="btn btn-secondary btn-sm"
+                      title="Roll a random 64-bit Minecraft seed into the box"
+                    >
+                      🎲 Roll Seed
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Curated Seed Presets -->
+                <div class="form-group">
+                  <span class="form-label">Popular Seed Presets (Click to Fill)</span>
+                  <div class="seed-preset-chips">
+                    <button type="button" class="seed-preset-chip" data-seed="1691256543523180978" data-type="minecraft:normal">
+                      🌸 Cherry Grove Crater
+                    </button>
+                    <button type="button" class="seed-preset-chip" data-seed="-343522682" data-type="minecraft:normal">
+                      🏝️ Survival Island
+                    </button>
+                    <button type="button" class="seed-preset-chip" data-seed="8624896" data-type="minecraft:normal">
+                      🏔️ Jagged Peaks Ring
+                    </button>
+                    <button type="button" class="seed-preset-chip" data-seed="-4821908542319044112" data-type="minecraft:normal">
+                      🍄 Mushroom Island
+                    </button>
+                    <button type="button" class="seed-preset-chip" data-seed="9064150133272194" data-type="minecraft:normal">
+                      🏘️ Coastal Village
+                    </button>
+                  </div>
+                </div>
+
+                <div class="form-row-2">
+                  <div class="form-group">
+                    <label class="form-label" for="world-level-type">World Terrain Type (`level-type`)</label>
+                    <select id="world-level-type" class="form-select">
+                      <option value="minecraft:normal">Normal (Standard Biomes &amp; Caves)</option>
+                      <option value="minecraft:large_biomes">Large Biomes (Vast Continents)</option>
+                      <option value="minecraft:amplified">Amplified (Extreme Mountains)</option>
+                      <option value="minecraft:flat">Superflat (Flat Building World)</option>
+                    </select>
+                  </div>
+                  <div class="form-group" style="justify-content: flex-end;">
+                    <label class="checkbox-card" style="height: 100%;">
+                      <input type="checkbox" id="world-gen-structures" checked />
+                      <span>Generate Structures (Villages, Strongholds, Trial Chambers)</span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="form-row-2">
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="world-backup-existing" checked />
+                    <span>Create safety backup of current world in Backups before generating new map</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="world-disable-end" />
+                    <span>Disable The End Dimension (No End Portals/Dragon)</span>
+                  </label>
+                </div>
+
+                <!-- Inline Confirmation Banner (hidden until clicked) -->
+                <div id="world-reset-confirm-box" class="world-confirm-box hidden">
+                  <div class="world-confirm-text" id="world-reset-confirm-text">
+                    Are you sure you want to generate a new world map?
+                  </div>
+                  <div class="world-confirm-actions">
+                    <button type="button" id="btn-world-confirm-yes" class="btn btn-danger btn-sm">
+                      Yes, Generate New World Map
+                    </button>
+                    <button type="button" id="btn-world-confirm-cancel" class="btn btn-ghost btn-sm">
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+
+                <!-- Primary Action Buttons -->
+                <div class="world-action-row" id="world-action-buttons">
+                  <button type="button" id="btn-world-reset-random" class="btn btn-secondary">
+                    🎲 Generate Random World Map
+                  </button>
+                  <button type="button" id="btn-world-reset-custom" class="btn btn-primary">
+                    🌱 Generate World with Specific Seed
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Visual server.properties Editor & Gamerules -->
+          <div style="display:flex; flex-direction:column; gap:1.35rem;">
+            <div class="panel-card">
+              <div class="panel-header">
+                <div>
+                  <h3>`server.properties` Visual Editor</h3>
+                  <p class="panel-subtitle">Synced automatically across all member hosts</p>
+                </div>
+              </div>
+              <form id="form-server-properties" class="stack-form">
+                <div class="form-group">
+                  <label class="form-label" for="prop-motd">Message of the Day (`motd`)</label>
+                  <input type="text" id="prop-motd" class="form-input" placeholder="A MineRelay Shared Server" />
+                  <div class="motd-preview-box" style="margin-top:0.35rem;">
+                    <div class="motd-preview-icon" aria-hidden="true">
+                      <img src="/logo.svg" alt="" class="brand-logo-img" />
+                    </div>
+                    <div style="flex:1; overflow:hidden;">
+                      <div style="display:flex; justify-content:space-between; font-size:0.82rem; color:#fff;">
+                        <strong id="motd-preview-title">Shared Minecraft Server</strong>
+                        <span style="color:#aaa;" id="motd-preview-slots">0/20</span>
+                      </div>
+                      <div id="motd-preview-text" style="font-size:0.8rem; color:#a3a3a3; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                        Our Shared Survival Server
+                      </div>
+                    </div>
+                  </div>
+                </div>
+                <div class="form-row-2">
+                  <div class="form-group">
+                    <label class="form-label" for="prop-gamemode">Gamemode</label>
+                    <select id="prop-gamemode" class="form-select">
+                      <option value="survival">Survival</option>
+                      <option value="creative">Creative</option>
+                      <option value="adventure">Adventure</option>
+                      <option value="spectator">Spectator</option>
+                    </select>
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="prop-difficulty">Difficulty</label>
+                    <select id="prop-difficulty" class="form-select">
+                      <option value="peaceful">Peaceful</option>
+                      <option value="easy">Easy</option>
+                      <option value="normal">Normal</option>
+                      <option value="hard">Hard</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="form-row-3">
+                  <div class="form-group">
+                    <label class="form-label" for="prop-max-players">Max Players</label>
+                    <input type="number" id="prop-max-players" class="form-input" value="20" />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="prop-view-distance">View Distance</label>
+                    <input type="number" id="prop-view-distance" class="form-input" value="10" />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="prop-sim-distance">Sim Distance</label>
+                    <input type="number" id="prop-sim-distance" class="form-input" value="10" />
+                  </div>
+                </div>
+
+                <div class="toggle-grid">
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="prop-online-mode" checked />
+                    <span>Online Mode (Mojang Auth)</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="prop-pvp" checked />
+                    <span>Allow PvP Combat</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="prop-whitelist" />
+                    <span>Enable Whitelist</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="prop-allow-flight" />
+                    <span>Allow Flight</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="prop-command-block" checked />
+                    <span>Command Blocks</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="prop-hardcore" />
+                    <span>Hardcore Mode</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="prop-allow-nether" checked />
+                    <span>Allow Nether</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="prop-disable-end" />
+                    <span>Disable The End (`allow-end: false`)</span>
+                  </label>
+                </div>
+
+                <div class="form-row-2">
+                  <div class="form-group">
+                    <label class="form-label" for="prop-level-seed">Level Seed (`level-seed` — optional)</label>
+                    <input type="text" id="prop-level-seed" class="form-input" placeholder="Leave blank for random seed" />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="prop-spawn-protection">Spawn Protection Radius</label>
+                    <input type="number" id="prop-spawn-protection" class="form-input" min="0" value="0" />
+                  </div>
+                </div>
+
+                <button type="submit" class="btn btn-primary">Save `server.properties`</button>
+              </form>
+            </div>
+
+            <!-- World Gamerules Card -->
+            <div class="panel-card">
+              <div class="panel-header">
+                <div>
+                  <h3>World Gamerules &amp; QoL Toggles</h3>
+                  <p class="panel-subtitle">Applies live to a running server &amp; persists across all hosts</p>
+                </div>
+              </div>
+              <form id="form-gamerules" class="stack-form">
+                <div class="toggle-grid">
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-keepInventory" />
+                    <span>Keep Inventory on Death</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-mobGriefing" checked />
+                    <span>Mob Griefing (Creepers/Endermen)</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-doDaylightCycle" checked />
+                    <span>Daylight Cycle</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-doWeatherCycle" checked />
+                    <span>Weather Cycle</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-doInsomnia" checked />
+                    <span>Spawn Phantoms (`doInsomnia`)</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-doFireTick" checked />
+                    <span>Fire Spread (`doFireTick`)</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-doImmediateRespawn" />
+                    <span>Immediate Respawn</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-forgiveDeadPlayers" checked />
+                    <span>Forgive Dead Players</span>
+                  </label>
+                  <label class="checkbox-card">
+                    <input type="checkbox" id="gr-announceAdvancements" checked />
+                    <span>Announce Advancements</span>
+                  </label>
+                </div>
+                <div class="form-row-3">
+                  <div class="form-group">
+                    <label class="form-label" for="gr-playersSleepingPercentage">Sleeping % (`1` = 1-Player Sleep)</label>
+                    <input type="number" id="gr-playersSleepingPercentage" class="form-input" min="0" max="100" value="100" />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="gr-randomTickSpeed">Random Tick Speed (`3`)</label>
+                    <input type="number" id="gr-randomTickSpeed" class="form-input" min="0" max="100" value="3" />
+                  </div>
+                  <div class="form-group">
+                    <label class="form-label" for="gr-spawnRadius">Spawn Radius (`10`)</label>
+                    <input type="number" id="gr-spawnRadius" class="form-input" min="0" max="100" value="10" />
+                  </div>
+                </div>
+                <button type="submit" class="btn btn-primary">Apply &amp; Save World Gamerules</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 4: PLAYERS & PERMISSIONS (Admin Only)                         -->
+      <!-- ================================================================= -->
+      <section id="tab-players" class="tab-panel hidden">
+        <div class="grid-2col">
+          <!-- Online Players & Operators -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h3>Online Players &amp; Live Actions</h3>
+                <p class="panel-subtitle">Manage connected players in real time (Gamemode, Heal, TP, OP, Kick, Ban)</p>
+              </div>
+            </div>
+            <div id="online-players-container" class="pill-list"></div>
+
+            <hr class="divider" />
+
+            <div class="panel-header">
+              <div>
+                <h3>Server Operators (`ops.json`)</h3>
+                <p class="panel-subtitle">Players with full in-game operator commands</p>
+              </div>
+            </div>
+            <form id="form-add-op" class="input-row">
+              <input type="text" id="input-op-username" class="form-input" placeholder="Minecraft Username" required />
+              <button type="submit" class="btn btn-primary btn-sm">Add OP</button>
+            </form>
+            <div id="ops-list-container" class="item-list"></div>
+          </div>
+
+          <!-- Whitelist & Banned Players -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h3>Whitelist (`whitelist.json`)</h3>
+                <p class="panel-subtitle">Allowed players when Whitelist is enabled</p>
+              </div>
+            </div>
+            <form id="form-add-whitelist" class="input-row">
+              <input type="text" id="input-wl-username" class="form-input" placeholder="Minecraft Username" required />
+              <button type="submit" class="btn btn-primary btn-sm">Add to Whitelist</button>
+            </form>
+            <div id="whitelist-container" class="item-list"></div>
+
+            <hr class="divider" />
+
+            <div class="panel-header">
+              <div>
+                <h3>Banned Players (`banned-players.json`)</h3>
+                <p class="panel-subtitle">Blocked from joining the server</p>
+              </div>
+            </div>
+            <form id="form-add-ban" class="input-row">
+              <input type="text" id="input-ban-username" class="form-input" placeholder="Username to Ban" required />
+              <input type="text" id="input-ban-reason" class="form-input" placeholder="Reason" value="Rule violation" />
+              <button type="submit" class="btn btn-danger btn-sm">Ban</button>
+            </form>
+            <div id="banned-container" class="item-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 5: PLUGINS, FILES & WORLD BACKUPS (Admin Only)                -->
+      <!-- ================================================================= -->
+      <section id="tab-files" class="tab-panel hidden">
+        <div class="grid-2col">
+          <!-- Left Column: 1-Click Plugin Marketplace & File Browser -->
+          <div style="display:flex; flex-direction:column; gap:1.35rem;">
+            <!-- 1-Click Plugin Installer & Manager -->
+            <div class="panel-card">
+              <div class="panel-header">
+                <div>
+                  <h3>PaperMC Plugin Marketplace &amp; Manager</h3>
+                  <p class="panel-subtitle">1-click install official plugins from Modrinth into `plugins/` (synced to all hosts)</p>
+                </div>
+              </div>
+              <form id="form-search-plugins" class="input-row">
+                <input type="text" id="input-plugin-search" class="form-input" placeholder="Search Modrinth plugins (e.g. EssentialsX, WorldEdit, ViaVersion, Chunky)..." />
+                <button type="submit" class="btn btn-primary btn-sm">Search</button>
+              </form>
+              <div id="plugin-catalog-container" class="plugin-catalog-grid"></div>
+
+              <hr class="divider" />
+
+              <div class="panel-header" style="margin-bottom:0.5rem;">
+                <h4>Installed Server Plugins (`plugins/`)</h4>
+                <button type="button" id="btn-refresh-plugins" class="btn btn-ghost btn-xs">↻ Refresh</button>
+              </div>
+              <div id="installed-plugins-container" class="item-list"></div>
+            </div>
+
+            <!-- Server File Browser -->
+            <div class="panel-card">
+              <div class="panel-header">
+                <div>
+                  <h3>Server File Browser &amp; Custom Uploader</h3>
+                  <p class="panel-subtitle">Manage `./data/runtime-server` files, `plugins/`, and configs</p>
+                </div>
+                <div class="btn-group" style="display:flex; gap:0.4rem;">
+                  <label class="btn btn-secondary btn-xs" style="cursor:pointer;">
+                    ⬆ Upload File / `.jar`
+                    <input type="file" id="input-file-upload" style="display:none;" />
+                  </label>
+                  <button id="btn-refresh-files" class="btn btn-ghost btn-xs">↻ Refresh</button>
+                </div>
+              </div>
+
+              <!-- Server File Browser Search & Navigation -->
+              <div class="file-search-bar" style="margin-bottom:0.6rem;">
+                <div class="file-search-input-wrap">
+                  <span class="file-search-icon" aria-hidden="true">🔍</span>
+                  <input
+                    type="search"
+                    id="input-file-search"
+                    class="form-input form-input-sm file-search-input"
+                    placeholder="Search files or folders in current directory &amp; subfolders..."
+                    autocomplete="off"
+                  />
+                  <button type="button" id="btn-clear-file-search" class="btn btn-ghost btn-xs file-search-clear hidden" title="Clear search">✕</button>
+                </div>
+              </div>
+
+              <div class="breadcrumb-bar">
+                <div class="breadcrumb-nav-wrapper">
+                  <span class="breadcrumb-label">Folder:</span>
+                  <nav id="file-breadcrumbs" class="file-breadcrumbs" aria-label="Directory Breadcrumbs">
+                    <span class="breadcrumb-crumb-current" data-path="">📁 root</span>
+                  </nav>
+                  <code id="file-current-dir" style="display:none;">/</code>
+                </div>
+                <div style="display:flex; align-items:center; gap:0.35rem;">
+                  <button id="btn-file-up" class="btn btn-ghost btn-xs" title="Go up to parent folder">↑ Up</button>
+                </div>
+              </div>
+
+              <div id="file-search-status" class="file-search-status hidden"></div>
+
+              <div id="files-list-container" class="file-browser-list">
+                <div class="file-loading-state">⏳ Loading server files...</div>
+              </div>
+
+              <!-- Inline File Text Editor -->
+              <div id="file-editor-box" class="file-editor-box hidden">
+                <div class="file-editor-header">
+                  <code id="file-editor-path">server.properties</code>
+                  <div style="display:flex; gap:0.4rem;">
+                    <button id="btn-save-file" class="btn btn-primary btn-xs">Save File</button>
+                    <button id="btn-close-file" class="btn btn-ghost btn-xs">Close</button>
+                  </div>
+                </div>
+                <textarea id="file-editor-textarea" class="file-textarea" rows="12"></textarea>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right Column: World Snapshots & Backups -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h3>Shared World Snapshots &amp; Backups</h3>
+                <p class="panel-subtitle">Stored in your Shared Cloud Folder so any member can host the latest save</p>
+              </div>
+            </div>
+            <form id="form-create-backup" class="input-row">
+              <input type="text" id="input-backup-label" class="form-input" placeholder="Backup label (e.g. before-ender-dragon)" value="manual" />
+              <button type="submit" class="btn btn-primary btn-sm">+ Create World Snapshot</button>
+            </form>
+            <div id="backups-list-container" class="item-list" style="margin-top: 1rem;"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================================================================= -->
+      <!-- TAB 6: ZERO-PORT-FORWARD & CLOUD SYNC SETTINGS (Admin Only)       -->
+      <!-- ================================================================= -->
+      <section id="tab-network" class="tab-panel hidden">
+        <div class="grid-2col">
+          <!-- Zero Port Forwarding (playit.gg) -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h3>Zero-Port-Forwarding Tunnel (`playit.gg`)</h3>
+                <p class="panel-subtitle">
+                  Host without touching router settings or port forwarding. The tunnel secret is stored in the Shared Folder so every member broadcasts on the same public IP!
+                </p>
+              </div>
+            </div>
+
+            <div id="tunnel-status-card" class="env-status-box"></div>
+
+            <div id="tunnel-claim-alert" class="alert-box alert-warning hidden">
+              <strong>Action Required — Claim Tunnel:</strong> Click <a id="tunnel-claim-link" href="#" target="_blank" rel="noopener">this playit.gg claim link</a> to pair this shared server tunnel with your free playit.gg account.
+            </div>
+
+            <div class="stack-form">
+              <div class="form-group">
+                <label class="form-label" for="net-public-address">Public Join Address (`*.gl.joinmc.link` or Custom Domain)</label>
+                <p class="form-hint">Set your assigned playit.gg address here so all members see it on the top dashboard banner.</p>
+                <div class="input-row">
+                  <input type="text" id="net-public-address" class="form-input" placeholder="e.g. craft-friends.gl.joinmc.link" />
+                  <button type="button" id="btn-save-public-address" class="btn btn-primary btn-sm">Save Address</button>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label" for="net-playit-secret">Shared `playit.gg` Secret Key (`playit.toml`)</label>
+                <p class="form-hint">Optional: Paste a `secret_key` from playit.gg so every member's PC uses the exact same tunnel agent automatically.</p>
+                <div class="input-row">
+                  <input type="password" id="net-playit-secret" class="form-input" placeholder="Paste playit secret_key..." />
+                  <button type="button" id="btn-save-playit-secret" class="btn btn-secondary btn-sm">Save Shared Secret</button>
+                </div>
+              </div>
+
+              <div class="form-group">
+                <button type="button" id="btn-install-playit" class="btn btn-secondary btn-block">
+                  Auto-Download Official `playit.gg` Agent Binary
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Shared Sync & Emergency Lock Controls -->
+          <div class="panel-card">
+            <div class="panel-header">
+              <div>
+                <h3>Multi-Device Google Drive &amp; Cloud Sync</h3>
+                <p class="panel-subtitle">Synchronize world saves, passkeys, and host locks across all members' PCs</p>
+              </div>
+            </div>
+
+            <div id="sync-diagnostics-card" class="env-status-box"></div>
+
+            <div class="stack-form">
+              <div class="form-group">
+                <label class="form-label" for="net-sync-dir">Shared Cloud Sync Folder Path (This PC)</label>
+                <div class="input-row">
+                  <input type="text" id="net-sync-dir" class="form-input" />
+                  <button type="button" id="btn-net-browse-sync" class="btn btn-secondary btn-sm">Browse...</button>
+                  <button type="button" id="btn-net-save-sync" class="btn btn-primary btn-sm">Update Path</button>
+                </div>
+              </div>
+
+              <div class="role-preview-box">
+                <div class="role-preview-title">How to Host Across Multiple PCs with Google Drive:</div>
+                <ol style="padding-left:1.2rem; display:flex; flex-direction:column; gap:0.35rem; color:var(--text-secondary);">
+                  <li>Install <strong>Google Drive for Desktop</strong> on each member's PC.</li>
+                  <li>Create a folder (e.g. <code>MineRelay-Shared</code>) in your Google Drive, right-click it &rarr; <strong>Share</strong> with your friends (Editor access), and have each friend click <strong>"Add shortcut to My Drive"</strong>.</li>
+                  <li>On each PC, click <strong>Browse...</strong> above and select that shared folder (e.g. <code>G:\My Drive\MineRelay-Shared</code>). Passkeys, world saves, and the active host lock will sync automatically!</li>
+                </ol>
+              </div>
+
+              <div class="toggle-grid">
+                <label class="checkbox-card">
+                  <input type="checkbox" id="net-auto-backup" checked />
+                  <span>Auto-Create Backup Archive on Every Server Stop</span>
+                </label>
+                <label class="checkbox-card">
+                  <input type="checkbox" id="net-git-sync" />
+                  <span>Enable Git Auto-Pull / Commit / Push in Shared Folder</span>
+                </label>
+              </div>
+              <button type="button" id="btn-save-sync-toggles" class="btn btn-secondary btn-sm">Save Sync Preferences</button>
+
+              <hr class="divider" />
+
+              <div class="emergency-box">
+                <h4>Emergency Host Lock Override</h4>
+                <p class="form-hint">
+                  If a member's PC lost power or crashed while hosting, the lock automatically expires after 45 seconds without a heartbeat. As the Admin, you can also force-release the lock immediately:
+                </p>
+                <button type="button" id="btn-force-unlock" class="btn btn-danger btn-sm">
+                  Force-Release Host Lock
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
