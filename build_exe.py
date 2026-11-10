@@ -101,11 +101,11 @@ def build_executable() -> Path:
             SHCNE_ASSOCCHANGED = 0x08000000
             SHCNF_IDLIST = 0x0000
             SHCNF_PATHW = 0x0005
-            SHCNF_FLUSH = 0x1000
-            ctypes.windll.shell32.SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSH, ctypes.c_wchar_p(str(exe_path)), None)
-            ctypes.windll.shell32.SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSH, None, None)
-            subprocess.run(["ie4uinit.exe", "-show"], check=False)
-            subprocess.run(["ie4uinit.exe", "-ClearIconCache"], check=False)
+            SHCNF_FLUSHNOWAIT = 0x2000
+            ctypes.windll.shell32.SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, ctypes.c_wchar_p(str(exe_path)), None)
+            ctypes.windll.shell32.SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, None, None)
+            subprocess.run(["ie4uinit.exe", "-show"], check=False, timeout=3)
+            subprocess.run(["ie4uinit.exe", "-ClearIconCache"], check=False, timeout=3)
         except Exception:
             pass
 

@@ -75,6 +75,41 @@ class AppContext:
             event_callback=self.broadcast_event,
         )
 
+        if os.environ.get("MINERELAY_TEST_MODE") != "1":
+            threading.Thread(
+                target=self._remote_lock_watcher_loop,
+                daemon=True,
+                name="RemoteLockWatcher",
+            ).start()
+
+    def _remote_lock_watcher_loop(self) -> None:
+        """Polls shared host lock state every 4s when dashboards are connected and pushes instant SSE updates."""
+        last_sig: Any = None
+        while True:
+            time.sleep(4.0)
+            try:
+                with self.sse_mutex:
+                    has_clients = len(self.sse_clients) > 0
+                if not has_clients:
+                    continue
+                lock = self.sync_engine.get_lock()
+                sig = (
+                    lock.is_locked,
+                    lock.is_stale(),
+                    lock.host_username,
+                    lock.machine_id,
+                    lock.status,
+                    lock.lock_epoch,
+                    tuple(lock.online_players),
+                    lock.public_address,
+                    lock.tunnel_status,
+                )
+                if last_sig is not None and sig != last_sig:
+                    self.broadcast_event("status_changed", self.mc_manager.get_status_summary())
+                last_sig = sig
+            except Exception:
+                pass
+
     def broadcast_event(self, event_type: str, payload: Any) -> None:
         try:
             msg = json.dumps({"event": event_type, "data": payload}, default=str)
@@ -497,9 +532,20 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     return
 
                 if path == "/api/admin/backups":
-                    ctx.auth_service.require_admin(token)
+                    admin_user = ctx.auth_service.require_admin(token)
+                    lock = ctx.sync_engine.get_lock()
+                    if ctx.mc_manager.local_status == "idle":
+                        if lock.is_locked and not ctx.sync_engine.is_locked_by_current_machine(lock):
+                            raise ValueError(
+                                f"Cannot create snapshot while '{lock.host_username}' ({lock.machine_name}) holds the host lock."
+                            )
+                        ctx.sync_engine.ensure_runtime_synced_when_idle(strict=True)
                     label = str(body.get("label", "manual"))
-                    res = ctx.sync_engine.push_world_from_runtime(create_backup=True, backup_label=label)
+                    res = ctx.sync_engine.push_world_from_runtime(
+                        create_backup=True,
+                        backup_label=label,
+                        host_username=admin_user.username,
+                    )
                     self._send_json(200, {"result": res, "backups": ctx.sync_engine.list_backups()})
                     return
 
@@ -746,7 +792,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
 
                 while True:
                     try:
-                        msg = client_q.get(timeout=15)
+                        msg = client_q.get(timeout=6)
                         self.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
                         self.wfile.flush()
                     except queue.Empty:

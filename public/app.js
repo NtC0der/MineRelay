@@ -360,7 +360,14 @@ function connectEventStream() {
     } catch (_) {}
   };
   es.onerror = () => {
-    // SSE disconnected, fallback polling maintains real-time sync
+    // Reconnect automatically if the browser closes the SSE stream permanently
+    if (es.readyState === EventSource.CLOSED && state.token && state.sse === es) {
+      setTimeout(() => {
+        if (state.token && (!state.sse || state.sse === es)) {
+          connectEventStream();
+        }
+      }, 4000);
+    }
   };
   state.sse = es;
 }
@@ -485,9 +492,9 @@ function renderStatusSummary(summary) {
       btnStop.disabled = true;
     } else {
       dot.className = "status-dot status-busy";
-      headline.textContent = `Host Lock Held by Your PC (${env.machineName})`;
+      headline.textContent = `Host Lock Held by ${lock.hostUsername || "Your PC"} (${env.machineName})`;
       detail.textContent =
-        "A lock from a previous session on this PC is active. Click below to stop any background process, sync the world, and release the lock.";
+        "A lock from a previous session on this device is active. Click below to stop any background process, sync the world, and release the lock.";
       btnStart.classList.add("hidden");
       if (btnRestart) btnRestart.classList.add("hidden");
       btnStop.classList.remove("hidden");
@@ -504,9 +511,9 @@ function renderStatusSummary(summary) {
     btnStop.classList.add("hidden");
     if (btnRestart) btnRestart.classList.add("hidden");
   } else if (isStaleLock) {
-    dot.className = "status-dot status-busy";
-    headline.textContent = `Stale Lock Detected (Previous Host: ${lock.hostUsername})`;
-    detail.textContent = `Heartbeat from ${lock.machineName} timed out. You can safely claim the host lock and start the server.`;
+    dot.className = "status-dot status-locked-other";
+    headline.textContent = `Host Lock Held by ${lock.hostUsername || "Remote Member"} (Heartbeat Delayed)`;
+    detail.textContent = `Last update from ${lock.machineName || "remote PC"} was ${formatTimeAgo(lock.lastHeartbeat)}. Confirm they stopped and cloud sync finished before reclaiming host so progress isn't lost.`;
     btnStart.classList.remove("hidden");
     btnStart.disabled = false;
     btnStart.textContent = "▶ Reclaim Host & Start Server";
@@ -580,10 +587,14 @@ function renderStatusSummary(summary) {
   // Telemetry Cards
   document.getElementById("metric-host-user").textContent = lock.isActivelyLocked
     ? `${lock.hostUsername}`
-    : "None (Available)";
+    : lock.isLocked && lock.isStale
+      ? `⚠️ ${lock.hostUsername || "Remote Host"} (Stale)`
+      : "None (Available)";
   document.getElementById("metric-host-machine").textContent = lock.isActivelyLocked
     ? `Device: ${lock.machineName} (${lock.status})`
-    : "Ready for any member to host";
+    : lock.isLocked && lock.isStale
+      ? `Device: ${lock.machineName || "Remote PC"} (${formatTimeAgo(lock.lastHeartbeat)})`
+      : "Ready for any member to host";
 
   const onlineList = summary.onlinePlayers || (lock.isActivelyLocked ? lock.onlinePlayers : []) || lock.onlinePlayers || [];
   const maxP = lock.maxPlayers || 20;
@@ -628,14 +639,64 @@ function renderAdminEnvBoxes(summary) {
   const syncDiagBox = document.getElementById("sync-diagnostics-card");
   if (syncDiagBox && env.syncDiagnostics) {
     const d = env.syncDiagnostics;
-    syncDiagBox.innerHTML = `
-      <div style="display:flex; flex-direction:column; gap:0.3rem; font-size:0.83rem;">
-        <div><strong>Detected Sync Provider:</strong> <span class="badge badge-member">${escapeHtml(d.providerDetected || "Shared Folder")}</span></div>
-        <div><strong>Cluster Config Synced:</strong> ${d.clusterConfigExists ? "✅ cluster-config.json Ready" : "⚠️ Not initialized"}</div>
-        <div><strong>Latest World Snapshot:</strong> ${d.latestSnapshotExists ? `✅ latest-server.zip (${formatBytes(d.latestSnapshotSizeBytes)} • ${formatTimeAgo(d.latestSnapshotModifiedAt)})` : "ℹ️ Created on first server stop"}</div>
-        <div><strong>Rolling World Backups:</strong> ${d.backupCount || 0} archives in shared folder</div>
-      </div>
-    `;
+    const altMirror = Array.isArray(d.mirroredAlternatives) && d.mirroredAlternatives.length > 0 ? d.mirroredAlternatives[0] : "";
+    const diagSig = JSON.stringify([
+      d.providerDetected,
+      d.clusterConfigExists,
+      d.latestSnapshotExists,
+      d.latestSnapshotSizeBytes,
+      d.latestSnapshotModifiedAt,
+      d.backupCount,
+      d.isShortcutStreamPath,
+      altMirror,
+      d.cloudTransferActive,
+      d.syncManifest && d.syncManifest.snapshotSeq,
+    ]);
+    if (syncDiagBox.dataset.sig !== diagSig) {
+      syncDiagBox.dataset.sig = diagSig;
+      const manifestLine = d.syncManifest
+        ? `<div><strong>Latest Verified World:</strong> Snapshot #${escapeHtml(d.syncManifest.snapshotSeq)} by ${escapeHtml(d.syncManifest.hostUsername || "Host")} (${formatTimeAgo(d.syncManifest.updatedAt)})</div>`
+        : "";
+      const transferLine = d.cloudTransferActive
+        ? `<div class="alert-box alert-warning" style="margin-top:0.35rem; padding:0.45rem 0.65rem;">⏳ ${escapeHtml(d.cloudTransferActive)}</div>`
+        : "";
+      const shortcutWarn = d.isShortcutStreamPath
+        ? `<div class="alert-box alert-warning" style="margin-top:0.35rem; padding:0.55rem 0.7rem; font-size:0.8rem;">
+             ⚠️ <strong>Google Drive Stream Shortcut Detected:</strong> Virtual <code>.shortcut-targets-by-id</code> paths can lag or cache stale lock/world files.
+             ${altMirror ? `<div style="margin-top:0.35rem;">Recommended local Google Drive mirror found: <code>${escapeHtml(altMirror)}</code> <button type="button" class="btn btn-primary btn-xs btn-use-mirror-sync" data-path="${escapeHtml(altMirror)}" style="margin-left:0.35rem;">Use Local Mirror</button></div>` : ""}
+           </div>`
+        : "";
+      syncDiagBox.innerHTML = `
+        <div style="display:flex; flex-direction:column; gap:0.3rem; font-size:0.83rem;">
+          <div><strong>Detected Sync Provider:</strong> <span class="badge badge-member">${escapeHtml(d.providerDetected || "Shared Folder")}</span></div>
+          <div><strong>Cluster Config Synced:</strong> ${d.clusterConfigExists ? "✅ cluster-config.json Ready" : "⚠️ Not initialized"}</div>
+          <div><strong>Latest World Snapshot:</strong> ${d.latestSnapshotExists ? `✅ latest-server.zip (${formatBytes(d.latestSnapshotSizeBytes)} • ${formatTimeAgo(d.latestSnapshotModifiedAt)})` : "ℹ️ Created on first server stop"}</div>
+          ${manifestLine}
+          <div><strong>Rolling World Backups:</strong> ${d.backupCount || 0} archives in shared folder</div>
+          ${transferLine}
+          ${shortcutWarn}
+        </div>
+      `;
+      const mirrorBtn = syncDiagBox.querySelector(".btn-use-mirror-sync");
+      if (mirrorBtn) {
+        mirrorBtn.addEventListener("click", async () => {
+          const targetPath = mirrorBtn.getAttribute("data-path");
+          if (!targetPath) return;
+          mirrorBtn.disabled = true;
+          try {
+            await apiFetch("/api/setup/sync-dir", {
+              method: "POST",
+              body: JSON.stringify({ sharedSyncDir: targetPath }),
+            });
+            showToast(`Switched Shared Folder to faster local mirror: ${targetPath}`, "success");
+            refreshServerStatus();
+          } catch (err) {
+            showToast(err.message, "error");
+            mirrorBtn.disabled = false;
+          }
+        });
+      }
+    }
   }
 
   const dlWrap = document.getElementById("jar-download-progress-wrap");

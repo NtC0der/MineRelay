@@ -407,7 +407,7 @@ class MinecraftManager:
                     "INFO",
                     "SyncEngine",
                 )
-                pull_res = self.sync_engine.pull_world_to_runtime()
+                pull_res = self.sync_engine.pull_world_to_runtime(strict=True)
                 if pull_res.get("synced"):
                     kb = round(pull_res.get("sizeBytes", 0) / 1024, 1)
                     self._log(f"Synced world snapshot ({kb} KB) into local runtime directory.", "INFO", "SyncEngine")
@@ -756,6 +756,7 @@ class MinecraftManager:
                         self.sync_engine.push_world_from_runtime(
                             create_backup=cfg.auto_backup_on_stop if cfg else True,
                             backup_label=effective_user.username if effective_user else "host",
+                            host_username=effective_user.username if effective_user else "recovery",
                         )
                     except Exception:
                         pass
@@ -855,6 +856,7 @@ class MinecraftManager:
             push_res = self.sync_engine.push_world_from_runtime(
                 create_backup=create_backup,
                 backup_label=user.username if user else "host",
+                host_username=user.username if user else "",
             )
             kb = round(push_res.get("sizeBytes", 0) / 1024, 1)
             self._log(
@@ -932,6 +934,7 @@ class MinecraftManager:
                 self.sync_engine.push_world_from_runtime(
                     create_backup=False,
                     backup_label=effective_user.username,
+                    host_username=effective_user.username,
                 )
             except Exception:
                 pass
@@ -1061,15 +1064,25 @@ class MinecraftManager:
     def _push_idle_config_safely(self) -> None:
         """
         Pushes updated config files from runtime_dir to the Shared Sync Folder ONLY if
-        no other member is currently hosting (so an idle PC never overwrites an active host's snapshot).
+        no other member holds the lock and local cloud snapshot is synced cleanly
+        (so an idle PC never clobbers another member's newer world save).
         """
         if self.local_status != "idle":
             return
         lock = self.sync_engine.get_lock()
-        if lock.is_actively_locked() and not self.sync_engine.is_locked_by_current_machine(lock):
+        if lock.is_locked and not self.sync_engine.is_locked_by_current_machine(lock):
             return
+        if self.sync_engine._has_active_cloud_transfer():
+            self._log("Skipped idle snapshot push while cloud sync download/upload is active.", "WARN", "SyncEngine")
+            return
+        manifest = self.sync_engine._read_sync_manifest()
+        if manifest:
+            _, mismatch = self.sync_engine._resolve_verified_snapshot_source(manifest)
+            if mismatch:
+                self._log(f"Skipped idle snapshot push to protect newer cloud world: {mismatch}", "WARN", "SyncEngine")
+                return
         try:
-            self.sync_engine.push_world_from_runtime(create_backup=False)
+            self.sync_engine.push_world_from_runtime(create_backup=False, host_username="Config")
         except Exception:
             pass
 

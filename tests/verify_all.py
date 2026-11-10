@@ -1070,6 +1070,95 @@ def run_verification():
         assert pc2.ctx.mc_manager.get_server_properties().get("online-mode") == "true"
         print("  [OK] Atomic staging restore, fresh mtime promotion, corrupt-backup guard & multi-PC pull verified!")
 
+        # ---------------------------------------------------------------------
+        # 18. Cloud Lock Visibility, Clock-Skew Protection & Stale Snapshot Guard
+        # ---------------------------------------------------------------------
+        print("\n[Test 18] Verifying Google Drive Lock Resilience, Clock Skew & Stale Snapshot Overwrite Guard...")
+        # 18.1 Bob starts hosting on PC 2; simulate Drive overwriting host-lock.json back to unlocked idle
+        st_b2, res_b2 = pc2.request("POST", "/api/server/start", token=bob_token)
+        assert st_b2 == 200
+        bob_epoch = res_b2["lock"]["lockEpoch"]
+        assert bob_epoch, "Expected non-empty lockEpoch for session claim file"
+        assert (pc2.ctx.sync_engine.locks_dir / f"session-{bob_epoch}.json").exists()
+
+        # Simulate stale cached host-lock.json on Drive resetting host-lock.json to idle
+        pc1.ctx.sync_engine.host_lock_path.write_text(json.dumps({"isLocked": False, "status": "idle"}), encoding="utf-8")
+        st_v1, status_pc1 = pc1.request("GET", "/api/server/status", token=admin_token)
+        assert st_v1 == 200
+        assert status_pc1["lock"]["isLocked"] is True, "PC 1 lost visibility of Bob's lock when host-lock.json reverted!"
+        assert status_pc1["lock"]["hostUsername"] == "Bob"
+        assert status_pc1["lock"]["isActivelyLocked"] is True
+
+        # PC 1 must STILL be blocked from starting over Bob!
+        st_col, _ = pc1.request("POST", "/api/server/start", token=admin_token)
+        assert st_col == 409, f"Expected 409 Conflict while Bob holds session file, got {st_col}"
+
+        # 18.2 Clock-skew protection: simulate Bob's PC clock 10 minutes slow, ticking heartbeat forward
+        pc1.ctx.sync_engine._remote_hb_tracker.clear()
+        sess_path = pc2.ctx.sync_engine.locks_dir / f"session-{bob_epoch}.json"
+        skew_data = json.loads(sess_path.read_text(encoding="utf-8"))
+        skew_hb1 = time.time() - 600.0
+        skew_data["lastHeartbeat"] = skew_hb1
+        sess_path.write_text(json.dumps(skew_data), encoding="utf-8")
+        pc1.ctx.sync_engine.host_lock_path.write_text(json.dumps(skew_data), encoding="utf-8")
+        first_skew_lock = pc1.ctx.sync_engine.get_lock()
+        assert first_skew_lock.is_stale() is True, "Static old timestamp without progression must still report stale"
+
+        # Now Bob bumps his skewed heartbeat +15s -> PC 1 sees forward progression and treats it active!
+        skew_data["lastHeartbeat"] = skew_hb1 + 15.0
+        sess_path.write_text(json.dumps(skew_data), encoding="utf-8")
+        pc1.ctx.sync_engine.host_lock_path.write_text(json.dumps(skew_data), encoding="utf-8")
+        second_skew_lock = pc1.ctx.sync_engine.get_lock()
+        assert second_skew_lock.is_actively_locked() is True, "Ticking remote heartbeat should bypass PC clock skew!"
+
+        # Restore Bob's current heartbeat, write world progress on PC 2, and stop cleanly
+        skew_data["lastHeartbeat"] = time.time()
+        sess_path.write_text(json.dumps(skew_data), encoding="utf-8")
+        (pc2.ctx.mc_manager.runtime_dir / "world" / "bob_diamond_base.txt").write_text("do-not-lose-me", encoding="utf-8")
+        st_b2_stop, res_b2_stop = pc2.request("POST", "/api/server/stop", token=bob_token)
+        assert st_b2_stop == 200 and res_b2_stop["lock"]["isLocked"] is False
+        assert (pc2.ctx.sync_engine.locks_dir / f"released-{bob_epoch}.json").exists()
+
+        # Simulate stale conflict copy host-lock (1).json with released lockEpoch -> must NOT look locked!
+        stale_conflict = pc1.ctx.sync_engine.shared_dir / "host-lock (1).json"
+        stale_conflict.write_text(json.dumps(skew_data), encoding="utf-8")
+        assert pc1.ctx.sync_engine.get_lock().is_locked is False, "Released epoch tombstone must suppress stale conflict lock!"
+        stale_conflict.unlink(missing_ok=True)
+        print("  [OK] Session lock resilience, conflict tombstone & clock-skew protection verified!")
+
+        # 18.3 Cloud sync protection: block start if .tmp.drivedownload is active OR snapshot mismatches manifest
+        manifest = pc1.ctx.sync_engine._read_sync_manifest()
+        assert manifest and manifest["hostUsername"] == "Bob" and manifest["backupFile"]
+
+        dl_dir = pc1.ctx.sync_engine.shared_dir / ".tmp.drivedownload"
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        active_part = dl_dir / "downloading.part"
+        active_part.write_bytes(b"X" * 4096)
+        st_dl_blk, res_dl_blk = pc1.request("POST", "/api/server/start", token=admin_token)
+        assert st_dl_blk == 400 and "downloading" in res_dl_blk["error"].lower(), f"Expected download block, got {st_dl_blk}: {res_dl_blk}"
+        shutil.rmtree(dl_dir, ignore_errors=True)
+
+        # Simulate frozen stale latest-server.zip + temporarily missing backup -> MUST block start AND block idle clobber!
+        latest_snap = pc1.ctx.sync_engine.latest_snapshot_path
+        good_snap_bytes = latest_snap.read_bytes()
+        expected_bk = pc1.ctx.sync_engine.backups_dir / manifest["backupFile"]
+        good_bk_bytes = expected_bk.read_bytes()
+
+        latest_snap.write_bytes(b"STALE-OLD-WORLD-BYTES")
+        expected_bk.unlink()
+        st_stale_blk, res_stale_blk = pc1.request("POST", "/api/server/start", token=admin_token)
+        assert st_stale_blk == 400 and "catching up" in res_stale_blk["error"].lower(), f"Expected sync mismatch block, got {st_stale_blk}: {res_stale_blk}"
+        assert pc1.ctx.sync_engine.get_lock().is_locked is False, "Blocked start must cleanly release lock!"
+
+        # Restore paired backup only (latest-server.zip still frozen stale) -> verify recovery directly from verified backup!
+        expected_bk.write_bytes(good_bk_bytes)
+        st_rec_ok, res_rec_ok = pc1.request("POST", "/api/server/start", token=admin_token)
+        assert st_rec_ok == 200, f"Expected backup manifest fallback recovery to succeed, got {res_rec_ok}"
+        assert (pc1.ctx.mc_manager.runtime_dir / "world" / "bob_diamond_base.txt").exists(), "Bob's diamond base lost!"
+        st_rec_stop, _ = pc1.request("POST", "/api/server/stop", token=admin_token)
+        assert st_rec_stop == 200
+        print("  [OK] Active Drive transfer guard & manifest-verified backup fallback recovery verified!")
+
         print("\n============================================================")
         print("  ALL END-TO-END VERIFICATION TESTS PASSED SUCCESSFULLY! ")
         print("============================================================")

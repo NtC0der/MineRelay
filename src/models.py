@@ -5,8 +5,8 @@ import time
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Any
 
-HEARTBEAT_INTERVAL_SEC = 10
-LOCK_STALE_TIMEOUT_SEC = 45
+HEARTBEAT_INTERVAL_SEC = 15
+LOCK_STALE_TIMEOUT_SEC = 240
 
 
 def _safe_str(val: Any, default: str = "") -> str:
@@ -91,6 +91,7 @@ class HostLock:
     mc_version: str = ""
     online_players: List[str] = field(default_factory=list)
     max_players: int = 20
+    lock_epoch: str = ""
 
     def is_stale(self, now: Optional[float] = None) -> bool:
         if not self.is_locked:
@@ -121,6 +122,7 @@ class HostLock:
             "mcVersion": self.mc_version,
             "onlinePlayers": self.online_players,
             "maxPlayers": self.max_players,
+            "lockEpoch": self.lock_epoch,
         }
 
     @staticmethod
@@ -144,6 +146,7 @@ class HostLock:
             mc_version=_safe_str(data.get("mc_version", data.get("mcVersion")), ""),
             online_players=players_list,
             max_players=_safe_int(data.get("max_players", data.get("maxPlayers")), 20),
+            lock_epoch=_safe_str(data.get("lock_epoch", data.get("lockEpoch")), ""),
         )
 
 
