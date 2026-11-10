@@ -505,12 +505,23 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
 
                 if path == "/api/admin/backups/restore":
                     ctx.auth_service.require_admin(token)
-                    if ctx.mc_manager.local_status != "idle" or ctx.sync_engine.get_lock().is_actively_locked():
-                        raise ValueError("Cannot restore backup while a server is actively running.")
+                    lock = ctx.sync_engine.get_lock()
+                    if ctx.mc_manager.local_status != "idle":
+                        raise ValueError("Cannot restore backup while this server is running or starting. Click Stop & Sync first.")
+                    if lock.is_actively_locked():
+                        raise ValueError(
+                            f"Cannot restore backup while '{lock.host_username}' ({lock.machine_name}) is actively hosting. Stop the server or Force-Unlock in Zero-Port-Forward & Sync first."
+                        )
                     name = str(body.get("name", "")).strip()
                     if not name:
                         raise ValueError("Backup name is required.")
                     res = ctx.sync_engine.restore_backup(name)
+                    ctx.mc_manager._log(f"Restored world backup '{name}' to runtime and shared snapshot.", "INFO", "SyncEngine")
+                    ctx.mc_manager._emit("status_changed", ctx.mc_manager.get_status_summary())
+                    res["properties"] = ctx.mc_manager.get_server_properties()
+                    res["world"] = ctx.mc_manager.get_world_info()
+                    res["backups"] = ctx.sync_engine.list_backups()
+                    res["status"] = ctx.mc_manager.get_status_summary()
                     self._send_json(200, res)
                     return
 

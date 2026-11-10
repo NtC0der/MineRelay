@@ -1179,8 +1179,126 @@ class MinecraftManager:
 
         return props
 
+    def _migrate_playerdata_on_online_mode_change(self, level_name: str, target_online_mode: bool) -> int:
+        """
+        Preserves player inventories, stats, advancements, OP status, and whitelist entries when
+        switching between Mojang Online Auth (online-mode=true) and Cracked Support (online-mode=false)
+        by non-destructively mapping known Mojang UUIDs <-> OfflinePlayer v3 UUIDs via usercache/player lists.
+        """
+        world_dir = self.runtime_dir / self._sanitize_level_name(level_name)
+        if not world_dir.exists() or not world_dir.is_dir():
+            return 0
+
+        known_players: Dict[str, Tuple[str, List[str]]] = {}
+        for json_name in ("usercache.json", "ops.json", "whitelist.json", "banned-players.json"):
+            jp = self.runtime_dir / json_name
+            if not jp.exists():
+                continue
+            try:
+                entries = json.loads(jp.read_text(encoding="utf-8", errors="replace"))
+                if not isinstance(entries, list):
+                    continue
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "")).strip()
+                    u_val = str(item.get("uuid", "")).strip().lower()
+                    if not name or len(u_val) != 36 or "-" not in u_val:
+                        continue
+                    key = name.lower()
+                    canon, ulist = known_players.get(key, (name, []))
+                    if u_val not in ulist:
+                        ulist.append(u_val)
+                    known_players[key] = (canon, ulist)
+            except Exception:
+                continue
+
+        if not known_players:
+            return 0
+
+        dir_groups = [
+            (world_dir / "players" / "data", ".dat", True),
+            (world_dir / "players" / "stats", ".json", False),
+            (world_dir / "players" / "advancements", ".json", False),
+            (world_dir / "playerdata", ".dat", True),
+            (world_dir / "stats", ".json", False),
+            (world_dir / "advancements", ".json", False),
+        ]
+
+        migrated_players = 0
+        uuid_remaps: Dict[str, str] = {}
+
+        for lower_name, (canon_name, candidate_uuids) in known_players.items():
+            offline_uuid = self._compute_offline_uuid(canon_name).lower()
+            online_uuids = [u for u in candidate_uuids if u != offline_uuid]
+            if not online_uuids:
+                continue
+
+            if not target_online_mode:
+                src_uuids = online_uuids
+                dst_uuid = offline_uuid
+            else:
+                src_uuids = [offline_uuid]
+                dst_uuid = online_uuids[0]
+
+            player_copied = False
+            for src_uuid in src_uuids:
+                for base_dir, ext, copy_old in dir_groups:
+                    if not base_dir.exists() or not base_dir.is_dir():
+                        continue
+                    src_file = base_dir / f"{src_uuid}{ext}"
+                    dst_file = base_dir / f"{dst_uuid}{ext}"
+                    try:
+                        if src_file.is_file() and (not dst_file.exists() or dst_file.stat().st_size == 0):
+                            shutil.copy2(src_file, dst_file)
+                            player_copied = True
+                    except OSError:
+                        pass
+                    if copy_old:
+                        src_old = base_dir / f"{src_uuid}{ext}_old"
+                        dst_old = base_dir / f"{dst_uuid}{ext}_old"
+                        try:
+                            if src_old.is_file() and (not dst_old.exists() or dst_old.stat().st_size == 0):
+                                shutil.copy2(src_old, dst_old)
+                        except OSError:
+                            pass
+            if player_copied:
+                migrated_players += 1
+            uuid_remaps[lower_name] = dst_uuid
+
+        if uuid_remaps:
+            for json_name in ("ops.json", "whitelist.json"):
+                jp = self.runtime_dir / json_name
+                if not jp.exists():
+                    continue
+                try:
+                    data = json.loads(jp.read_text(encoding="utf-8", errors="replace"))
+                    if not isinstance(data, list):
+                        continue
+                    changed = False
+                    for entry in data:
+                        if isinstance(entry, dict) and entry.get("name"):
+                            k = str(entry["name"]).strip().lower()
+                            if k in uuid_remaps and str(entry.get("uuid", "")).lower() != uuid_remaps[k]:
+                                entry["uuid"] = uuid_remaps[k]
+                                changed = True
+                    if changed:
+                        jp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                except Exception:
+                    pass
+
+        if migrated_players > 0:
+            mode_label = "Online Mojang Auth" if target_online_mode else "Cracked/Offline Support"
+            self._log(
+                f"Preserved inventory/stats/permissions for {migrated_players} player(s) across switch to {mode_label}.",
+                "INFO",
+                "Server",
+            )
+        return migrated_players
+
     def update_server_properties(self, updates: Dict[str, Any]) -> Dict[str, str]:
         props = self.get_server_properties()
+        old_online_mode = props.get("online-mode", "true").lower() != "false"
         for k, v in updates.items():
             clean_key = str(k).replace("\r", "").replace("\n", "").strip()
             if clean_key:
@@ -1207,6 +1325,11 @@ class MinecraftManager:
 
         props_path = self.runtime_dir / "server.properties"
         props_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        new_online_mode = props.get("online-mode", "true").lower() != "false"
+        if "online-mode" in updates and (new_online_mode != old_online_mode or not new_online_mode):
+            level_name = self._sanitize_level_name(props.get("level-name", "world"))
+            self._migrate_playerdata_on_online_mode_change(level_name, new_online_mode)
 
         # If server is running locally, also apply live-reloadable settings immediately
         if self.local_status == "running" and self._proc and self._proc.stdin:

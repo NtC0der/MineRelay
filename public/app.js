@@ -1326,14 +1326,56 @@ function renderBackupsList(backups) {
     `;
     const restoreBtn = row.querySelector(".btn-restore-bk");
     if (restoreBtn) {
+      let confirmStep = false;
+      let confirmResetTimer = null;
       restoreBtn.addEventListener("click", async () => {
+        if (restoreBtn.disabled) return;
+        if (!confirmStep) {
+          confirmStep = true;
+          restoreBtn.textContent = "Confirm Restore?";
+          restoreBtn.classList.remove("btn-secondary");
+          restoreBtn.classList.add("btn-primary");
+          clearTimeout(confirmResetTimer);
+          confirmResetTimer = setTimeout(() => {
+            confirmStep = false;
+            restoreBtn.textContent = "Restore";
+            restoreBtn.classList.remove("btn-primary");
+            restoreBtn.classList.add("btn-secondary");
+          }, 4500);
+          return;
+        }
+        clearTimeout(confirmResetTimer);
+        confirmStep = false;
+        const allRestoreBtns = Array.from(container.querySelectorAll(".btn-restore-bk"));
+        allRestoreBtns.forEach((btn) => { btn.disabled = true; });
+        restoreBtn.textContent = "⏳ Restoring...";
         try {
-          await apiFetch("/api/admin/backups/restore", {
+          const res = await apiFetch("/api/admin/backups/restore", {
             method: "POST",
             body: JSON.stringify({ name: b.name }),
           });
-          showToast(`Restored world backup '${b.name}' to active runtime and shared snapshot!`, "success");
+          state.fileCache = {};
+          state.currentFileDir = "";
+          if (res.status) {
+            state.status = res.status;
+            renderStatusSummary(res.status);
+          }
+          if (Array.isArray(res.backups)) {
+            renderBackupsList(res.backups);
+          } else {
+            loadAdminBackups();
+          }
+          loadAdminProperties();
+          loadAdminGamerules();
+          loadAdminPlayers();
+          loadAdminFiles("", "");
+          loadAdminPlugins("");
+          showToast(`Restored backup '${b.name}'! Server world and config updated.`, "success");
         } catch (err) {
+          allRestoreBtns.forEach((btn) => { btn.disabled = false; });
+          restoreBtn.textContent = "Restore";
+          restoreBtn.classList.remove("btn-primary");
+          restoreBtn.classList.add("btn-secondary");
           showToast(err.message, "error");
         }
       });
@@ -2426,6 +2468,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("form-create-backup").addEventListener("submit", async (e) => {
     e.preventDefault();
+    const formEl = e.currentTarget;
+    const submitBtn = formEl.querySelector("button[type='submit']");
+    const origText = submitBtn ? submitBtn.textContent : "";
+    if (submitBtn) {
+      submitBtn.disabled = true;
+      submitBtn.textContent = "⏳ Creating Snapshot...";
+    }
     const label = document.getElementById("input-backup-label").value.trim() || "manual";
     try {
       const res = await apiFetch("/api/admin/backups", {
@@ -2436,6 +2485,11 @@ document.addEventListener("DOMContentLoaded", () => {
       showToast("Created world snapshot backup in Shared Sync Folder!", "success");
     } catch (err) {
       showToast(err.message, "error");
+    } finally {
+      if (submitBtn) {
+        submitBtn.disabled = false;
+        submitBtn.textContent = origText;
+      }
     }
   });
 

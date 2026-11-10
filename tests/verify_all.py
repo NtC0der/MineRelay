@@ -963,6 +963,113 @@ def run_verification():
         assert "flex: 1 0 auto;" in styles_css and "justify-content: space-between;" in styles_css
         print("  [OK] No-flash session boot veil, file request sequencing/cache & symmetrical nav-tab layout verified.")
 
+        # ---------------------------------------------------------------------
+        # 17. Atomic Backup Restore & Cracked Support UUID Progress Preservation
+        # ---------------------------------------------------------------------
+        print("\n[Test 17] Verifying Atomic Backup Restore & Cracked Support UUID Preservation...")
+
+        # 17.1 Set up rich Mojang online-mode player state & create backup
+        rt1 = pc1.ctx.mc_manager.runtime_dir
+        online_uuid = "ff36425e-4f60-4f1a-9675-82a686d59bd3"
+        offline_uuid = pc1.ctx.mc_manager._compute_offline_uuid("ProudHogRider")
+        (rt1 / "usercache.json").write_text(
+            json.dumps([{"uuid": online_uuid, "name": "ProudHogRider", "expiresOn": "2026-12-09 22:00:00 +0200"}]),
+            encoding="utf-8",
+        )
+        (rt1 / "ops.json").write_text(
+            json.dumps([{"uuid": online_uuid, "name": "ProudHogRider", "level": 4, "bypassesPlayerLimit": False}]),
+            encoding="utf-8",
+        )
+        for sub_dir, content in [
+            ("world/players/data", b"MC26-PLAYER-NBT-INVENTORY"),
+            ("world/players/stats", b'{"stats": {"mined": 42}}'),
+            ("world/players/advancements", b'{"minecraft:story/root": {"done": true}}'),
+            ("world/playerdata", b"LEGACY-PLAYER-NBT-INVENTORY"),
+        ]:
+            ext = ".dat" if ("data" in sub_dir) else ".json"
+            pdir = rt1 / sub_dir
+            pdir.mkdir(parents=True, exist_ok=True)
+            (pdir / f"{online_uuid}{ext}").write_bytes(content)
+
+        # Preserve a fake static library & paper-remapped file to ensure restore doesn't delete them
+        static_lib = rt1 / "libraries" / "netty-core.jar"
+        static_lib.parent.mkdir(parents=True, exist_ok=True)
+        static_lib.write_bytes(b"static-lib")
+        (rt1 / "plugins" / ".paper-remapped").mkdir(parents=True, exist_ok=True)
+        (rt1 / "plugins" / ".paper-remapped" / "index.json").write_text("{}", encoding="utf-8")
+
+        st_bk, res_bk = pc1.request(
+            "POST",
+            "/api/admin/backups",
+            token=admin_token,
+            body={"label": "Milioths"},
+        )
+        assert st_bk == 200 and res_bk["result"]["backupFile"]
+        good_bk_name = res_bk["result"]["backupFile"]
+        good_bk_path = pc1.ctx.sync_engine.backups_dir / good_bk_name
+        # Backdate the backup file to yesterday so we verify restore touches latest-server.zip mtime to NOW
+        old_ts = time.time() - 86400.0
+        os.utime(good_bk_path, (old_ts, old_ts))
+
+        # 17.2 Enable cracked support (online-mode=false) -> auto-migrates player data without losing progress!
+        st_crk, res_crk = pc1.request(
+            "PUT",
+            "/api/admin/properties",
+            token=admin_token,
+            body={"properties": {"online-mode": False}},
+        )
+        assert st_crk == 200
+        assert (rt1 / "world" / "players" / "data" / f"{offline_uuid}.dat").read_bytes() == b"MC26-PLAYER-NBT-INVENTORY"
+        assert (rt1 / "world" / "players" / "stats" / f"{offline_uuid}.json").exists()
+        assert (rt1 / "world" / "players" / "advancements" / f"{offline_uuid}.json").exists()
+        assert (rt1 / "world" / "playerdata" / f"{offline_uuid}.dat").read_bytes() == b"LEGACY-PLAYER-NBT-INVENTORY"
+        assert (rt1 / "world" / "players" / "data" / f"{online_uuid}.dat").exists(), "Online UUID file must remain intact!"
+        migrated_ops = json.loads((rt1 / "ops.json").read_text(encoding="utf-8"))
+        assert migrated_ops[0]["uuid"] == offline_uuid
+        print("  [OK] Enabling cracked support (online-mode=false) preserved player inventory, stats, advancements & OP permissions.")
+
+        # 17.3 Corrupt world in runtime + push newer broken snapshot, then verify atomic backup restore recovers cleanly
+        (rt1 / "world" / "players" / "data" / f"{online_uuid}.dat").unlink()
+        (rt1 / "post_disaster_marker.txt").write_text("broken", encoding="utf-8")
+        pc1.ctx.sync_engine.push_world_from_runtime(create_backup=False, backup_label="broken")
+
+        # Also test corrupted backup file rejects cleanly WITHOUT wiping runtime_dir
+        corrupt_bk = pc1.ctx.sync_engine.backups_dir / "world-corrupted.zip"
+        corrupt_bk.write_bytes(b"NOT-A-VALID-ZIP")
+        st_bad_rst, res_bad_rst = pc1.request(
+            "POST",
+            "/api/admin/backups/restore",
+            token=admin_token,
+            body={"name": "world-corrupted.zip"},
+        )
+        assert st_bad_rst == 400, f"Expected 400 for corrupt backup restore, got {st_bad_rst}: {res_bad_rst}"
+        assert (rt1 / "post_disaster_marker.txt").exists(), "Failed restore must NOT wipe runtime directory!"
+        corrupt_bk.unlink(missing_ok=True)
+
+        # Now restore Milioths' healthy backup
+        before_restore_ts = time.time() - 2.0
+        st_rst, res_rst = pc1.request(
+            "POST",
+            "/api/admin/backups/restore",
+            token=admin_token,
+            body={"name": good_bk_name},
+        )
+        assert st_rst == 200, f"Backup restore failed: {res_rst}"
+        assert res_rst["restored"] == good_bk_name
+        assert res_rst["properties"]["online-mode"] == "true"
+        assert not (rt1 / "post_disaster_marker.txt").exists(), "Stale post-disaster file should be cleaned on restore"
+        assert (rt1 / "world" / "players" / "data" / f"{online_uuid}.dat").exists()
+        assert static_lib.exists() and (rt1 / "plugins" / ".paper-remapped" / "index.json").exists(), "Static runtime dirs must be preserved"
+        # latest-server.zip mtime must be updated to NOW (newer than backup file's yesterday timestamp)
+        restored_snap_mtime = pc1.ctx.sync_engine.latest_snapshot_path.stat().st_mtime
+        assert restored_snap_mtime >= before_restore_ts, "Restored latest-server.zip mtime was not updated to current time!"
+
+        # Verify PC 2 automatically sees the newly restored snapshot when idle
+        pc2.ctx.sync_engine.ensure_runtime_synced_when_idle()
+        assert (pc2.ctx.mc_manager.runtime_dir / "world" / "players" / "data" / f"{online_uuid}.dat").exists()
+        assert pc2.ctx.mc_manager.get_server_properties().get("online-mode") == "true"
+        print("  [OK] Atomic staging restore, fresh mtime promotion, corrupt-backup guard & multi-PC pull verified!")
+
         print("\n============================================================")
         print("  ALL END-TO-END VERIFICATION TESTS PASSED SUCCESSFULLY! ")
         print("============================================================")

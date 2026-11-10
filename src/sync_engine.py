@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import time
+import zlib
 import shutil
 import zipfile
 import threading
@@ -182,19 +183,19 @@ class SyncEngine:
         tmp_path = target_path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
         content = json.dumps(data, indent=2)
         try:
-            for attempt in range(5):
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            for attempt in range(8):
                 try:
-                    with open(tmp_path, "w", encoding="utf-8") as f:
-                        f.write(content)
-                        f.flush()
-                        os.fsync(f.fileno())
                     os.replace(tmp_path, target_path)
                     return
                 except OSError:
                     time.sleep(0.08 * (attempt + 1))
-            # Fallback direct write if cloud sync client locked rename briefly
-            with open(target_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            # Never truncate target_path via direct 'w' open if cloud sync locks replace
+            if not target_path.exists():
+                shutil.copyfile(tmp_path, target_path)
         finally:
             try:
                 if tmp_path.exists():
@@ -690,12 +691,99 @@ class SyncEngine:
                 raise ValueError(f"Zip path traversal detected: {member.filename}")
             zf.extract(member, dest_dir)
 
+    def _remove_path_with_retry(self, target: Path) -> None:
+        for attempt in range(4):
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                else:
+                    target.unlink(missing_ok=True)
+                return
+            except OSError:
+                if attempt == 3 and target.is_dir():
+                    shutil.rmtree(target, ignore_errors=True)
+                else:
+                    time.sleep(0.1 * (attempt + 1))
+
+    def _extract_zip_to_runtime_safely(self, zip_source: Path) -> Dict[str, Any]:
+        """
+        Extracts a snapshot or backup zip into a temporary staging folder first so all
+        entries & CRCs are verified BEFORE clearing `./data/runtime-server`.
+        Preserves static JVM/Paper binaries (`server.jar`, `libraries/`, `versions/`,
+        `cache/`, `logs/`, `crash-reports/`, `plugins/.paper-remapped`).
+        """
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        staging_dir = self.base_data_dir / f".pull_staging_{os.getpid()}_{threading.get_ident()}"
+        preserved_entries = {"server.jar", "jar-version.json", "cache", "libraries", "versions", "logs", "crash-reports"}
+
+        try:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            staging_dir.mkdir(parents=True, exist_ok=True)
+
+            file_count = 0
+            with zipfile.ZipFile(zip_source, "r") as zf:
+                infos = zf.infolist()
+                if not infos:
+                    raise ValueError(f"Archive '{zip_source.name}' is empty.")
+                self._safe_extract_zip(zf, staging_dir)
+                file_count = sum(1 for m in infos if not m.is_dir())
+
+            # Remove stale Minecraft session.lock files inside staging
+            for lock_file in staging_dir.rglob("session.lock"):
+                try:
+                    lock_file.unlink()
+                except OSError:
+                    pass
+
+            # Clean existing dynamic world & config files in runtime_dir only AFTER staging succeeded
+            for item in list(self.runtime_dir.iterdir()):
+                if item.name in preserved_entries:
+                    continue
+                if item.name == "plugins" and item.is_dir():
+                    for sub in list(item.iterdir()):
+                        if sub.name == ".paper-remapped":
+                            continue
+                        self._remove_path_with_retry(sub)
+                    continue
+                self._remove_path_with_retry(item)
+
+            # Move verified staged items into runtime_dir without ever nesting dirs on locked paths
+            def _place_entry(src: Path, dst: Path) -> None:
+                if dst.exists():
+                    self._remove_path_with_retry(dst)
+                if not dst.exists():
+                    shutil.move(str(src), str(dst))
+                elif src.is_dir():
+                    shutil.copytree(str(src), str(dst), dirs_exist_ok=True, copy_function=shutil.copyfile)
+                else:
+                    shutil.copyfile(str(src), str(dst))
+
+            for staged_item in list(staging_dir.iterdir()):
+                if staged_item.name in preserved_entries:
+                    continue
+                dest_item = self.runtime_dir / staged_item.name
+                if staged_item.name == "plugins" and staged_item.is_dir():
+                    dest_item.mkdir(parents=True, exist_ok=True)
+                    for sub in list(staged_item.iterdir()):
+                        if sub.name == ".paper-remapped":
+                            continue
+                        _place_entry(sub, dest_item / sub.name)
+                    continue
+                _place_entry(staged_item, dest_item)
+
+            self._ensure_default_runtime_files()
+            return {"fileCount": file_count}
+        finally:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
     def pull_world_to_runtime(self) -> Dict[str, Any]:
         """
         Extracts `snapshots/latest-server.zip` from the Shared Sync Folder into `./data/runtime-server`.
         Preserves static JVM/Paper libraries (`server.jar`, `libraries/`, `versions/`, `cache/`, `plugins/.paper-remapped`)
         so version binaries don't need re-unpacking on every start.
-        Validates the zip archive BEFORE cleaning runtime files so a cloud sync lock never wipes the local world!
+        Validates & stage-extracts BEFORE cleaning runtime files so a cloud sync lock never wipes the local world!
         """
         with self._sync_mutex:
             self._ensure_shared_dirs()
@@ -706,63 +794,24 @@ class SyncEngine:
                 self._ensure_default_runtime_files()
                 return {"synced": False, "reason": "No existing shared snapshot found; initialized fresh runtime."}
 
-            # Verify the snapshot zip can be opened (retry up to 5 times in case OneDrive/Google Drive holds a brief lock)
-            last_err = None
+            # Retry up to 5 times in case Google Drive / OneDrive holds a transient lock while reading/extracting
+            last_err: Optional[Exception] = None
             for attempt in range(5):
                 try:
-                    with zipfile.ZipFile(self.latest_snapshot_path, "r") as zf:
-                        _ = zf.namelist()
+                    self._extract_zip_to_runtime_safely(self.latest_snapshot_path)
                     last_err = None
                     break
-                except Exception as e:
+                except (zipfile.BadZipFile, zlib.error, ValueError, OSError) as e:
                     last_err = e
-                    time.sleep(0.15 * (attempt + 1))
+                    time.sleep(0.18 * (attempt + 1))
 
             if last_err is not None:
-                # Keep existing runtime files intact if snapshot is temporarily unreadable
                 self._ensure_default_runtime_files()
                 return {
                     "synced": False,
                     "reason": f"Using local runtime files (snapshot temporarily busy: {last_err})",
                 }
 
-            preserved_entries = {"server.jar", "jar-version.json", "cache", "libraries", "versions", "logs", "crash-reports"}
-
-            # Clean world & config files in runtime_dir before extracting latest snapshot, while preserving plugins/.paper-remapped
-            for item in self.runtime_dir.iterdir():
-                if item.name in preserved_entries:
-                    continue
-                if item.name == "plugins" and item.is_dir():
-                    for sub in item.iterdir():
-                        if sub.name == ".paper-remapped":
-                            continue
-                        if sub.is_dir():
-                            shutil.rmtree(sub, ignore_errors=True)
-                        else:
-                            try:
-                                sub.unlink()
-                            except OSError:
-                                pass
-                    continue
-                if item.is_dir():
-                    shutil.rmtree(item, ignore_errors=True)
-                else:
-                    try:
-                        item.unlink()
-                    except OSError:
-                        pass
-
-            with zipfile.ZipFile(self.latest_snapshot_path, "r") as zf:
-                self._safe_extract_zip(zf, self.runtime_dir)
-
-            # Remove stale Minecraft session.lock files if any
-            for lock_file in self.runtime_dir.rglob("session.lock"):
-                try:
-                    lock_file.unlink()
-                except OSError:
-                    pass
-
-            self._ensure_default_runtime_files()
             st = self.latest_snapshot_path.stat()
             self._last_synced_snapshot_mtime = st.st_mtime
             self._last_synced_snapshot_sig = (st.st_mtime, st.st_size, str(self.latest_snapshot_path))
@@ -854,32 +903,93 @@ class SyncEngine:
 
     def list_backups(self) -> List[Dict[str, Any]]:
         self._ensure_shared_dirs()
-        backups: List[Dict[str, Any]] = []
-        for f in sorted(self.backups_dir.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True):
-            st = f.stat()
-            backups.append({
-                "name": f.name,
-                "sizeBytes": st.st_size,
-                "createdAt": st.st_mtime,
-            })
-        return backups
+        entries = []
+        for f in self.backups_dir.glob("*.zip"):
+            try:
+                st = f.stat()
+                entries.append((st.st_mtime, {
+                    "name": f.name,
+                    "sizeBytes": st.st_size,
+                    "createdAt": st.st_mtime,
+                }))
+            except OSError:
+                continue
+        entries.sort(key=lambda item: item[0], reverse=True)
+        return [item[1] for item in entries]
 
     def restore_backup(self, backup_name: str) -> Dict[str, Any]:
         safe_name = Path(backup_name).name
         if not safe_name or safe_name in (".", ".."):
             raise ValueError("Invalid backup name.")
-        source = self.backups_dir / safe_name
-        if not source.exists() or not source.is_file():
-            raise FileNotFoundError(f"Backup '{safe_name}' not found.")
-        try:
-            with zipfile.ZipFile(source, "r") as zf:
-                if zf.testzip() is not None:
-                    raise ValueError(f"Backup '{safe_name}' archive is corrupted.")
-        except Exception as e:
-            raise ValueError(f"Invalid backup archive: {e}")
-        shutil.copy2(source, self.latest_snapshot_path)
-        pull_res = self.pull_world_to_runtime()
-        return {"restored": safe_name, "pull": pull_res}
+
+        with self._sync_mutex:
+            self._ensure_shared_dirs()
+            source = self.backups_dir / safe_name
+            if not source.exists() or not source.is_file():
+                raise FileNotFoundError(f"Backup '{safe_name}' not found.")
+
+            # Stage-extract & validate every entry/CRC directly from backup BEFORE modifying latest-server.zip or runtime-server
+            try:
+                extract_info = self._extract_zip_to_runtime_safely(source)
+            except (zipfile.BadZipFile, zlib.error, ValueError) as e:
+                raise ValueError(f"Backup '{safe_name}' is invalid or corrupted: {e}")
+            except OSError as e:
+                raise RuntimeError(f"Backup file '{safe_name}' is temporarily locked by cloud sync ({e}). Please try again.")
+
+            # Atomically promote backup -> latest-server.zip with current mtime so cloud sync & all members pull it
+            tmp_snap = self.snapshots_dir / f"latest-server.tmp.{os.getpid()}.{threading.get_ident()}.zip"
+            try:
+                shutil.copyfile(source, tmp_snap)
+                os.utime(tmp_snap, None)
+                replaced = False
+                last_err: Optional[Exception] = None
+                for attempt in range(8):
+                    try:
+                        os.replace(tmp_snap, self.latest_snapshot_path)
+                        replaced = True
+                        break
+                    except OSError as e:
+                        last_err = e
+                        time.sleep(0.15 * (attempt + 1))
+                if not replaced:
+                    raise RuntimeError(
+                        f"Could not replace '{self.latest_snapshot_path.name}' because cloud sync locked the file ({last_err}). Try again in a moment."
+                    )
+                try:
+                    os.utime(self.latest_snapshot_path, None)
+                except OSError:
+                    pass
+            finally:
+                try:
+                    if tmp_snap.exists():
+                        tmp_snap.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            st = self.latest_snapshot_path.stat()
+            self._last_synced_snapshot_mtime = st.st_mtime
+            self._last_synced_snapshot_sig = (st.st_mtime, st.st_size, str(self.latest_snapshot_path))
+            self._save_sync_state(st.st_mtime, st.st_size, str(self.latest_snapshot_path))
+
+            # Clean up any empty/corrupt unlocked host-lock.json
+            current_lock = self.get_lock()
+            if not current_lock.is_actively_locked():
+                try:
+                    self.save_lock(HostLock(is_locked=False, status="idle"))
+                except Exception:
+                    pass
+
+            self.git_push_if_enabled(f"Restore backup {safe_name}")
+            return {
+                "restored": safe_name,
+                "pull": {
+                    "synced": True,
+                    "snapshotPath": str(self.latest_snapshot_path),
+                    "sizeBytes": st.st_size,
+                    "fileCount": extract_info.get("fileCount", 0),
+                    "timestamp": time.time(),
+                },
+            }
 
     def delete_backup(self, backup_name: str) -> bool:
         safe_name = Path(backup_name).name
