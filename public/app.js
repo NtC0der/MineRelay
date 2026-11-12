@@ -11,6 +11,8 @@ const state = {
   filesRequestSeq: 0,
   fileCache: {},
   editingFilePath: "",
+  editingFileSavedContent: "",
+  lastOnlinePlayersKey: null,
   consoleFilter: "ALL",
   consoleSearch: "",
   consoleLogs: [],
@@ -253,7 +255,9 @@ async function enterDashboard() {
 
   connectEventStream();
   if (state.pollTimer) clearInterval(state.pollTimer);
-  state.pollTimer = setInterval(refreshServerStatus, 5000);
+  state.pollTimer = setInterval(() => {
+    if (!document.hidden) refreshServerStatus();
+  }, 5000);
 }
 
 function leaveDashboard() {
@@ -267,9 +271,25 @@ function leaveDashboard() {
   }
   state.token = "";
   state.account = null;
+  state.status = null;
   state.currentFileDir = "";
   state.fileSearchQuery = "";
   state.fileCache = {};
+  state.editingFilePath = "";
+  state.editingFileSavedContent = "";
+  state.lastOnlinePlayersKey = null;
+  state.consoleLogs = [];
+  state.cmdHistory = [];
+  state.cmdHistoryIdx = -1;
+  state.pendingAction = null;
+  state.statusSeq++;
+  renderedLogIds.clear();
+  const term = document.getElementById("console-output");
+  if (term) term.innerHTML = "";
+  const editorBox = document.getElementById("file-editor-box");
+  if (editorBox) editorBox.classList.add("hidden");
+  const loginPk = document.getElementById("login-passkey");
+  if (loginPk) loginPk.value = "";
   localStorage.removeItem("minerelay_token");
   document.documentElement.classList.remove("session-restoring");
   document.getElementById("dashboard-view").classList.add("hidden");
@@ -301,9 +321,13 @@ function connectEventStream() {
           return;
         }
         clearPendingActionIfSettled(incoming.localStatus, incoming.lastError);
+        state.statusSeq++;
         const prevStatus = state.status ? state.status.localStatus : "idle";
         state.status = incoming;
         renderStatusSummary(incoming);
+        if (incoming.logs) {
+          renderAllConsoleLogs(incoming.logs);
+        }
         if (
           (prevStatus === "starting" || prevStatus === "syncing_pull" || prevStatus === "restarting") &&
           incoming.localStatus === "running"
@@ -576,7 +600,7 @@ function renderStatusSummary(summary) {
     if (tunnel.claimUrl) {
       heroClaimBanner.classList.remove("hidden");
       document.getElementById("hero-claim-btn").href = tunnel.claimUrl;
-    } else if (isLanAddress) {
+    } else if (isLanAddress && lock.isActivelyLocked && summary.isLocalMachineHosting) {
       heroClaimBanner.classList.remove("hidden");
       document.getElementById("hero-claim-btn").href = "https://playit.gg/account/tunnels";
     } else {
@@ -596,8 +620,10 @@ function renderStatusSummary(summary) {
       ? `Device: ${lock.machineName || "Remote PC"} (${formatTimeAgo(lock.lastHeartbeat)})`
       : "Ready for any member to host";
 
-  const onlineList = summary.onlinePlayers || (lock.isActivelyLocked ? lock.onlinePlayers : []) || lock.onlinePlayers || [];
-  const maxP = lock.maxPlayers || 20;
+  const onlineList = Array.isArray(summary.onlinePlayers)
+    ? summary.onlinePlayers
+    : (lock.isActivelyLocked && Array.isArray(lock.onlinePlayers) ? lock.onlinePlayers : []);
+  const maxP = lock.maxPlayers || cluster.maxPlayers || 20;
   document.getElementById("metric-players").textContent = `${onlineList.length} / ${maxP}`;
   document.getElementById("metric-players-list").textContent =
     onlineList.length > 0 ? onlineList.join(", ") : "No players currently online";
@@ -605,15 +631,33 @@ function renderStatusSummary(summary) {
   // Synchronize Tab 4 dedicated online players list in real time
   renderOnlinePlayersList(onlineList);
 
+  const tpsVal = typeof telemetry.tps === "number" ? telemetry.tps : 20.0;
   document.getElementById("metric-tps").textContent = lock.isActivelyLocked
-    ? `${(telemetry.tps || 20.0).toFixed(1)} TPS`
+    ? `${tpsVal.toFixed(1)} TPS`
     : "Offline";
-  document.getElementById("metric-cpu").textContent = `CPU Load: ${telemetry.cpuPercent || 0}%`;
+  document.getElementById("metric-cpu").textContent = `CPU Load: ${telemetry.cpuPercent ?? 0}%`;
 
   document.getElementById("metric-ram").textContent =
-    `${telemetry.memoryUsedMb || 0} / ${telemetry.memoryMaxMb || 4096} MB`;
+    `${telemetry.memoryUsedMb ?? 0} / ${telemetry.memoryMaxMb ?? cluster.memoryMaxMb ?? 4096} MB`;
   document.getElementById("metric-uptime").textContent =
-    `Uptime: ${formatDuration(telemetry.uptimeSeconds || 0)}`;
+    `Uptime: ${formatDuration(telemetry.uptimeSeconds ?? 0)}`;
+
+  // Sync Console Command Bar & Mirror Footer for Local vs Remote Host
+  const isAdmin = state.account && state.account.role === "admin";
+  const isRemoteHosting = Boolean(lock.isActivelyLocked && !summary.isLocalMachineHosting);
+  const cmdForm = document.getElementById("form-console-cmd");
+  const quickCmds = document.getElementById("admin-quick-cmds");
+  const consoleFooter = document.getElementById("member-console-footer");
+  if (cmdForm) cmdForm.classList.toggle("hidden", !isAdmin || isRemoteHosting);
+  if (quickCmds) quickCmds.classList.toggle("hidden", !isAdmin || isRemoteHosting);
+  if (consoleFooter) {
+    consoleFooter.classList.toggle("hidden", isAdmin && !isRemoteHosting);
+    consoleFooter.textContent = isRemoteHosting
+      ? `Live console mirrored from ${lock.hostUsername || "member"} on ${lock.machineName || "remote PC"}. Console commands run only on the active host.`
+      : "Console command execution is restricted to the Admin account.";
+  }
+
+  updateMotdPreview();
 
   // Admin Config & Network Tab Status Boxes
   if (state.account && state.account.role === "admin") {
@@ -757,16 +801,20 @@ function matchesConsoleFilter(entry) {
   return true;
 }
 
+function createConsoleLogElement(entry) {
+  const div = document.createElement("div");
+  div.className = `log-line log-${entry.level || "INFO"} log-${entry.source || "Server"}`;
+  div.textContent = entry.text;
+  return div;
+}
+
 function rebuildConsoleView() {
   const term = document.getElementById("console-output");
   if (!term) return;
   term.innerHTML = "";
   state.consoleLogs.forEach((entry) => {
     if (matchesConsoleFilter(entry)) {
-      const div = document.createElement("div");
-      div.className = `log-line log-${entry.level || "INFO"} log-${entry.source || "Server"}`;
-      div.textContent = entry.text;
-      term.appendChild(div);
+      term.appendChild(createConsoleLogElement(entry));
     }
   });
   const autoScrollEl = document.getElementById("console-autoscroll");
@@ -799,10 +847,7 @@ function appendConsoleLine(entry, autoScroll = true) {
   }
   if (!matchesConsoleFilter(entry)) return;
   const term = document.getElementById("console-output");
-  const div = document.createElement("div");
-  div.className = `log-line log-${entry.level || "INFO"} log-${entry.source || "Server"}`;
-  div.textContent = entry.text;
-  term.appendChild(div);
+  term.appendChild(createConsoleLogElement(entry));
   const autoScrollEl = document.getElementById("console-autoscroll");
   if (autoScroll && (!autoScrollEl || autoScrollEl.checked)) {
     term.scrollTop = term.scrollHeight;
@@ -848,22 +893,52 @@ async function loadAdminAccounts() {
       `;
       const renameBtn = tr.querySelector(".btn-rename-acc");
       if (renameBtn) {
-        renameBtn.addEventListener("click", async () => {
-          const newName = prompt(`Enter new username for '${acc.username}':`, acc.username);
-          if (!newName || !newName.trim() || newName.trim() === acc.username) return;
-          try {
-            const res = await apiFetch("/api/admin/accounts/rename", {
-              method: "POST",
-              body: JSON.stringify({ userId: acc.id, username: newName.trim() }),
+        renameBtn.addEventListener("click", () => {
+          const nameCell = tr.firstElementChild;
+          if (!nameCell || tr.querySelector(".inline-rename-form")) return;
+          const origHtml = nameCell.innerHTML;
+          nameCell.innerHTML = `
+            <form class="inline-rename-form" style="display:flex;gap:0.35rem;align-items:center;">
+              <input type="text" class="form-input inline-rename-input" value="${escapeHtml(acc.username)}" style="max-width:170px;padding:0.2rem 0.45rem;font-size:0.82rem;" required />
+              <button type="submit" class="btn btn-primary btn-xs">Save</button>
+              <button type="button" class="btn btn-ghost btn-xs inline-rename-cancel">Cancel</button>
+            </form>
+          `;
+          const inp = nameCell.querySelector(".inline-rename-input");
+          const cancelBtn = nameCell.querySelector(".inline-rename-cancel");
+          const form = nameCell.querySelector(".inline-rename-form");
+          if (inp) {
+            inp.focus();
+            inp.select();
+          }
+          if (cancelBtn) {
+            cancelBtn.addEventListener("click", () => {
+              nameCell.innerHTML = origHtml;
             });
-            showToast(`Renamed account to '${res.account.username}'.`, "success");
-            if (state.account && state.account.id === acc.id) {
-              state.account.username = res.account.username;
-              document.getElementById("user-name-label").textContent = res.account.username;
-            }
-            loadAdminAccounts();
-          } catch (err) {
-            showToast(err.message, "error");
+          }
+          if (form) {
+            form.addEventListener("submit", async (e) => {
+              e.preventDefault();
+              const trimmed = inp ? inp.value.trim() : "";
+              if (!trimmed || trimmed === acc.username) {
+                nameCell.innerHTML = origHtml;
+                return;
+              }
+              try {
+                const res = await apiFetch("/api/admin/accounts/rename", {
+                  method: "POST",
+                  body: JSON.stringify({ userId: acc.id, username: trimmed }),
+                });
+                showToast(`Renamed account to '${res.account.username}'.`, "success");
+                if (state.account && state.account.id === acc.id) {
+                  state.account.username = res.account.username;
+                  document.getElementById("user-name-label").textContent = res.account.username;
+                }
+                loadAdminAccounts();
+              } catch (err) {
+                showToast(err.message, "error");
+              }
+            });
           }
         });
       }
@@ -911,9 +986,16 @@ function updateMotdPreview() {
   const motdEl = document.getElementById("prop-motd");
   const prevText = document.getElementById("motd-preview-text");
   const prevTitle = document.getElementById("motd-preview-title");
+  const prevSlots = document.getElementById("motd-preview-slots");
   const srvNameEl = document.getElementById("cfg-server-name");
+  const maxPlayersEl = document.getElementById("prop-max-players");
   if (prevTitle && srvNameEl) {
     prevTitle.textContent = srvNameEl.value.trim() || "MineRelay Shared Server";
+  }
+  if (prevSlots) {
+    const onlineCount = state.status && Array.isArray(state.status.onlinePlayers) ? state.status.onlinePlayers.length : 0;
+    const maxP = parseInt(maxPlayersEl && maxPlayersEl.value ? maxPlayersEl.value : "", 10) || 20;
+    prevSlots.textContent = `${onlineCount}/${maxP}`;
   }
   if (!motdEl || !prevText) return;
   const raw = motdEl.value || "MineRelay Shared Server";
@@ -985,12 +1067,12 @@ function renderWorldGeneratorInfo(worldInfo, props = {}) {
   }
 }
 
-async function loadAdminProperties() {
+async function loadAdminProperties(includeVersions = true) {
   try {
     const [propsRes, statusRes, versRes] = await Promise.all([
       apiFetch("/api/admin/properties"),
       apiFetch("/api/server/status"),
-      apiFetch("/api/admin/versions").catch(() => null),
+      includeVersions ? apiFetch("/api/admin/versions").catch(() => null) : Promise.resolve(null),
     ]);
     const p = propsRes.properties || {};
     const c = statusRes.cluster || {};
@@ -1102,12 +1184,19 @@ async function loadAdminPlayers() {
 function renderOnlinePlayersList(online) {
   const onlineEl = document.getElementById("online-players-container");
   if (!onlineEl) return;
+  const list = Array.isArray(online) ? online : [];
+  const nextKey = JSON.stringify(list);
+  const activeFocusedInside = onlineEl.contains(document.activeElement);
+  if (activeFocusedInside || (nextKey === state.lastOnlinePlayersKey && onlineEl.childElementCount > 0)) {
+    return;
+  }
+  state.lastOnlinePlayersKey = nextKey;
   onlineEl.innerHTML = "";
-  if (!online || online.length === 0) {
+  if (list.length === 0) {
     onlineEl.innerHTML = `<span style="color:var(--text-muted);font-size:0.84rem;">No players currently online.</span>`;
     return;
   }
-  online.forEach((name) => {
+  list.forEach((name) => {
     const row = document.createElement("div");
     row.className = "list-row";
     row.style.width = "100%";
@@ -1461,8 +1550,6 @@ function renderBackupsList(backups) {
 
 function renderFileBreadcrumbs(currentDir) {
   const nav = document.getElementById("file-breadcrumbs");
-  const legacyDir = document.getElementById("file-current-dir");
-  if (legacyDir) legacyDir.textContent = "/" + (currentDir || "");
   if (!nav) return;
   nav.innerHTML = "";
 
@@ -1599,6 +1686,7 @@ function renderFilesList(files, currentDir, isSearching) {
         await apiFetch(`/api/admin/files?path=${encodeURIComponent(f.path)}`, {
           method: "DELETE",
         });
+        state.fileCache = {};
         loadAdminFiles(state.currentFileDir, state.fileSearchQuery);
         showToast(`Deleted ${f.name}`, "info");
       } catch (err) {
@@ -1705,6 +1793,7 @@ async function openFileInEditor(relPath) {
   try {
     const data = await apiFetch(`/api/admin/files/read?path=${encodeURIComponent(relPath)}`);
     state.editingFilePath = data.path;
+    state.editingFileSavedContent = data.content || "";
     document.getElementById("file-editor-path").textContent = data.path;
     document.getElementById("file-editor-textarea").value = data.content;
     document.getElementById("file-editor-box").classList.remove("hidden");
@@ -1728,9 +1817,23 @@ function switchDashboardTab(tabId) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  // Passkey modal buttons
+  // Passkey modal buttons & Escape/backdrop dismissal
+  const passkeyModal = document.getElementById("passkey-modal");
   document.getElementById("passkey-modal-close").addEventListener("click", hidePasskeyModal);
   document.getElementById("passkey-modal-done").addEventListener("click", hidePasskeyModal);
+  if (passkeyModal) {
+    passkeyModal.addEventListener("click", (e) => {
+      if (e.target === passkeyModal) hidePasskeyModal();
+    });
+  }
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && passkeyModal && !passkeyModal.classList.contains("hidden")) {
+      hidePasskeyModal();
+    }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden && state.token) refreshServerStatus();
+  });
   document.getElementById("passkey-modal-copy").addEventListener("click", () => {
     const pk = document.getElementById("passkey-modal-value").textContent;
     navigator.clipboard.writeText(pk);
@@ -1746,49 +1849,69 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("sync-folder-editor").classList.toggle("hidden");
   });
 
-  const browseBtnAuth = document.getElementById("btn-browse-sync-dir");
-  if (browseBtnAuth) {
-    browseBtnAuth.addEventListener("click", async () => {
-      if (browseBtnAuth.disabled) return;
-      const origText = browseBtnAuth.textContent;
-      browseBtnAuth.disabled = true;
-      browseBtnAuth.textContent = "Opening Explorer...";
-      try {
-        const res = await apiFetch("/api/setup/browse-folder", { method: "POST" });
-        if (res.selectedPath) {
-          document.getElementById("input-sync-dir").value = res.selectedPath;
-          const saveRes = await apiFetch("/api/setup/sync-dir", {
-            method: "POST",
-            body: JSON.stringify({ sharedSyncDir: res.selectedPath }),
-          });
-          document.getElementById("auth-sync-dir-label").textContent = saveRes.sharedSyncDir;
-          showToast(`Selected Shared Sync Folder: ${saveRes.sharedSyncDir}`, "success");
-          checkInitialSetup();
-        }
-      } catch (err) {
-        showToast(err.message, "error");
-      } finally {
-        browseBtnAuth.disabled = false;
-        browseBtnAuth.textContent = origText;
+  function bindSyncDirControls({ browseBtnId, saveBtnId, inputId, labelId, editorId, onSaved }) {
+    const browseBtn = document.getElementById(browseBtnId);
+    const saveBtn = document.getElementById(saveBtnId);
+    const applySyncDir = async (dirPath) => {
+      const saveRes = await apiFetch("/api/setup/sync-dir", {
+        method: "POST",
+        body: JSON.stringify({ sharedSyncDir: dirPath }),
+      });
+      const resolved = saveRes.sharedSyncDir || dirPath;
+      const inp = document.getElementById(inputId);
+      if (inp) inp.value = resolved;
+      if (labelId) {
+        const lbl = document.getElementById(labelId);
+        if (lbl) lbl.textContent = resolved;
       }
-    });
+      if (editorId) {
+        const ed = document.getElementById(editorId);
+        if (ed) ed.classList.add("hidden");
+      }
+      if (onSaved) onSaved(resolved);
+    };
+    if (browseBtn) {
+      browseBtn.addEventListener("click", async () => {
+        if (browseBtn.disabled) return;
+        const origText = browseBtn.textContent;
+        browseBtn.disabled = true;
+        browseBtn.textContent = "Opening Explorer...";
+        try {
+          const res = await apiFetch("/api/setup/browse-folder", { method: "POST" });
+          if (res.selectedPath) {
+            await applySyncDir(res.selectedPath);
+            showToast(`Selected Shared Sync Folder: ${res.selectedPath}`, "success");
+          }
+        } catch (err) {
+          showToast(err.message, "error");
+        } finally {
+          browseBtn.disabled = false;
+          browseBtn.textContent = origText;
+        }
+      });
+    }
+    if (saveBtn) {
+      saveBtn.addEventListener("click", async () => {
+        const inp = document.getElementById(inputId);
+        const newDir = inp ? inp.value.trim() : "";
+        if (!newDir) return;
+        try {
+          await applySyncDir(newDir);
+          showToast("Updated Shared Sync Folder path!", "success");
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      });
+    }
   }
 
-  document.getElementById("btn-save-sync-dir").addEventListener("click", async () => {
-    const newDir = document.getElementById("input-sync-dir").value.trim();
-    if (!newDir) return;
-    try {
-      const res = await apiFetch("/api/setup/sync-dir", {
-        method: "POST",
-        body: JSON.stringify({ sharedSyncDir: newDir }),
-      });
-      document.getElementById("auth-sync-dir-label").textContent = res.sharedSyncDir;
-      document.getElementById("sync-folder-editor").classList.add("hidden");
-      showToast("Updated Shared Sync Folder path!", "success");
-      checkInitialSetup();
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+  bindSyncDirControls({
+    browseBtnId: "btn-browse-sync-dir",
+    saveBtnId: "btn-save-sync-dir",
+    inputId: "input-sync-dir",
+    labelId: "auth-sync-dir-label",
+    editorId: "sync-folder-editor",
+    onSaved: () => checkInitialSetup(),
   });
 
   // Show/hide passkey input
@@ -1971,7 +2094,7 @@ document.addEventListener("DOMContentLoaded", () => {
           loadAdminBackups();
           loadAdminPlugins();
         }
-        if (target === "tab-network") loadAdminProperties();
+        if (target === "tab-network") loadAdminProperties(false);
       }
     });
   });
@@ -2121,11 +2244,23 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Live MOTD preview listeners
+  // Live MOTD preview listeners & Disable-End checkbox sync
   const motdInput = document.getElementById("prop-motd");
   if (motdInput) motdInput.addEventListener("input", updateMotdPreview);
   const srvNameInput = document.getElementById("cfg-server-name");
   if (srvNameInput) srvNameInput.addEventListener("input", updateMotdPreview);
+  const maxPlayersInput = document.getElementById("prop-max-players");
+  if (maxPlayersInput) maxPlayersInput.addEventListener("input", updateMotdPreview);
+  const propDisableEnd = document.getElementById("prop-disable-end");
+  const worldDisableEnd = document.getElementById("world-disable-end");
+  if (propDisableEnd && worldDisableEnd) {
+    propDisableEnd.addEventListener("change", () => {
+      worldDisableEnd.checked = propDisableEnd.checked;
+    });
+    worldDisableEnd.addEventListener("change", () => {
+      propDisableEnd.checked = worldDisableEnd.checked;
+    });
+  }
 
   // Save JVM & Cluster Settings
   document.getElementById("form-jvm-settings").addEventListener("submit", async (e) => {
@@ -2361,6 +2496,9 @@ document.addEventListener("DOMContentLoaded", () => {
   if (formGamerules) {
     formGamerules.addEventListener("submit", async (e) => {
       e.preventDefault();
+      const sleepPct = parseInt(document.getElementById("gr-playersSleepingPercentage").value, 10);
+      const tickSpeed = parseInt(document.getElementById("gr-randomTickSpeed").value, 10);
+      const spawnRad = parseInt(document.getElementById("gr-spawnRadius").value, 10);
       const gamerules = {
         keepInventory: document.getElementById("gr-keepInventory").checked,
         mobGriefing: document.getElementById("gr-mobGriefing").checked,
@@ -2371,10 +2509,10 @@ document.addEventListener("DOMContentLoaded", () => {
         doImmediateRespawn: document.getElementById("gr-doImmediateRespawn").checked,
         forgiveDeadPlayers: document.getElementById("gr-forgiveDeadPlayers").checked,
         announceAdvancements: document.getElementById("gr-announceAdvancements").checked,
-        playersSleepingPercentage: parseInt(document.getElementById("gr-playersSleepingPercentage").value, 10),
-        randomTickSpeed: parseInt(document.getElementById("gr-randomTickSpeed").value, 10),
-        spawnRadius: parseInt(document.getElementById("gr-spawnRadius").value, 10),
       };
+      if (Number.isFinite(sleepPct)) gamerules.playersSleepingPercentage = sleepPct;
+      if (Number.isFinite(tickSpeed)) gamerules.randomTickSpeed = tickSpeed;
+      if (Number.isFinite(spawnRad)) gamerules.spawnRadius = spawnRad;
       try {
         await apiFetch("/api/admin/gamerules", {
           method: "PUT",
@@ -2486,7 +2624,27 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  document.getElementById("btn-close-file").addEventListener("click", () => {
+  const btnCloseFile = document.getElementById("btn-close-file");
+  let closeConfirmTimer = null;
+  let closeConfirmArmed = false;
+  btnCloseFile.addEventListener("click", () => {
+    const curContent = document.getElementById("file-editor-textarea").value;
+    if (curContent !== state.editingFileSavedContent && !closeConfirmArmed) {
+      closeConfirmArmed = true;
+      btnCloseFile.textContent = "Discard Unsaved?";
+      clearTimeout(closeConfirmTimer);
+      closeConfirmTimer = setTimeout(() => {
+        closeConfirmArmed = false;
+        btnCloseFile.textContent = "Close";
+      }, 3500);
+      showToast("Unsaved edits in file! Click 'Discard Unsaved?' again to close without saving.", "info");
+      return;
+    }
+    clearTimeout(closeConfirmTimer);
+    closeConfirmArmed = false;
+    btnCloseFile.textContent = "Close";
+    state.editingFilePath = "";
+    state.editingFileSavedContent = "";
     document.getElementById("file-editor-box").classList.add("hidden");
   });
 
@@ -2497,6 +2655,10 @@ document.addEventListener("DOMContentLoaded", () => {
         method: "POST",
         body: JSON.stringify({ path: state.editingFilePath, content }),
       });
+      state.editingFileSavedContent = content;
+      state.fileCache = {};
+      closeConfirmArmed = false;
+      btnCloseFile.textContent = "Close";
       showToast(`Saved ${state.editingFilePath}!`, "success");
     } catch (err) {
       showToast(err.message, "error");
@@ -2504,7 +2666,8 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   document.getElementById("input-file-upload").addEventListener("change", (e) => {
-    const file = e.target.files[0];
+    const fileInput = e.target;
+    const file = fileInput.files[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = async () => {
@@ -2518,10 +2681,13 @@ document.addEventListener("DOMContentLoaded", () => {
             dataBase64: base64,
           }),
         });
+        state.fileCache = {};
         showToast(`Uploaded ${file.name}!`, "success");
-        loadAdminFiles(state.currentFileDir);
+        loadAdminFiles(state.currentFileDir, state.fileSearchQuery);
       } catch (err) {
         showToast(err.message, "error");
+      } finally {
+        fileInput.value = "";
       }
     };
     reader.readAsDataURL(file);
@@ -2593,46 +2759,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  const browseBtnNet = document.getElementById("btn-net-browse-sync");
-  if (browseBtnNet) {
-    browseBtnNet.addEventListener("click", async () => {
-      if (browseBtnNet.disabled) return;
-      const origText = browseBtnNet.textContent;
-      browseBtnNet.disabled = true;
-      browseBtnNet.textContent = "Opening Explorer...";
-      try {
-        const res = await apiFetch("/api/setup/browse-folder", { method: "POST" });
-        if (res.selectedPath) {
-          document.getElementById("net-sync-dir").value = res.selectedPath;
-          await apiFetch("/api/setup/sync-dir", {
-            method: "POST",
-            body: JSON.stringify({ sharedSyncDir: res.selectedPath }),
-          });
-          showToast(`Updated Shared Sync Folder: ${res.selectedPath}`, "success");
-          refreshServerStatus();
-        }
-      } catch (err) {
-        showToast(err.message, "error");
-      } finally {
-        browseBtnNet.disabled = false;
-        browseBtnNet.textContent = origText;
-      }
-    });
-  }
-
-  document.getElementById("btn-net-save-sync").addEventListener("click", async () => {
-    const sharedSyncDir = document.getElementById("net-sync-dir").value.trim();
-    if (!sharedSyncDir) return;
-    try {
-      await apiFetch("/api/setup/sync-dir", {
-        method: "POST",
-        body: JSON.stringify({ sharedSyncDir }),
-      });
-      showToast("Updated local machine's Shared Sync Folder path!", "success");
-      refreshServerStatus();
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+  bindSyncDirControls({
+    browseBtnId: "btn-net-browse-sync",
+    saveBtnId: "btn-net-save-sync",
+    inputId: "net-sync-dir",
+    onSaved: () => refreshServerStatus(),
   });
 
   document.getElementById("btn-save-sync-toggles").addEventListener("click", async () => {

@@ -40,7 +40,6 @@ class TunnelManager:
 
         self._proc: Optional[subprocess.Popen] = None
         self._claim_exchange_proc: Optional[subprocess.Popen] = None
-        self._claim_code: str = ""
         self._claim_init_started: bool = False
         self._mutex = threading.RLock()
         self.status: str = "stopped"  # 'stopped' | 'starting' | 'claim_required' | 'online' | 'relay_ready' | 'error'
@@ -111,9 +110,9 @@ class TunnelManager:
         self.download_progress = 0
         self._append_log(f"Downloading official playit.gg agent from {url} ...")
 
+        tmp_target = self.playit_binary_path.with_suffix(".tmp")
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "MineRelay/1.0"})
-            tmp_target = self.playit_binary_path.with_suffix(".tmp")
             with urllib.request.urlopen(req, timeout=30) as resp:
                 total = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
@@ -137,6 +136,12 @@ class TunnelManager:
             self.is_downloading = False
             self._append_log(f"Failed to download playit.gg binary: {e}")
             raise RuntimeError(f"Could not download playit binary: {e}")
+        finally:
+            try:
+                if tmp_target.exists():
+                    tmp_target.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def save_secret_key(self, secret_key: str) -> None:
         """Saves a playit.gg secret key to the shared folder so all members share the tunnel."""
@@ -344,23 +349,31 @@ class TunnelManager:
                     self._claim_init_started = False
                     return
 
-                self._claim_code = code
                 self.claim_url = f"https://playit.gg/claim/{code}"
                 if self.status in ("stopped", "lan_only"):
                     self.status = "claim_required"
                 self._append_log(f"Generated playit.gg claim link: {self.claim_url}")
                 self._emit("tunnel_updated", self.get_state())
 
-                # Wait for user to click the claim link and exchange it for secret_key
-                ex_res = subprocess.run(
+                # Wait for user to click the claim link and exchange it for secret_key (cancellable via stop_tunnel)
+                ex_proc = subprocess.Popen(
                     [bin_path, "-s", "claim", "exchange", code, "--wait", "600"],
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
-                    timeout=610,
                     creationflags=creationflags,
                 )
+                self._claim_exchange_proc = ex_proc
+                ex_stdout = ""
+                try:
+                    ex_stdout, _ = ex_proc.communicate(timeout=610)
+                except subprocess.TimeoutExpired:
+                    ex_proc.kill()
+                finally:
+                    if self._claim_exchange_proc is ex_proc:
+                        self._claim_exchange_proc = None
                 secret_key = ""
-                for line in (ex_res.stdout or "").splitlines():
+                for line in (ex_stdout or "").splitlines():
                     clean = ansi_escape.sub("", line).strip()
                     if "playit_cli::ui:" in clean:
                         clean = clean.split("playit_cli::ui:", 1)[1].strip()
@@ -516,16 +529,18 @@ class TunnelManager:
 
     def stop_tunnel(self) -> Dict[str, Any]:
         with self._mutex:
-            if self._proc is not None:
-                try:
-                    self._proc.terminate()
-                    self._proc.wait(timeout=3)
-                except Exception:
+            for proc_attr in ("_proc", "_claim_exchange_proc"):
+                proc = getattr(self, proc_attr, None)
+                if proc is not None:
                     try:
-                        self._proc.kill()
+                        proc.terminate()
+                        proc.wait(timeout=3)
                     except Exception:
-                        pass
-                self._proc = None
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    setattr(self, proc_attr, None)
             self._kill_orphaned_playit_processes()
             if self.has_shared_secret():
                 self.status = "stopped"

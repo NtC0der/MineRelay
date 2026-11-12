@@ -83,16 +83,33 @@ class AppContext:
             ).start()
 
     def _remote_lock_watcher_loop(self) -> None:
-        """Polls shared host lock state every 4s when dashboards are connected and pushes instant SSE updates."""
+        """Polls shared host lock & remote telemetry state every 3s and pushes instant SSE updates to dashboards."""
         last_sig: Any = None
+        seen_remote_log_ids: set = set()
         while True:
-            time.sleep(4.0)
+            time.sleep(3.0)
             try:
                 with self.sse_mutex:
                     has_clients = len(self.sse_clients) > 0
                 if not has_clients:
                     continue
                 lock = self.sync_engine.get_lock()
+                remote_tel = None
+                if lock.is_actively_locked() and not self.sync_engine.is_locked_by_current_machine(lock):
+                    remote_tel = self.sync_engine.read_host_telemetry(expected_epoch=lock.lock_epoch)
+                    if remote_tel and isinstance(remote_tel.get("logs"), list):
+                        for entry in remote_tel["logs"][-40:]:
+                            eid = entry.get("id") if isinstance(entry, dict) else None
+                            if eid and eid not in seen_remote_log_ids:
+                                seen_remote_log_ids.add(eid)
+                                self.broadcast_event("console_log", entry)
+                        if len(seen_remote_log_ids) > 600:
+                            seen_remote_log_ids = {
+                                e.get("id") for e in remote_tel["logs"][-120:] if isinstance(e, dict) and e.get("id")
+                            }
+                elif not lock.is_actively_locked():
+                    seen_remote_log_ids.clear()
+
                 sig = (
                     lock.is_locked,
                     lock.is_stale(),
@@ -103,6 +120,10 @@ class AppContext:
                     tuple(lock.online_players),
                     lock.public_address,
                     lock.tunnel_status,
+                    lock.memory_used_mb,
+                    lock.cpu_percent,
+                    lock.tps,
+                    (remote_tel or {}).get("updatedAt") if remote_tel else None,
                 )
                 if last_sig is not None and sig != last_sig:
                     self.broadcast_event("status_changed", self.mc_manager.get_status_summary())
@@ -232,35 +253,13 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     user = ctx.auth_service.require_auth(token)
                     summary = ctx.mc_manager.get_status_summary()
                     summary["currentUser"] = user.to_public_dict()
-                    summary["logs"] = ctx.mc_manager.console_logs[-120:]
-                    if "onlinePlayers" not in summary:
-                        lock = ctx.sync_engine.get_lock()
-                        with ctx.mc_manager._mutex:
-                            mc_online = list(ctx.mc_manager.online_players)
-                        summary["onlinePlayers"] = (
-                            mc_online
-                            if ctx.mc_manager.local_status == "running"
-                            else (list(lock.online_players) if lock.is_actively_locked() else [])
-                        )
+                    summary["logs"] = ctx.mc_manager.get_effective_logs(120)
                     self._send_json(200, summary)
                     return
 
                 if path == "/api/players":
-                    user = ctx.auth_service.require_auth(token)
-                    lock = ctx.sync_engine.get_lock()
-                    with ctx.mc_manager._mutex:
-                        mc_online = list(ctx.mc_manager.online_players)
-                    online_list = (
-                        mc_online
-                        if ctx.mc_manager.local_status == "running"
-                        else (list(lock.online_players) if lock.is_actively_locked() else [])
-                    )
-                    max_p = lock.max_players if (lock.is_locked or lock.is_actively_locked()) else 20
-                    self._send_json(200, {
-                        "online": online_list,
-                        "count": len(online_list),
-                        "max": max_p,
-                    })
+                    ctx.auth_service.require_auth(token)
+                    self._send_json(200, ctx.mc_manager.get_fast_players_snapshot())
                     return
 
                 if path == "/api/events":
@@ -536,16 +535,12 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     lock = ctx.sync_engine.get_lock()
                     if ctx.mc_manager.local_status == "idle":
                         if lock.is_locked and not ctx.sync_engine.is_locked_by_current_machine(lock):
-                            raise ValueError(
+                            raise HostLockConflictError(
                                 f"Cannot create snapshot while '{lock.host_username}' ({lock.machine_name}) holds the host lock."
                             )
                         ctx.sync_engine.ensure_runtime_synced_when_idle(strict=True)
                     label = str(body.get("label", "manual"))
-                    res = ctx.sync_engine.push_world_from_runtime(
-                        create_backup=True,
-                        backup_label=label,
-                        host_username=admin_user.username,
-                    )
+                    res = ctx.mc_manager.flush_and_backup_live_world(label=label, host_username=admin_user.username)
                     self._send_json(200, {"result": res, "backups": ctx.sync_engine.list_backups()})
                     return
 
@@ -673,13 +668,24 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     if "serverName" in body:
                         cfg.server_name = str(body["serverName"]).strip() or cfg.server_name
                     if "mcSoftware" in body:
-                        cfg.mc_software = str(body["mcSoftware"]).strip()
+                        sw = str(body["mcSoftware"]).strip().lower()
+                        if sw not in ("paper", "vanilla"):
+                            raise ValueError("mcSoftware must be 'paper' or 'vanilla'.")
+                        cfg.mc_software = sw
                     if "mcVersion" in body:
-                        cfg.mc_version = str(body["mcVersion"]).strip()
-                    if "memoryMinMb" in body:
-                        cfg.memory_min_mb = max(512, self._require_int(body["memoryMinMb"], "memoryMinMb"))
-                    if "memoryMaxMb" in body:
-                        cfg.memory_max_mb = max(cfg.memory_min_mb, self._require_int(body["memoryMaxMb"], "memoryMaxMb"))
+                        ver = str(body["mcVersion"]).strip()
+                        if not ver:
+                            raise ValueError("mcVersion cannot be empty.")
+                        cfg.mc_version = ver
+                    new_mem_min = max(512, self._require_int(body["memoryMinMb"], "memoryMinMb")) if "memoryMinMb" in body else cfg.memory_min_mb
+                    new_mem_max = max(512, self._require_int(body["memoryMaxMb"], "memoryMaxMb")) if "memoryMaxMb" in body else cfg.memory_max_mb
+                    if new_mem_min > new_mem_max:
+                        if "memoryMaxMb" in body and "memoryMinMb" not in body:
+                            new_mem_min = new_mem_max
+                        else:
+                            new_mem_max = new_mem_min
+                    cfg.memory_min_mb = new_mem_min
+                    cfg.memory_max_mb = new_mem_max
                     if "javaPath" in body:
                         cfg.java_path = str(body["javaPath"]).strip() or "java"
                     if "jvmFlags" in body:
@@ -783,24 +789,22 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                 ctx.sse_clients.append(client_q)
 
             try:
+                init_summary = ctx.mc_manager.get_status_summary()
+                init_summary["logs"] = ctx.mc_manager.get_effective_logs(120)
                 init_payload = json.dumps({
                     "event": "connected",
-                    "data": ctx.mc_manager.get_status_summary(),
+                    "data": init_summary,
                 })
                 self.wfile.write(f"data: {init_payload}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
                 while True:
                     try:
-                        msg = client_q.get(timeout=6)
+                        msg = client_q.get(timeout=8)
                         self.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
                         self.wfile.flush()
                     except queue.Empty:
-                        # Send keepalive ping and latest lock state from shared folder
-                        ping_payload = json.dumps({
-                            "event": "heartbeat",
-                            "data": {"lock": ctx.sync_engine.get_lock().to_dict()},
-                        })
+                        ping_payload = json.dumps({"event": "heartbeat", "data": {"ts": time.time()}})
                         self.wfile.write(f"data: {ping_payload}\n\n".encode("utf-8"))
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):

@@ -53,38 +53,49 @@ def build_executable() -> Path:
     if not icon_path.exists():
         subprocess.run([sys.executable, str(ROOT_DIR / "scripts" / "generate_logo.py")], cwd=str(ROOT_DIR), check=True)
 
-    add_data_sep = ";" if sys.platform.startswith("win") else ":"
-    cmd = [
-        sys.executable,
-        "-m",
-        "PyInstaller",
-        "--noconfirm",
-        "--clean",
-        "--onefile",
-        "--name",
-        "MineRelay",
-        "--icon",
-        str(icon_path),
-        "--add-data",
-        f"{public_dir}{add_data_sep}public",
-        "--paths",
-        str(ROOT_DIR),
-        "--hidden-import",
-        "psutil",
-        "--hidden-import",
-        "src.models",
-        "--hidden-import",
-        "src.sync_engine",
-        "--hidden-import",
-        "src.auth_service",
-        "--hidden-import",
-        "src.tunnel_manager",
-        "--hidden-import",
-        "src.minecraft_manager",
-        "--hidden-import",
-        "src.bootstrap_runtime",
-        str(entry_script),
-    ]
+    spec_file = ROOT_DIR / "MineRelay.spec"
+    if spec_file.exists():
+        cmd = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            str(spec_file),
+        ]
+    else:
+        add_data_sep = ";" if sys.platform.startswith("win") else ":"
+        cmd = [
+            sys.executable,
+            "-m",
+            "PyInstaller",
+            "--noconfirm",
+            "--clean",
+            "--onefile",
+            "--name",
+            "MineRelay",
+            "--icon",
+            str(icon_path),
+            "--add-data",
+            f"{public_dir}{add_data_sep}public",
+            "--paths",
+            str(ROOT_DIR),
+            "--hidden-import",
+            "psutil",
+            "--hidden-import",
+            "src.models",
+            "--hidden-import",
+            "src.sync_engine",
+            "--hidden-import",
+            "src.auth_service",
+            "--hidden-import",
+            "src.tunnel_manager",
+            "--hidden-import",
+            "src.minecraft_manager",
+            "--hidden-import",
+            "src.bootstrap_runtime",
+            str(entry_script),
+        ]
 
     res = subprocess.run(cmd, cwd=str(ROOT_DIR))
     if res.returncode != 0:

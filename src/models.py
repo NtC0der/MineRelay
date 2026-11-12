@@ -1,4 +1,3 @@
-import os
 import uuid
 import socket
 import time
@@ -57,10 +56,6 @@ class UserAccount:
 
     def to_public_dict(self) -> Dict[str, Any]:
         raw_hint = (self.passkey_hint or "").strip().upper()
-        for prefix in ("MC-ADMIN-", "MC-HOST-"):
-            if raw_hint.startswith(prefix) and len(raw_hint) > len(prefix):
-                raw_hint = raw_hint[len(prefix):]
-                break
         clean_chars = [c for c in raw_hint if c not in ("•", ".")]
         first_two = "".join(clean_chars[:2])
         short_hint = f"{first_two}••••" if first_two else "••••"
@@ -92,6 +87,15 @@ class HostLock:
     online_players: List[str] = field(default_factory=list)
     max_players: int = 20
     lock_epoch: str = ""
+    # Live telemetry synced from active host so other PCs see RAM / CPU / TPS / uptime
+    memory_used_mb: int = 0
+    memory_max_mb: int = 4096
+    cpu_percent: float = 0.0
+    tps: float = 0.0
+    server_ready_at: float = 0.0
+    # Snapshot verification carried on release so peers never start before cloud upload finishes
+    expected_snapshot_seq: int = 0
+    expected_snapshot_hash: str = ""
 
     def is_stale(self, now: Optional[float] = None) -> bool:
         if not self.is_locked:
@@ -123,6 +127,13 @@ class HostLock:
             "onlinePlayers": self.online_players,
             "maxPlayers": self.max_players,
             "lockEpoch": self.lock_epoch,
+            "memoryUsedMb": self.memory_used_mb,
+            "memoryMaxMb": self.memory_max_mb,
+            "cpuPercent": self.cpu_percent,
+            "tps": self.tps,
+            "serverReadyAt": self.server_ready_at,
+            "expectedSnapshotSeq": self.expected_snapshot_seq,
+            "expectedSnapshotHash": self.expected_snapshot_hash,
         }
 
     @staticmethod
@@ -147,6 +158,13 @@ class HostLock:
             online_players=players_list,
             max_players=_safe_int(data.get("max_players", data.get("maxPlayers")), 20),
             lock_epoch=_safe_str(data.get("lock_epoch", data.get("lockEpoch")), ""),
+            memory_used_mb=_safe_int(data.get("memory_used_mb", data.get("memoryUsedMb")), 0),
+            memory_max_mb=max(512, _safe_int(data.get("memory_max_mb", data.get("memoryMaxMb")), 4096)),
+            cpu_percent=round(_safe_float(data.get("cpu_percent", data.get("cpuPercent")), 0.0), 1),
+            tps=round(_safe_float(data.get("tps"), 0.0), 2),
+            server_ready_at=_safe_float(data.get("server_ready_at", data.get("serverReadyAt")), 0.0),
+            expected_snapshot_seq=max(0, _safe_int(data.get("expected_snapshot_seq", data.get("expectedSnapshotSeq")), 0)),
+            expected_snapshot_hash=_safe_str(data.get("expected_snapshot_hash", data.get("expectedSnapshotHash")), ""),
         )
 
 
@@ -222,15 +240,20 @@ class ClusterConfig:
                         host_count=_safe_int(acc.get("host_count", acc.get("hostCount")), 0),
                     )
                 )
+        mem_max = max(512, _safe_int(data.get("memoryMaxMb", data.get("memory_max_mb")), 4096))
+        mem_min = max(256, min(mem_max, _safe_int(data.get("memoryMinMb", data.get("memory_min_mb")), 2048)))
         return ClusterConfig(
             cluster_id=_safe_str(data.get("clusterId", data.get("cluster_id")), str(uuid.uuid4())) or str(uuid.uuid4()),
             server_name=_safe_str(data.get("serverName", data.get("server_name")), "Shared Minecraft Server") or "Shared Minecraft Server",
             mc_software=_safe_str(data.get("mcSoftware", data.get("mc_software")), "paper") or "paper",
             mc_version=_safe_str(data.get("mcVersion", data.get("mc_version")), "26.3") or "26.3",
-            memory_min_mb=_safe_int(data.get("memoryMinMb", data.get("memory_min_mb")), 2048),
-            memory_max_mb=_safe_int(data.get("memoryMaxMb", data.get("memory_max_mb")), 4096),
+            memory_min_mb=mem_min,
+            memory_max_mb=mem_max,
             java_path=_safe_str(data.get("javaPath", data.get("java_path")), "java") or "java",
-            jvm_flags=_safe_str(data.get("jvmFlags", data.get("jvm_flags")), "-XX:+UseG1GC"),
+            jvm_flags=_safe_str(
+                data.get("jvmFlags", data.get("jvm_flags")),
+                "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200",
+            ),
             server_port=_safe_int(data.get("serverPort", data.get("server_port")), 25565),
             tunnel_enabled=_safe_bool(data.get("tunnelEnabled", data.get("tunnel_enabled")), True),
             tunnel_provider=_safe_str(data.get("tunnelProvider", data.get("tunnel_provider")), "playit") or "playit",
@@ -267,9 +290,9 @@ class LocalMachineConfig:
         if not isinstance(data, dict):
             return LocalMachineConfig(shared_sync_dir=default_sync_dir)
         return LocalMachineConfig(
-            machine_id=_safe_str(data.get("machineId"), str(uuid.uuid4())) or str(uuid.uuid4()),
-            machine_name=_safe_str(data.get("machineName"), socket.gethostname()) or socket.gethostname(),
-            shared_sync_dir=_safe_str(data.get("sharedSyncDir"), default_sync_dir) or default_sync_dir,
-            java_override_path=_safe_str(data.get("javaOverridePath"), ""),
-            dashboard_port=_safe_int(data.get("dashboardPort"), 3080),
+            machine_id=_safe_str(data.get("machineId", data.get("machine_id")), str(uuid.uuid4())) or str(uuid.uuid4()),
+            machine_name=_safe_str(data.get("machineName", data.get("machine_name")), socket.gethostname()) or socket.gethostname(),
+            shared_sync_dir=_safe_str(data.get("sharedSyncDir", data.get("shared_sync_dir")), default_sync_dir) or default_sync_dir,
+            java_override_path=_safe_str(data.get("javaOverridePath", data.get("java_override_path")), ""),
+            dashboard_port=_safe_int(data.get("dashboardPort", data.get("dashboard_port")), 3080),
         )

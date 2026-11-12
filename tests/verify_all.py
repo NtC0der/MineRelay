@@ -1159,6 +1159,105 @@ def run_verification():
         assert st_rec_stop == 200
         print("  [OK] Active Drive transfer guard & manifest-verified backup fallback recovery verified!")
 
+        # =====================================================================
+        # Test 19: Remote Host Telemetry/Console & Host-Transfer Sync Ordering
+        # =====================================================================
+        print("\n[Test 19] Verifying Remote Host Telemetry/Console & Host-Transfer Sync Guard...")
+        # Bob (PC 2) starts hosting with simulated telemetry + logs
+        st_19_start, res_19_start = pc2.request("POST", "/api/server/start", token=bob_token)
+        assert st_19_start == 200, f"Expected Bob start to succeed, got {res_19_start}"
+
+        # Populate live metrics and console logs on PC 2 and force-publish host telemetry
+        with pc2.ctx.mc_manager._mutex:
+            pc2.ctx.mc_manager.memory_used_mb = 1842
+            pc2.ctx.mc_manager.cpu_percent = 37.5
+            pc2.ctx.mc_manager.tps = 19.6
+            pc2.ctx.mc_manager.server_ready_at = time.time() - 95.0
+        pc2.ctx.mc_manager._log("Remote console check: Boss raid started!", "INFO", "Minecraft")
+        pc2.ctx.mc_manager.sync_engine.update_lock_state(
+            status="running",
+            memory_used_mb=1842,
+            memory_max_mb=4096,
+            cpu_percent=37.5,
+            tps=19.6,
+            server_ready_at=pc2.ctx.mc_manager.server_ready_at,
+        )
+        pc2.ctx.mc_manager._publish_host_telemetry_throttled(force=True)
+
+        # PC 1 (Admin, idle) queries /api/server/status -> must see Bob's live RAM, CPU, TPS, Uptime & Console Logs!
+        st_19_stat, res_19_stat = pc1.request("GET", "/api/server/status", token=admin_token)
+        assert st_19_stat == 200
+        tel_19 = res_19_stat.get("telemetry", {})
+        assert tel_19.get("memoryUsedMb") == 1842, f"Expected remote RAM 1842 MB, got {tel_19}"
+        assert tel_19.get("cpuPercent") == 37.5, f"Expected remote CPU 37.5%, got {tel_19}"
+        assert abs(float(tel_19.get("tps", 0.0)) - 19.6) < 0.2, f"Expected remote TPS ~19.6, got {tel_19}"
+        assert tel_19.get("uptimeSeconds", 0) >= 80, f"Expected remote uptime >=80s, got {tel_19}"
+        remote_log_texts = [e.get("text", "") for e in res_19_stat.get("logs", [])]
+        assert any("Remote console check: Boss raid started!" in txt for txt in remote_log_texts), (
+            f"Remote host console logs missing on PC 1: {remote_log_texts}"
+        )
+
+        # Frontend assertion for remote console mirroring guard
+        js_app = (Path(__file__).resolve().parent.parent / "public" / "app.js").read_text(encoding="utf-8")
+        assert "Live console mirrored from" in js_app, "Frontend missing remote host console mirror notice!"
+
+        # PC 2 writes critical world progress and stops cleanly
+        marker_file_pc2 = pc2.ctx.mc_manager.runtime_dir / "world" / "host_transfer_marker.txt"
+        marker_file_pc2.write_text("pc2-session-progress-v19", encoding="utf-8")
+        pre_stop_manifest = pc2.ctx.sync_engine._read_sync_manifest() or {}
+        st_19_stop, _ = pc2.request("POST", "/api/server/stop", token=bob_token)
+        assert st_19_stop == 200
+
+        post_stop_manifest = pc2.ctx.sync_engine._read_sync_manifest() or {}
+        expected_seq, expected_hash, released_by = pc1.ctx.sync_engine.get_expected_snapshot_state()
+        assert expected_seq == int(post_stop_manifest.get("snapshotSeq", 0))
+        assert expected_hash == str(post_stop_manifest.get("sha256", ""))
+        assert released_by == "Bob", f"Expected release attribution 'Bob', got '{released_by}'"
+
+        # Simulate Drive lag: released-*.json already reflects expected_seq, while snapshots/ still lags behind!
+        saved_manifest_bytes = pc1.ctx.sync_engine.sync_manifest_path.read_bytes()
+        saved_snap_bytes = pc1.ctx.sync_engine.latest_snapshot_path.read_bytes()
+        newest_bk_path = pc1.ctx.sync_engine.backups_dir / post_stop_manifest["backupFile"]
+        saved_bk_bytes = newest_bk_path.read_bytes()
+
+        lagging_manifest = dict(pre_stop_manifest)
+        lagging_manifest["snapshotSeq"] = max(1, expected_seq - 1)
+        pc1.ctx.sync_engine.sync_manifest_path.write_text(json.dumps(lagging_manifest), encoding="utf-8")
+        pc1.ctx.sync_engine.latest_snapshot_path.write_bytes(good_snap_bytes)
+        newest_bk_path.unlink(missing_ok=True)
+
+        st_19_lag, res_19_lag = pc1.request("POST", "/api/server/start", token=admin_token)
+        assert st_19_lag == 400 and "catching up" in res_19_lag["error"].lower(), (
+            f"Expected host-transfer lag block while waiting for snapshotSeq {expected_seq}, got {st_19_lag}: {res_19_lag}"
+        )
+        assert pc1.ctx.sync_engine.get_lock().is_locked is False
+
+        # Restore synced files AND simulate Drive conflict directory/config duplicates
+        pc1.ctx.sync_engine.sync_manifest_path.write_bytes(saved_manifest_bytes)
+        pc1.ctx.sync_engine.latest_snapshot_path.write_bytes(saved_snap_bytes)
+        newest_bk_path.write_bytes(saved_bk_bytes)
+
+        conflict_locks_dir = pc1.ctx.sync_engine.shared_dir / "locks (1)"
+        conflict_locks_dir.mkdir(exist_ok=True)
+        (conflict_locks_dir / "released-123456-fake.json").write_text(
+            json.dumps({"lockEpoch": "123456-fake", "releasedAt": time.time()}),
+            encoding="utf-8",
+        )
+        conflict_cfg = pc1.ctx.sync_engine.shared_dir / "cluster-config (1).json"
+        base_cfg_data = json.loads(pc1.ctx.sync_engine.cluster_config_path.read_text(encoding="utf-8"))
+        base_cfg_data["serverName"] = "Synced Conflict Config"
+        conflict_cfg.write_text(json.dumps(base_cfg_data), encoding="utf-8")
+
+        st_19_handoff, res_19_handoff = pc1.request("POST", "/api/server/start", token=admin_token)
+        assert st_19_handoff == 200, f"Expected clean handoff after Drive catch-up, got {res_19_handoff}"
+        pc1_marker = pc1.ctx.mc_manager.runtime_dir / "world" / "host_transfer_marker.txt"
+        assert pc1_marker.exists() and pc1_marker.read_text(encoding="utf-8") == "pc2-session-progress-v19"
+        assert not conflict_locks_dir.exists(), "Duplicate 'locks (1)' conflict folder should be cleaned up!"
+        assert not conflict_cfg.exists(), "Duplicate 'cluster-config (1).json' should be reconciled & cleaned up!"
+        st_19_done, _ = pc1.request("POST", "/api/server/stop", token=admin_token)
+        assert st_19_done == 200
+        print("  [OK] Remote host telemetry, live console mirroring, expectedSnapshotSeq transfer guard & conflict folder cleanup verified!")
+
         print("\n============================================================")
         print("  ALL END-TO-END VERIFICATION TESTS PASSED SUCCESSFULLY! ")
         print("============================================================")

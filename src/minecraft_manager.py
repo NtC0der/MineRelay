@@ -14,7 +14,7 @@ import subprocess
 import urllib.request
 from urllib.parse import quote as urlquote
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Callable
+from typing import Optional, List, Dict, Any, Callable, Tuple
 
 try:
     import psutil  # type: ignore
@@ -49,7 +49,10 @@ class MinecraftManager:
         self.event_callback = event_callback
 
         self._mutex = threading.RLock()
+        self._lifecycle_lock = threading.RLock()
         self._proc: Optional[subprocess.Popen] = None
+        self._psutil_proc: Optional[Any] = None
+        self._save_complete_event = threading.Event()
         self._sim_running: bool = False
         self._sim_stop_event = threading.Event()
         self._reached_running: bool = False
@@ -57,7 +60,10 @@ class MinecraftManager:
         self.local_status: str = "idle"  # 'idle' | 'syncing_pull' | 'starting' | 'running' | 'stopping' | 'syncing_push'
         self.active_host_user: Optional[UserAccount] = None
         self.started_at: float = 0.0
+        self.server_ready_at: float = 0.0
         self._last_player_active_at: float = 0.0
+        self._last_tps_warn_at: float = 0.0
+        self._last_telemetry_publish_at: float = 0.0
         self.online_players: List[str] = []
         self.console_logs: List[Dict[str, Any]] = []
         self.tps: float = 20.0
@@ -72,6 +78,8 @@ class MinecraftManager:
         self._java_cache: Dict[str, Any] = {}
         self._java_cache_key: str = ""
         self._java_cache_ts: float = 0.0
+
+        self.sync_engine.telemetry_provider = self._build_telemetry_snapshot
 
         if os.environ.get("MINERELAY_TEST_MODE") != "1":
             self._recover_orphaned_session_on_boot()
@@ -127,20 +135,96 @@ class MinecraftManager:
             except Exception:
                 pass
 
+    def _sample_local_process_metrics(self) -> None:
+        if psutil is None or self.local_status not in ("running", "starting", "restarting"):
+            return
+        try:
+            proc = self._proc
+            if proc is not None:
+                if self._psutil_proc is None or self._psutil_proc.pid != proc.pid:
+                    self._psutil_proc = psutil.Process(proc.pid)
+                    # Prime baseline CPU counter once on the cached Process instance
+                    self._psutil_proc.cpu_percent(interval=None)
+                rss_bytes = self._psutil_proc.memory_info().rss
+                cpu_val = self._psutil_proc.cpu_percent(interval=None)
+                for child in self._psutil_proc.children(recursive=True):
+                    try:
+                        rss_bytes += child.memory_info().rss
+                        cpu_val += child.cpu_percent(interval=None)
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                        pass
+                self.memory_used_mb = int(rss_bytes / (1024 * 1024))
+                cpu_count = max(1, psutil.cpu_count() or 1)
+                self.cpu_percent = round(min(100.0, float(cpu_val) / cpu_count), 1)
+            elif self.runtime_mode == "embedded":
+                # Embedded test simulator updates self.memory_used_mb & self.cpu_percent directly
+                pass
+            if self.local_status == "running" and self._last_tps_warn_at > 0 and (time.time() - self._last_tps_warn_at) > 20.0:
+                # Recover observed TPS back toward 20.0 once tick-lag warnings subside
+                self.tps = round(min(20.0, self.tps + 0.5), 2)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            self._psutil_proc = None
+        except Exception:
+            pass
+
+    def _build_telemetry_snapshot(self) -> Dict[str, Any]:
+        self._sample_local_process_metrics()
+        cfg = self.sync_engine.load_cluster_config()
+        with self._mutex:
+            players_copy = list(self.online_players)
+            logs_copy = list(self.console_logs[-120:])
+        return {
+            "tps": self.tps if self.local_status == "running" else 0.0,
+            "memoryUsedMb": self.memory_used_mb,
+            "memoryMaxMb": cfg.memory_max_mb if cfg else 4096,
+            "cpuPercent": self.cpu_percent,
+            "serverReadyAt": self.server_ready_at,
+            "onlinePlayers": players_copy,
+            "logs": logs_copy,
+        }
+
+    def _publish_host_telemetry_throttled(self, force: bool = False) -> None:
+        if self.local_status in ("idle",):
+            return
+        if os.environ.get("MINERELAY_TEST_MODE") == "1" and not force:
+            return
+        now = time.time()
+        if not force and (now - self._last_telemetry_publish_at) < 2.0:
+            return
+        self._last_telemetry_publish_at = now
+        try:
+            if not self.sync_engine._owns_active_lock:
+                return
+            lock = self.sync_engine.get_lock()
+            if not lock.is_locked or lock.machine_id != self.sync_engine.local_config.machine_id:
+                return
+            snap = self._build_telemetry_snapshot()
+            snap["isActive"] = True
+            snap["lockEpoch"] = lock.lock_epoch
+            snap["machineId"] = lock.machine_id
+            snap["hostUsername"] = lock.host_username
+            snap["status"] = self.local_status
+            snap["maxPlayers"] = lock.max_players
+            self.sync_engine.write_host_telemetry(snap)
+        except Exception:
+            pass
+
     def _log(self, message: str, level: str = "INFO", source: str = "Server") -> None:
         ts = time.strftime("%H:%M:%S")
         formatted = f"[{ts}] [{source}/{level}]: {message}"
-        entry = {
-            "id": f"{int(time.time() * 1000)}-{len(self.console_logs)}",
-            "timestamp": ts,
-            "level": level,
-            "source": source,
-            "text": formatted,
-        }
-        self.console_logs.append(entry)
-        if len(self.console_logs) > 500:
-            self.console_logs = self.console_logs[-500:]
+        with self._mutex:
+            entry = {
+                "id": f"{int(time.time() * 1000)}-{len(self.console_logs)}",
+                "timestamp": ts,
+                "level": level,
+                "source": source,
+                "text": formatted,
+            }
+            self.console_logs.append(entry)
+            if len(self.console_logs) > 500:
+                self.console_logs = self.console_logs[-500:]
         self._emit("console_log", entry)
+        self._publish_host_telemetry_throttled(force=False)
 
     def check_java_installed(
         self,
@@ -168,7 +252,8 @@ class MinecraftManager:
             )
             output = (res.stderr or res.stdout or "").strip()
             first_line = output.splitlines()[0] if output else "Java installed"
-            major = get_java_major_version(cmd)
+            m = re.search(r'version "(\d+)', output)
+            major = int(m.group(1)) if m else 0
             installed = res.returncode == 0 and major >= req_major
             result = {
                 "installed": installed,
@@ -329,7 +414,8 @@ class MinecraftManager:
     def _recover_orphaned_session_on_boot(self) -> None:
         """
         If MineRelay was closed while a local Java server was still running or while this machine
-        still held host-lock.json, cleanly stop the orphaned JVM, save the world snapshot, and release the lock.
+        held host-lock.json, stop any orphaned JVM, push unsaved world progress from an interrupted session,
+        and cleanly release the lock with expected snapshot metadata.
         """
         try:
             cfg = self.sync_engine.load_cluster_config()
@@ -337,24 +423,42 @@ class MinecraftManager:
             orphans = self._stop_any_runtime_java_processes(server_port=port)
             self.tunnel_manager.stop_tunnel()
             lock = self.sync_engine.get_lock()
-            if orphans > 0:
+            was_running_session = (
+                lock.is_locked
+                and lock.machine_id == self.sync_engine.local_config.machine_id
+                and lock.status in ("running", "stopping", "syncing_push", "restarting")
+            )
+            if orphans > 0 or was_running_session:
                 self._log(
-                    f"Recovered {orphans} orphaned Minecraft server process(es) from a previous session; syncing world and unlocking.",
+                    (
+                        f"Recovered {orphans} orphaned Minecraft server process(es); syncing world and unlocking."
+                        if orphans > 0
+                        else "Detected interrupted hosting session on this machine; pushing latest local world before unlocking."
+                    ),
                     "WARN",
                     "Launcher",
                 )
+                push_res: Dict[str, Any] = {}
                 try:
-                    self.sync_engine.push_world_from_runtime(create_backup=True, backup_label="recovery")
-                except Exception:
-                    pass
-                self.sync_engine.force_unlock()
+                    push_res = self.sync_engine.push_world_from_runtime(
+                        create_backup=True,
+                        backup_label="recovery",
+                        host_username=lock.host_username or "recovery",
+                    )
+                except Exception as e:
+                    self._log(f"Recovery push failed: {e}", "ERROR", "SyncEngine")
+                    return
+                self.sync_engine.release_lock(
+                    expected_snapshot_seq=int(push_res.get("snapshotSeq", 0) or 0),
+                    expected_snapshot_hash=str(push_res.get("sha256", "") or ""),
+                )
             elif lock.is_locked and lock.machine_id == self.sync_engine.local_config.machine_id:
                 self._log(
-                    "Cleared leftover host lock from previous session on this machine.",
+                    "Cleared leftover startup host lock from previous session on this machine.",
                     "INFO",
                     "SyncEngine",
                 )
-                self.sync_engine.force_unlock()
+                self.sync_engine.release_lock()
         except Exception:
             pass
 
@@ -369,7 +473,7 @@ class MinecraftManager:
         3. Starts zero-port-forwarding tunnel (playit.gg).
         4. Ensures matching Java Runtime (Java 25 for MC 26.3+) and versioned server.jar exist, then launches JVM.
         """
-        with self._mutex:
+        with self._lifecycle_lock:
             if self.local_status not in ("idle",):
                 raise RuntimeError(f"Local server is already in state '{self.local_status}'.")
 
@@ -379,9 +483,11 @@ class MinecraftManager:
 
             self.last_error = ""
             self._reached_running = False
+            self.server_ready_at = 0.0
+            self._last_tps_warn_at = 0.0
 
             # Step 1: Acquire distributed lock (raises HostLockConflictError if another member is hosting)
-            lock = self.sync_engine.acquire_lock(
+            self.sync_engine.acquire_lock(
                 user=user,
                 mc_version=f"{cfg.mc_software.capitalize()} {cfg.mc_version}",
                 public_address=cfg.public_join_address,
@@ -390,6 +496,7 @@ class MinecraftManager:
             self.local_status = "syncing_pull"
             self.active_host_user = user
             self._emit("status_changed", self.get_status_summary())
+            self._publish_host_telemetry_throttled(force=True)
 
             try:
                 # Ensure no orphaned JVM is holding world/session.lock or the server port before pulling world
@@ -495,8 +602,12 @@ class MinecraftManager:
                         log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
                     )
                     self._spawn_java_minecraft(cfg, java_info["command"], target_jar, max_players)
-                else:
+                elif os.environ.get("MINERELAY_TEST_MODE") == "1":
                     self._spawn_embedded_minecraft_runtime(cfg, has_jar, java_info["installed"], max_players)
+                else:
+                    raise RuntimeError(
+                        f"Java {req_java}+ and a valid {cfg.mc_software.upper()} {cfg.mc_version} server.jar are required to host (auto-download did not complete)."
+                    )
 
                 return self.get_status_summary()
 
@@ -504,6 +615,7 @@ class MinecraftManager:
                 self.last_error = str(e)
                 self.local_status = "idle"
                 self.active_host_user = None
+                self.server_ready_at = 0.0
                 self.tunnel_manager.stop_tunnel()
                 try:
                     self.sync_engine.release_lock(user)
@@ -562,6 +674,8 @@ class MinecraftManager:
         leave_regex = re.compile(prefix + r"(?!<)([a-zA-Z0-9_.*+~-]{2,32})\s+(?:left the game|lost connection:)")
         disconnect_regex = re.compile(prefix + r"(?!<)(?:Disconnecting|Kicking)\s+([a-zA-Z0-9_.*+~-]{2,32}):")
         list_regex = re.compile(prefix + r"(?!<)There are \d+ of a max of \d+ players online:(.*)")
+        overload_regex = re.compile(r"Running\s+(\d+)ms\s+or\s+\d+\s+ticks behind", re.IGNORECASE)
+        tps_cmd_regex = re.compile(r"TPS from last [^:]+:\s*\*?([0-9.]+)", re.IGNORECASE)
         fatal_error = ""
 
         if proc.stdout:
@@ -573,17 +687,35 @@ class MinecraftManager:
                     lvl = "ERROR" if ("/ERROR]" in line or "FAILED TO BIND" in line or "Exception" in line) else "INFO"
                     self._log(line, lvl, "Minecraft")
 
+                    if "Saved the game" in line or "All dimensions are saved" in line:
+                        self._save_complete_event.set()
+
+                    om = overload_regex.search(line)
+                    if om:
+                        self._last_tps_warn_at = time.time()
+                        lag_ms = int(om.group(1))
+                        # Estimate effective TPS during server tick overload
+                        self.tps = round(max(2.0, min(19.5, 20.0 - (lag_ms / 1000.0) * 1.5)), 2)
+
+                    tm = tps_cmd_regex.search(line)
+                    if tm:
+                        try:
+                            self.tps = round(min(20.0, max(0.0, float(tm.group(1)))), 2)
+                        except ValueError:
+                            pass
+
                     if done_regex.search(line):
                         self._reached_running = True
                         self.last_error = ""
                         self.local_status = "running"
+                        self.server_ready_at = time.time()
                         self._last_player_active_at = time.time()
                         self.tps = 20.0
-                        self.memory_used_mb = 1420
-                        self.cpu_percent = 14.5
+                        self._sample_local_process_metrics()
                         with self._mutex:
                             players_copy = list(self.online_players)
                         self.sync_engine.update_lock_state(status="running", max_players=max_players, online_players=players_copy)
+                        self._publish_host_telemetry_throttled(force=True)
                         self._emit("status_changed", self.get_status_summary())
                         self._emit("players_updated", self.get_players_data())
                         self._apply_saved_gamerules_to_live_server(proc)
@@ -646,8 +778,15 @@ class MinecraftManager:
             except Exception as e:
                 self._log(f"Error in Minecraft stdout monitor loop: {e}", "WARN", "Launcher")
 
-        # Process exited
-        with self._mutex:
+        # Close pipes cleanly and transition if process exited unexpectedly
+        self._psutil_proc = None
+        for pipe in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
+        with self._lifecycle_lock:
             if self._proc is proc:
                 self._proc = None
                 if self.local_status not in ("stopping", "syncing_push", "restarting", "idle"):
@@ -715,10 +854,12 @@ class MinecraftManager:
         self._log('Done (1.24s)! For help, type "help"', "INFO", "ServerMain")
 
         self.local_status = "running"
+        self.server_ready_at = time.time()
         self.tps = 20.0
         self.memory_used_mb = min(1024, cfg.memory_min_mb)
         self.cpu_percent = 8.4
         self.sync_engine.update_lock_state(status="running", max_players=max_players)
+        self._publish_host_telemetry_throttled(force=True)
         self._emit("status_changed", self.get_status_summary())
 
         def _telemetry_loop() -> None:
@@ -730,15 +871,67 @@ class MinecraftManager:
                 self.tps = 20.0
                 self.cpu_percent = round(6.5 + (tick % 300) * 0.01, 1)
                 self.memory_used_mb = min(cfg.memory_max_mb, int(cfg.memory_min_mb * 0.65) + (tick % 120))
+                self._publish_host_telemetry_throttled(force=False)
 
         threading.Thread(target=_telemetry_loop, daemon=True, name="EmbeddedRuntimeTelemetry").start()
+
+    def _stop_java_process_gracefully(self, proc_ref: subprocess.Popen, wait_timeout: float = 35.0) -> None:
+        """Flushes chunks to disk with `save-all flush`, sends `stop`, and waits cleanly before terminating."""
+        self._psutil_proc = None
+        try:
+            if proc_ref.stdin:
+                self._save_complete_event.clear()
+                proc_ref.stdin.write("save-all flush\n")
+                proc_ref.stdin.flush()
+                self._save_complete_event.wait(timeout=8.0)
+                proc_ref.stdin.write("stop\n")
+                proc_ref.stdin.flush()
+            proc_ref.wait(timeout=wait_timeout)
+        except Exception:
+            self._terminate_process_tree(proc_ref, wait_timeout=5.0)
+        finally:
+            for pipe in (proc_ref.stdin, proc_ref.stdout):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+
+    def flush_and_backup_live_world(self, label: str, host_username: str) -> Dict[str, Any]:
+        """Safely flushes and pauses chunk writes before packaging a backup while running."""
+        with self._lifecycle_lock:
+            proc_ref = self._proc
+            paused_autosave = False
+            if self.local_status == "running" and proc_ref is not None and proc_ref.stdin:
+                try:
+                    self._save_complete_event.clear()
+                    proc_ref.stdin.write("save-off\n")
+                    proc_ref.stdin.write("save-all flush\n")
+                    proc_ref.stdin.flush()
+                    self._save_complete_event.wait(timeout=6.0)
+                    paused_autosave = True
+                except Exception:
+                    pass
+            try:
+                return self.sync_engine.push_world_from_runtime(
+                    create_backup=True,
+                    backup_label=label,
+                    host_username=host_username,
+                )
+            finally:
+                if paused_autosave and proc_ref is not None and proc_ref.stdin:
+                    try:
+                        proc_ref.stdin.write("save-on\n")
+                        proc_ref.stdin.flush()
+                    except Exception:
+                        pass
 
     def stop_hosting(self, user: Optional[UserAccount] = None) -> Dict[str, Any]:
         """
         Gracefully stops the local Minecraft server, syncs the updated world back to the Shared Sync Folder,
         stops the tunnel, and releases the distributed host lock so another member can host next.
         """
-        with self._mutex:
+        with self._lifecycle_lock:
             effective_user = user or self.active_host_user
             lock = self.sync_engine.get_lock()
             cfg = self.sync_engine.load_cluster_config()
@@ -746,6 +939,7 @@ class MinecraftManager:
 
             if self.local_status == "idle":
                 orphans_stopped = self._stop_any_runtime_java_processes(server_port=port)
+                push_res: Dict[str, Any] = {}
                 if orphans_stopped > 0:
                     self._log(
                         f"Stopped {orphans_stopped} background Java server process(es) and syncing world...",
@@ -753,21 +947,20 @@ class MinecraftManager:
                         "Launcher",
                     )
                     try:
-                        self.sync_engine.push_world_from_runtime(
+                        push_res = self.sync_engine.push_world_from_runtime(
                             create_backup=cfg.auto_backup_on_stop if cfg else True,
                             backup_label=effective_user.username if effective_user else "host",
                             host_username=effective_user.username if effective_user else "recovery",
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self._log(f"Warning pushing orphaned world: {e}", "WARN", "SyncEngine")
                 if lock.is_locked:
-                    if (
-                        lock.machine_id == self.sync_engine.local_config.machine_id
-                        or (effective_user and lock.host_user_id == effective_user.id)
-                        or (effective_user and effective_user.role == "admin")
-                        or lock.is_stale()
-                    ):
-                        self.sync_engine.release_lock(effective_user)
+                    if lock.machine_id == self.sync_engine.local_config.machine_id or lock.is_stale():
+                        self.sync_engine.release_lock(
+                            effective_user,
+                            expected_snapshot_seq=int(push_res.get("snapshotSeq", 0) or 0) if orphans_stopped > 0 else 0,
+                            expected_snapshot_hash=str(push_res.get("sha256", "") or "") if orphans_stopped > 0 else "",
+                        )
                         self.tunnel_manager.stop_tunnel()
                         uname = effective_user.username if effective_user else "System"
                         self._log(f"Host lock released by {uname}.", "INFO", "SyncEngine")
@@ -775,7 +968,8 @@ class MinecraftManager:
                         return self.get_status_summary()
                     else:
                         raise HostLockConflictError(
-                            f"Only the active host ({lock.host_username} on {lock.machine_name}) or the Admin can stop this remote session."
+                            f"Cannot stop active remote server hosted by {lock.host_username} on {lock.machine_name} from another PC "
+                            "(have them click Stop Server so world saves upload cleanly, or use Admin Force Unlock if their PC crashed)."
                         )
                 self.tunnel_manager.stop_tunnel()
                 self._emit("status_changed", self.get_status_summary())
@@ -792,16 +986,7 @@ class MinecraftManager:
                 proc_ref = self._proc
                 self._proc = None
                 if was_running:
-                    try:
-                        if proc_ref.stdin:
-                            proc_ref.stdin.write("save-all\n")
-                            proc_ref.stdin.flush()
-                            time.sleep(0.4)
-                            proc_ref.stdin.write("stop\n")
-                            proc_ref.stdin.flush()
-                        proc_ref.wait(timeout=12)
-                    except Exception:
-                        self._terminate_process_tree(proc_ref, wait_timeout=4.0)
+                    self._stop_java_process_gracefully(proc_ref, wait_timeout=35.0)
                 else:
                     self._terminate_process_tree(proc_ref, wait_timeout=3.0)
 
@@ -833,8 +1018,10 @@ class MinecraftManager:
         with self._mutex:
             self.online_players = []
         self.started_at = 0.0
+        self.server_ready_at = 0.0
         self.memory_used_mb = 0
         self.cpu_percent = 0.0
+        self._psutil_proc = None
         self._emit("status_changed", self.get_status_summary())
         self._emit("players_updated", self.get_players_data())
         return self.get_status_summary()
@@ -852,25 +1039,41 @@ class MinecraftManager:
         create_backup = cfg.auto_backup_on_stop if cfg else True
 
         self._log("Packaging and syncing world files to Shared Sync Folder...", "INFO", "SyncEngine")
-        try:
-            push_res = self.sync_engine.push_world_from_runtime(
-                create_backup=create_backup,
-                backup_label=user.username if user else "host",
-                host_username=user.username if user else "",
-            )
+        push_res: Dict[str, Any] = {}
+        push_err: Optional[Exception] = None
+        for attempt in range(2):
+            try:
+                push_res = self.sync_engine.push_world_from_runtime(
+                    create_backup=create_backup,
+                    backup_label=user.username if user else "host",
+                    host_username=user.username if user else "",
+                )
+                push_err = None
+                break
+            except Exception as e:
+                push_err = e
+                time.sleep(0.5)
+
+        if push_err is None:
             kb = round(push_res.get("sizeBytes", 0) / 1024, 1)
             self._log(
                 f"World synced to shared storage ({push_res.get('fileCount', 0)} files, {kb} KB). Releasing host lock.",
                 "INFO",
                 "SyncEngine",
             )
-        except Exception as e:
-            self._log(f"Warning during world snapshot push: {e}", "WARN", "SyncEngine")
-
-        try:
-            self.sync_engine.release_lock(user)
-        except Exception:
-            self.sync_engine.force_unlock()
+            try:
+                self.sync_engine.release_lock(
+                    user,
+                    expected_snapshot_seq=int(push_res.get("snapshotSeq", 0) or 0),
+                    expected_snapshot_hash=str(push_res.get("sha256", "") or ""),
+                )
+            except Exception:
+                self.sync_engine.force_unlock()
+        else:
+            err_msg = f"CRITICAL: World snapshot push failed ({push_err}). Host lock preserved so unsaved progress is NOT overwritten!"
+            self.last_error = err_msg
+            self._log(err_msg, "ERROR", "SyncEngine")
+            self.sync_engine.update_lock_state(status="sync_failed")
 
         self.local_status = "idle"
         self.runtime_mode = "none"
@@ -879,8 +1082,10 @@ class MinecraftManager:
         with self._mutex:
             self.online_players = []
         self.started_at = 0.0
+        self.server_ready_at = 0.0
         self.memory_used_mb = 0
         self.cpu_percent = 0.0
+        self._psutil_proc = None
         self._emit("status_changed", self.get_status_summary())
         self._emit("players_updated", self.get_players_data())
         return self.get_status_summary()
@@ -890,7 +1095,7 @@ class MinecraftManager:
         Gracefully restarts the local Minecraft server while keeping the host lock and tunnel active,
         pushing a quick world snapshot in between without ever dropping to 'idle'.
         """
-        with self._mutex:
+        with self._lifecycle_lock:
             effective_user = user or self.active_host_user
             if not effective_user:
                 raise RuntimeError("No active host user found for restart.")
@@ -904,7 +1109,9 @@ class MinecraftManager:
 
             self.local_status = "restarting"
             self._reached_running = False
-            self.online_players = []
+            self.server_ready_at = 0.0
+            with self._mutex:
+                self.online_players = []
             self.sync_engine.update_lock_state(status="restarting", online_players=[])
             self._emit("status_changed", self.get_status_summary())
             self._emit("players_updated", self.get_players_data())
@@ -913,16 +1120,7 @@ class MinecraftManager:
             if self._proc is not None:
                 proc_ref = self._proc
                 self._proc = None
-                try:
-                    if proc_ref.stdin:
-                        proc_ref.stdin.write("save-all\n")
-                        proc_ref.stdin.flush()
-                        time.sleep(0.3)
-                        proc_ref.stdin.write("stop\n")
-                        proc_ref.stdin.flush()
-                    proc_ref.wait(timeout=12)
-                except Exception:
-                    self._terminate_process_tree(proc_ref, wait_timeout=4.0)
+                self._stop_java_process_gracefully(proc_ref, wait_timeout=35.0)
 
             self._stop_any_runtime_java_processes(server_port=port)
 
@@ -932,12 +1130,12 @@ class MinecraftManager:
 
             try:
                 self.sync_engine.push_world_from_runtime(
-                    create_backup=False,
-                    backup_label=effective_user.username,
+                    create_backup=cfg.auto_backup_on_stop if cfg else True,
+                    backup_label=f"{effective_user.username}-restart",
                     host_username=effective_user.username,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                self._log(f"Warning saving restart backup: {e}", "WARN", "SyncEngine")
 
             props = self.get_server_properties()
             max_players = int(props.get("max-players", 20))
@@ -957,8 +1155,10 @@ class MinecraftManager:
                     log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
                 )
                 self._spawn_java_minecraft(cfg, java_info["command"], target_jar, max_players)
-            else:
+            elif os.environ.get("MINERELAY_TEST_MODE") == "1":
                 self._spawn_embedded_minecraft_runtime(cfg, has_jar, java_info["installed"], max_players)
+            else:
+                raise RuntimeError("Java runtime or versioned server.jar missing for restart.")
 
             return self.get_status_summary()
 
@@ -1061,6 +1261,17 @@ class MinecraftManager:
 
         return {"sent": True, "command": clean}
 
+    def _ensure_idle_mutable_sync(self) -> None:
+        """Guards idle config/file edits against active remote hosting and pulls verified cloud state first."""
+        if self.local_status != "idle":
+            return
+        lock = self.sync_engine.get_lock()
+        if lock.is_actively_locked() and lock.machine_id != self.sync_engine.local_config.machine_id:
+            raise HostLockConflictError(
+                f"Cannot modify server files while '{lock.host_username}' is hosting on '{lock.machine_name}'. Your edits would be overwritten when they stop."
+            )
+        self.sync_engine.ensure_runtime_synced_when_idle(strict=True)
+
     def _push_idle_config_safely(self) -> None:
         """
         Pushes updated config files from runtime_dir to the Shared Sync Folder ONLY if
@@ -1076,6 +1287,9 @@ class MinecraftManager:
             self._log("Skipped idle snapshot push while cloud sync download/upload is active.", "WARN", "SyncEngine")
             return
         manifest = self.sync_engine._read_sync_manifest()
+        if not manifest and self.sync_engine.latest_snapshot_path.exists():
+            self._log("Skipped idle snapshot push because shared snapshot manifest is still syncing.", "WARN", "SyncEngine")
+            return
         if manifest:
             _, mismatch = self.sync_engine._resolve_verified_snapshot_source(manifest)
             if mismatch:
@@ -1244,6 +1458,19 @@ class MinecraftManager:
         for lower_name, (canon_name, candidate_uuids) in known_players.items():
             offline_uuid = self._compute_offline_uuid(canon_name).lower()
             online_uuids = [u for u in candidate_uuids if u != offline_uuid]
+            if target_online_mode and not online_uuids and os.environ.get("MINERELAY_TEST_MODE") != "1":
+                try:
+                    mojang_url = f"https://api.mojang.com/users/profiles/minecraft/{urlquote(canon_name)}"
+                    req = urllib.request.Request(mojang_url, headers={"User-Agent": "MineRelay/2.0"})
+                    with urllib.request.urlopen(req, timeout=3.0) as resp:
+                        profile = json.loads(resp.read().decode("utf-8"))
+                        raw_id = str(profile.get("id", "")).strip().lower()
+                        if len(raw_id) == 32:
+                            formatted_uuid = f"{raw_id[:8]}-{raw_id[8:12]}-{raw_id[12:16]}-{raw_id[16:20]}-{raw_id[20:]}"
+                            if formatted_uuid != offline_uuid:
+                                online_uuids = [formatted_uuid]
+                except Exception:
+                    pass
             if not online_uuids:
                 continue
 
@@ -1262,9 +1489,14 @@ class MinecraftManager:
                     src_file = base_dir / f"{src_uuid}{ext}"
                     dst_file = base_dir / f"{dst_uuid}{ext}"
                     try:
-                        if src_file.is_file() and (not dst_file.exists() or dst_file.stat().st_size == 0):
-                            shutil.copy2(src_file, dst_file)
-                            player_copied = True
+                        if src_file.is_file():
+                            dst_exists = dst_file.exists() and dst_file.stat().st_size > 0
+                            src_newer = dst_exists and (src_file.stat().st_mtime > dst_file.stat().st_mtime + 1.0)
+                            if not dst_exists or src_newer:
+                                if dst_exists:
+                                    shutil.copy2(dst_file, base_dir / f"{dst_uuid}{ext}.pre_migrate_bak")
+                                shutil.copy2(src_file, dst_file)
+                                player_copied = True
                     except OSError:
                         pass
                     if copy_old:
@@ -1310,6 +1542,7 @@ class MinecraftManager:
         return migrated_players
 
     def update_server_properties(self, updates: Dict[str, Any]) -> Dict[str, str]:
+        self._ensure_idle_mutable_sync()
         props = self.get_server_properties()
         old_online_mode = props.get("online-mode", "true").lower() != "false"
         for k, v in updates.items():
@@ -1624,6 +1857,7 @@ class MinecraftManager:
     def update_gamerules(self, updates: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(updates, dict):
             raise ValueError("Gamerules payload must be an object.")
+        self._ensure_idle_mutable_sync()
         cfg = self.sync_engine.load_cluster_config()
         if not cfg:
             raise ValueError("Cluster not initialized.")
@@ -1763,6 +1997,7 @@ class MinecraftManager:
             return []
 
     def _write_player_json(self, filename: str, data: List[Dict[str, Any]]) -> None:
+        self._ensure_idle_mutable_sync()
         path = self.runtime_dir / filename
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         self._push_idle_config_safely()
@@ -2136,8 +2371,7 @@ class MinecraftManager:
         return {"path": rel_path, "content": content}
 
     def write_file_content(self, rel_path: str, content: str) -> Dict[str, Any]:
-        if self.local_status == "idle":
-            self.sync_engine.ensure_runtime_synced_when_idle()
+        self._ensure_idle_mutable_sync()
         target = self._safe_resolve_runtime_path(rel_path)
         if target == self.runtime_dir.resolve() or target.is_dir():
             raise ValueError("Target path must be a file, not a directory.")
@@ -2147,8 +2381,7 @@ class MinecraftManager:
         return {"saved": True, "path": rel_path}
 
     def upload_file_base64(self, rel_dir: str, filename: str, base64_data: str) -> Dict[str, Any]:
-        if self.local_status == "idle":
-            self.sync_engine.ensure_runtime_synced_when_idle()
+        self._ensure_idle_mutable_sync()
         safe_name = Path(filename).name
         if not safe_name or safe_name in (".", ".."):
             raise ValueError("Invalid filename for upload.")
@@ -2165,8 +2398,7 @@ class MinecraftManager:
         }
 
     def delete_runtime_file(self, rel_path: str) -> Dict[str, Any]:
-        if self.local_status == "idle":
-            self.sync_engine.ensure_runtime_synced_when_idle()
+        self._ensure_idle_mutable_sync()
         target = self._safe_resolve_runtime_path(rel_path)
         if target == self.runtime_dir.resolve():
             raise ValueError("Cannot delete root runtime directory.")
@@ -2264,8 +2496,7 @@ class MinecraftManager:
         return items
 
     def toggle_plugin(self, filename: str) -> List[Dict[str, Any]]:
-        if self.local_status == "idle":
-            self.sync_engine.ensure_runtime_synced_when_idle()
+        self._ensure_idle_mutable_sync()
         safe_name = Path(filename.strip()).name
         if not safe_name:
             raise ValueError("Plugin filename is required.")
@@ -2286,8 +2517,7 @@ class MinecraftManager:
         return self.list_plugins()
 
     def delete_plugin(self, filename: str) -> List[Dict[str, Any]]:
-        if self.local_status == "idle":
-            self.sync_engine.ensure_runtime_synced_when_idle()
+        self._ensure_idle_mutable_sync()
         safe_name = Path(filename.strip()).name
         if not safe_name:
             raise ValueError("Plugin filename is required.")
@@ -2340,8 +2570,7 @@ class MinecraftManager:
         if not clean_id:
             raise ValueError("Plugin project ID or slug is required.")
         clean_title = re.sub(r"[^a-zA-Z0-9_-]", "", title.strip()) or clean_id
-        if self.local_status == "idle":
-            self.sync_engine.ensure_runtime_synced_when_idle()
+        self._ensure_idle_mutable_sync()
         plugins_dir = self.runtime_dir / "plugins"
         plugins_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2409,6 +2638,32 @@ class MinecraftManager:
     # Status Summary
     # -------------------------------------------------------------------------
 
+    def get_effective_logs(self, limit: int = 120) -> List[Dict[str, Any]]:
+        lock = self.sync_engine.get_lock()
+        is_local = self.sync_engine.is_locked_by_current_machine(lock) or self.local_status != "idle"
+        if not is_local and lock.is_actively_locked():
+            remote_tel = self.sync_engine.read_host_telemetry(expected_epoch=lock.lock_epoch)
+            if remote_tel and isinstance(remote_tel.get("logs"), list):
+                return list(remote_tel["logs"][-limit:])
+            return []
+        with self._mutex:
+            return list(self.console_logs[-limit:])
+
+    def get_fast_players_snapshot(self) -> Dict[str, Any]:
+        """Lightweight online player snapshot without running Java/JAR/disk diagnostics."""
+        with self._mutex:
+            local_running = self.local_status == "running"
+            local_players = list(self.online_players) if local_running else None
+        lock = self.sync_engine.get_lock()
+        online_list = local_players if local_players is not None else (
+            list(lock.online_players) if lock.is_actively_locked() else []
+        )
+        return {
+            "online": online_list,
+            "count": len(online_list),
+            "max": lock.max_players or 20,
+        }
+
     def get_status_summary(self) -> Dict[str, Any]:
         cfg = self.sync_engine.load_cluster_config()
         lock = self.sync_engine.get_lock()
@@ -2426,18 +2681,33 @@ class MinecraftManager:
         active_jar = self.get_active_jar_path()
         has_jar = active_jar.exists() and active_jar.stat().st_size > 1_000_000
 
-        uptime_sec = int(time.time() - lock.started_at) if lock.is_actively_locked() and lock.started_at else 0
-
-        if psutil is not None and self.local_status == "running":
-            try:
-                if self._proc is not None:
-                    p = psutil.Process(self._proc.pid)
-                    self.memory_used_mb = int(p.memory_info().rss / (1024 * 1024))
-                    self.cpu_percent = round(p.cpu_percent(interval=None) or psutil.cpu_percent(interval=None), 1)
-                else:
-                    self.cpu_percent = round(psutil.cpu_percent(interval=None), 1)
-            except Exception:
-                pass
+        remote_hosting = (not is_local_host) and (self.local_status == "idle") and lock.is_actively_locked()
+        remote_tel: Optional[Dict[str, Any]] = None
+        if remote_hosting:
+            remote_tel = self.sync_engine.read_host_telemetry(expected_epoch=lock.lock_epoch)
+            ref_start = (
+                float(remote_tel.get("serverReadyAt") or 0.0) if remote_tel else 0.0
+            ) or lock.server_ready_at or lock.started_at
+            uptime_sec = int(max(0.0, time.time() - ref_start)) if ref_start else 0
+            tel_tps = float((remote_tel.get("tps") if remote_tel and remote_tel.get("tps") is not None else lock.tps) or 0.0)
+            if lock.status == "running" and tel_tps <= 0.0:
+                tel_tps = 20.0
+            tel_mem_used = int((remote_tel.get("memoryUsedMb") if remote_tel and remote_tel.get("memoryUsedMb") is not None else lock.memory_used_mb) or 0)
+            tel_mem_max = int((remote_tel.get("memoryMaxMb") if remote_tel and remote_tel.get("memoryMaxMb") else lock.memory_max_mb) or (cfg.memory_max_mb if cfg else 4096))
+            tel_cpu = round(float((remote_tel.get("cpuPercent") if remote_tel and remote_tel.get("cpuPercent") is not None else lock.cpu_percent) or 0.0), 1)
+            tunnel_state = dict(self.tunnel_manager.get_state())
+            tunnel_state["status"] = lock.tunnel_status or tunnel_state.get("status", "stopped")
+            if lock.public_address:
+                tunnel_state["publicAddress"] = lock.public_address
+        else:
+            self._sample_local_process_metrics()
+            ref_start = self.server_ready_at or lock.server_ready_at or (lock.started_at if lock.is_actively_locked() else self.started_at)
+            uptime_sec = int(max(0.0, time.time() - ref_start)) if (self.local_status != "idle" or lock.is_actively_locked()) and ref_start else 0
+            tel_tps = self.tps if self.local_status == "running" else 0.0
+            tel_mem_used = self.memory_used_mb if self.local_status != "idle" else 0
+            tel_mem_max = cfg.memory_max_mb if cfg else 4096
+            tel_cpu = self.cpu_percent if self.local_status != "idle" else 0.0
+            tunnel_state = self.tunnel_manager.get_state()
 
         lock_dict = lock.to_dict()
         if self.local_status != "idle":
@@ -2457,12 +2727,12 @@ class MinecraftManager:
             "isLocalMachineHosting": is_local_host or (self.local_status != "idle"),
             "onlinePlayers": online_list,
             "lock": lock_dict,
-            "tunnel": self.tunnel_manager.get_state(),
+            "tunnel": tunnel_state,
             "telemetry": {
-                "tps": self.tps if self.local_status == "running" else (20.0 if lock.is_actively_locked() else 0.0),
-                "memoryUsedMb": self.memory_used_mb,
-                "memoryMaxMb": cfg.memory_max_mb if cfg else 4096,
-                "cpuPercent": self.cpu_percent,
+                "tps": tel_tps,
+                "memoryUsedMb": tel_mem_used,
+                "memoryMaxMb": tel_mem_max,
+                "cpuPercent": tel_cpu,
                 "uptimeSeconds": uptime_sec,
             },
             "environment": {

@@ -18,10 +18,14 @@ class PermissionDeniedError(Exception):
 
 
 class AuthService:
+    SESSION_TTL_SEC = 30 * 24 * 3600
+    MAX_SESSIONS = 256
+
     def __init__(self, sync_engine: SyncEngine):
         self.sync_engine = sync_engine
         # Active session token -> user_id mapping in memory
         self._sessions: Dict[str, str] = {}
+        self._session_times: Dict[str, float] = {}
         self._session_mutex = threading.RLock()
 
     @staticmethod
@@ -131,26 +135,46 @@ class AuthService:
         if not matched_account:
             raise AuthError("Invalid passkey. Please check your passkey and try again.")
 
-        matched_account.last_active_at = time.time()
-        self.sync_engine.save_cluster_config(config)
+        now = time.time()
+        # Avoid rewriting shared cluster-config.json on rapid logins to prevent cloud conflict files
+        if (now - float(matched_account.last_active_at or 0.0)) >= 300.0:
+            matched_account.last_active_at = now
+            self.sync_engine.save_cluster_config(config)
         token = self.create_session(matched_account.id)
         return matched_account, token
 
     def create_session(self, user_id: str) -> str:
         token = secrets.token_urlsafe(32)
+        now = time.time()
         with self._session_mutex:
+            expired = [t for t, ts in self._session_times.items() if (now - ts) > self.SESSION_TTL_SEC]
+            for t in expired:
+                self._sessions.pop(t, None)
+                self._session_times.pop(t, None)
+            while len(self._sessions) >= self.MAX_SESSIONS and self._session_times:
+                oldest = min(self._session_times, key=self._session_times.get)  # type: ignore[arg-type]
+                self._sessions.pop(oldest, None)
+                self._session_times.pop(oldest, None)
             self._sessions[token] = user_id
+            self._session_times[token] = now
         return token
 
     def logout_session(self, token: str) -> None:
         with self._session_mutex:
             self._sessions.pop(token, None)
+            self._session_times.pop(token, None)
 
     def get_user_by_token(self, token: Optional[str]) -> Optional[UserAccount]:
         if not token:
             return None
+        now = time.time()
         with self._session_mutex:
             user_id = self._sessions.get(token)
+            issued_at = self._session_times.get(token, now)
+            if user_id and (now - issued_at) > self.SESSION_TTL_SEC:
+                self._sessions.pop(token, None)
+                self._session_times.pop(token, None)
+                user_id = None
         if not user_id:
             return None
         config = self.sync_engine.load_cluster_config()
@@ -162,6 +186,7 @@ class AuthService:
         # User was revoked by Admin! Remove session immediately.
         with self._session_mutex:
             self._sessions.pop(token, None)
+            self._session_times.pop(token, None)
         return None
 
     def require_auth(self, token: Optional[str]) -> UserAccount:
@@ -202,17 +227,21 @@ class AuthService:
             if existing.username.lower() == clean_name.lower():
                 raise ValueError(f"An account with username '{clean_name}' already exists.")
 
-        raw_passkey = (
-            self.normalize_passkey(custom_passkey)
-            if custom_passkey and custom_passkey.strip()
-            else self.generate_passkey("member")
-        )
-
-        # Ensure passkey is completely unique across all accounts
-        for existing in config.accounts:
-            cand_hash, _ = self.hash_passkey(raw_passkey, existing.passkey_salt)
-            if hmac.compare_digest(cand_hash, existing.passkey_hash):
-                raise ValueError("Passkey collision detected; please try again.")
+        has_custom = bool(custom_passkey and custom_passkey.strip())
+        raw_passkey = ""
+        for _ in range(5):
+            candidate = self.normalize_passkey(custom_passkey) if has_custom else self.generate_passkey("member")
+            collision = any(
+                hmac.compare_digest(self.hash_passkey(candidate, existing.passkey_salt)[0], existing.passkey_hash)
+                for existing in config.accounts
+            )
+            if not collision:
+                raw_passkey = candidate
+                break
+            if has_custom:
+                raise ValueError("Passkey collision detected; please choose a different custom passkey.")
+        if not raw_passkey:
+            raise ValueError("Passkey collision detected; please try again.")
 
         pk_hash, pk_salt = self.hash_passkey(raw_passkey)
         member = UserAccount(

@@ -9,16 +9,10 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Callable, Dict, List, Any, Tuple
 
-ADOPTIUM_JRE25_WIN_X64_API = (
-    "https://api.adoptium.net/v3/binary/latest/25/ga/windows/x64/jre/hotspot/normal/eclipse"
+ADOPTIUM_JRE_WIN_X64_API_TMPL = (
+    "https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jre/hotspot/normal/eclipse"
 )
-ADOPTIUM_JRE21_WIN_X64_API = (
-    "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jre/hotspot/normal/eclipse"
-)
-PLAYIT_WIN_URL = (
-    "https://github.com/playit-cloud/playit-agent/releases/download/v0.15.26/playit-windows-x86_64-signed.exe"
-)
-USER_AGENT = "MineRelay/2.0 (https://github.com/minerelay; contact@minerelay.local)"
+USER_AGENT = "MineRelay/2.0 (https://github.com/NtC0der/MineRelay; contact@minerelay.local)"
 
 
 def get_java_major_version(java_cmd: str) -> int:
@@ -86,8 +80,8 @@ def ensure_portable_java(
             log_fn(f"Portable Java Runtime ready at: {existing}")
         return existing
 
-    target_major = 25
-    api_url = ADOPTIUM_JRE25_WIN_X64_API
+    target_major = 25 if min_major >= 22 else 21
+    api_url = ADOPTIUM_JRE_WIN_X64_API_TMPL.format(major=target_major)
     folder_name = f"jre{target_major}"
 
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -97,37 +91,45 @@ def ensure_portable_java(
 
     if log_fn:
         log_fn(
-            f"Downloading Portable Java {target_major} Runtime (Eclipse Temurin {target_major} JRE for Minecraft 26.3+)... (~53 MB)"
+            f"Downloading Portable Java {target_major} Runtime (Eclipse Temurin {target_major} JRE for Minecraft)... (~53 MB)"
         )
 
     req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        total = int(resp.headers.get("Content-Length", 0))
-        downloaded = 0
-        last_pct = -1
-        with open(zip_path, "wb") as out:
-            while True:
-                chunk = resp.read(131072)
-                if not chunk:
-                    break
-                out.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    pct = int((downloaded / total) * 100)
-                    if pct // 20 > last_pct // 20 and log_fn:
-                        last_pct = pct
-                        log_fn(
-                            f"Downloading Portable Java {target_major} JRE: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
-                        )
-
-    if log_fn:
-        log_fn(f"Extracting Portable Java {target_major} JRE...")
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        zf.extractall(jre_root)
     try:
-        zip_path.unlink()
-    except OSError:
-        pass
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            last_pct = -1
+            with open(zip_path, "wb") as out:
+                while True:
+                    chunk = resp.read(131072)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = int((downloaded / total) * 100)
+                        if pct // 20 > last_pct // 20 and log_fn:
+                            last_pct = pct
+                            log_fn(
+                                f"Downloading Portable Java {target_major} JRE: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
+                            )
+
+        if log_fn:
+            log_fn(f"Extracting Portable Java {target_major} JRE...")
+        jre_resolved = jre_root.resolve()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in zf.infolist():
+                target_path = (jre_root / member.filename).resolve()
+                if not (target_path == jre_resolved or target_path.is_relative_to(jre_resolved)):
+                    raise ValueError(f"Zip path traversal detected in JRE archive: {member.filename}")
+                zf.extract(member, jre_root)
+    finally:
+        try:
+            if zip_path.exists():
+                zip_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     found = find_portable_java(bin_dir, min_major=min_major)
     if not found:
@@ -240,10 +242,12 @@ def resolve_mojang_server_url(version: str) -> Tuple[str, str]:
         manifest = json.loads(resp.read().decode("utf-8"))
     versions = manifest.get("versions", [])
     resolved_ver = version
-    ver_url = next((v["url"] for v in versions if v["id"] == version), None)
-    if not ver_url and versions:
+    if not versions:
+        raise RuntimeError("Mojang version manifest returned no versions.")
+    ver_url = next((v["url"] for v in versions if v.get("id") == version), None)
+    if not ver_url:
         resolved_ver = manifest.get("latest", {}).get("release", versions[0]["id"])
-        ver_url = next((v["url"] for v in versions if v["id"] == resolved_ver), versions[0]["url"])
+        ver_url = next((v["url"] for v in versions if v.get("id") == resolved_ver), versions[0]["url"])
     with urllib.request.urlopen(urllib.request.Request(ver_url, headers={"User-Agent": USER_AGENT}), timeout=20) as resp:
         ver_data = json.loads(resp.read().decode("utf-8"))
     return ver_data["downloads"]["server"]["url"], resolved_ver
@@ -411,26 +415,33 @@ def ensure_server_jar(
 
     tmp_jar = versioned_jar.with_suffix(f".tmp.{os.getpid()}.jar")
     req = urllib.request.Request(download_url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        total = int(resp.headers.get("Content-Length", 0))
-        downloaded = 0
-        last_pct = -1
-        with open(tmp_jar, "wb") as out:
-            while True:
-                chunk = resp.read(131072)
-                if not chunk:
-                    break
-                out.write(chunk)
-                downloaded += len(chunk)
-                if total > 0:
-                    pct = int((downloaded / total) * 100)
-                    if pct // 20 > last_pct // 20 and log_fn:
-                        last_pct = pct
-                        log_fn(
-                            f"Downloading {resolved_sw.upper()} {resolved_ver} server.jar: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
-                        )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            last_pct = -1
+            with open(tmp_jar, "wb") as out:
+                while True:
+                    chunk = resp.read(131072)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+                    if total > 0:
+                        pct = int((downloaded / total) * 100)
+                        if pct // 20 > last_pct // 20 and log_fn:
+                            last_pct = pct
+                            log_fn(
+                                f"Downloading {resolved_sw.upper()} {resolved_ver} server.jar: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
+                            )
 
-    os.replace(tmp_jar, versioned_jar)
+        os.replace(tmp_jar, versioned_jar)
+    finally:
+        try:
+            if tmp_jar.exists():
+                tmp_jar.unlink(missing_ok=True)
+        except OSError:
+            pass
     ensure_paperclip_mojang_cache(versioned_jar, runtime_dir, log_fn=log_fn)
     try:
         shutil.copy2(versioned_jar, runtime_dir / "server.jar")
@@ -442,34 +453,6 @@ def ensure_server_jar(
             f"Installed {resolved_sw.upper()} {resolved_ver} ({round(versioned_jar.stat().st_size / (1024*1024), 1)} MB)"
         )
     return versioned_jar
-
-
-def ensure_playit_binary(
-    bin_dir: Path,
-    log_fn: Optional[Callable[[str], None]] = None,
-) -> Path:
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    target = bin_dir / ("playit.exe" if sys.platform.startswith("win") else "playit")
-    if target.exists() and target.stat().st_size > 500_000:
-        if log_fn:
-            log_fn(f"playit.gg binary already installed at {target}")
-        return target
-
-    if log_fn:
-        log_fn("Downloading official playit.gg tunnel agent binary...")
-    tmp = target.with_suffix(".tmp")
-    req = urllib.request.Request(PLAYIT_WIN_URL, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        with open(tmp, "wb") as out:
-            while True:
-                chunk = resp.read(131072)
-                if not chunk:
-                    break
-                out.write(chunk)
-    os.replace(tmp, target)
-    if log_fn:
-        log_fn(f"playit.gg binary installed ({round(target.stat().st_size / (1024*1024), 1)} MB)")
-    return target
 
 
 if __name__ == "__main__":
@@ -484,5 +467,4 @@ if __name__ == "__main__":
     print(f"Latest Official Minecraft Release: {latest_ver}")
     java_exe = ensure_portable_java(bin_dir, min_major=25, log_fn=print)
     jar_file = ensure_server_jar(runtime_dir, "paper", latest_ver, log_fn=print, bin_dir=bin_dir)
-    playit_exe = ensure_playit_binary(bin_dir, log_fn=print)
     print(f"=== All Binaries Ready for Minecraft {latest_ver}! ===")
