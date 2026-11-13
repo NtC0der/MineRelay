@@ -45,12 +45,20 @@ class SyncEngine:
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
         self._owns_active_lock = False
+        self._active_lock_epoch: str = ""
         self._last_synced_snapshot_mtime: float = 0.0
         self._last_synced_snapshot_sig: Tuple[float, int, str] = (0.0, -1, "")
+        self._last_synced_snapshot_hash: str = ""
         self._last_synced_manifest_seq: int = 0
         self._last_known_remote_lock: Optional[HostLock] = None
         self._last_known_remote_lock_at: float = 0.0
-        self._remote_hb_tracker: Dict[str, Tuple[float, float]] = {}
+        # track_key -> (last_seen_hb, first_seen_local, last_advance_local)
+        self._remote_hb_tracker: Dict[str, Tuple[float, float, float]] = {}
+        self._known_released_epochs: set = set()
+        self._cached_own_lock: Optional[HostLock] = None
+        self._cached_own_lock_mtime: float = 0.0
+        self._last_session_write_at: float = 0.0
+        self._last_telemetry_publish_at: float = 0.0
 
         self.local_config = self._load_local_config()
         self._ensure_shared_dirs()
@@ -62,13 +70,22 @@ class SyncEngine:
         size: int,
         path_str: str,
         manifest_seq: Optional[int] = None,
+        sha256_hex: str = "",
     ) -> None:
         seq = manifest_seq if manifest_seq is not None else self._last_synced_manifest_seq
         self._last_synced_manifest_seq = seq
+        if sha256_hex:
+            self._last_synced_snapshot_hash = sha256_hex.lower()
         try:
             self._write_json_atomic(
                 self.sync_state_path,
-                {"mtime": mtime, "size": size, "path": path_str, "manifestSeq": seq},
+                {
+                    "mtime": mtime,
+                    "size": size,
+                    "path": path_str,
+                    "manifestSeq": seq,
+                    "sha256": self._last_synced_snapshot_hash,
+                },
                 in_place_if_exists=False,
             )
         except Exception:
@@ -78,10 +95,17 @@ class SyncEngine:
         with self._sync_mutex:
             self._last_synced_snapshot_mtime = 0.0
             self._last_synced_snapshot_sig = (0.0, -1, "")
+            self._last_synced_snapshot_hash = ""
             self._last_synced_manifest_seq = 0
-            self._last_known_remote_lock = None
-            self._last_known_remote_lock_at = 0.0
-            self._remote_hb_tracker.clear()
+            with self._lock_mutex:
+                self._last_known_remote_lock = None
+                self._last_known_remote_lock_at = 0.0
+                self._remote_hb_tracker.clear()
+                self._known_released_epochs.clear()
+                self._cached_own_lock = None
+                self._cached_own_lock_mtime = 0.0
+                self._last_session_write_at = 0.0
+                self._last_telemetry_publish_at = 0.0
             try:
                 if self.sync_state_path.exists():
                     self.sync_state_path.unlink(missing_ok=True)
@@ -90,23 +114,22 @@ class SyncEngine:
 
     def _init_snapshot_mtime(self) -> None:
         try:
-            if self.latest_snapshot_path.exists() and (self.runtime_dir / "server.properties").exists():
-                st = self.latest_snapshot_path.stat()
-                snap_path_str = str(self.latest_snapshot_path)
-                if self.sync_state_path.exists():
-                    try:
-                        saved = json.loads(self.sync_state_path.read_text(encoding="utf-8"))
-                        if (
-                            saved.get("path") == snap_path_str
-                            and int(saved.get("size", -1)) == st.st_size
-                            and abs(float(saved.get("mtime", 0.0)) - st.st_mtime) < 1e-3
-                        ):
-                            self._last_synced_snapshot_mtime = st.st_mtime
-                            self._last_synced_snapshot_sig = (st.st_mtime, st.st_size, snap_path_str)
-                            self._last_synced_manifest_seq = int(saved.get("manifestSeq", 0) or 0)
-                    except Exception:
-                        pass
-        except OSError:
+            if (self.runtime_dir / "server.properties").exists() and self.sync_state_path.exists():
+                saved = json.loads(self.sync_state_path.read_text(encoding="utf-8"))
+                saved_path_str = str(saved.get("path") or "")
+                cand_path = Path(saved_path_str) if saved_path_str else self.latest_snapshot_path
+                if cand_path.exists() and cand_path.is_file():
+                    st = cand_path.stat()
+                    if (
+                        saved_path_str == str(cand_path)
+                        and int(saved.get("size", -1)) == st.st_size
+                        and abs(float(saved.get("mtime", 0.0)) - st.st_mtime) < 1e-3
+                    ):
+                        self._last_synced_snapshot_mtime = st.st_mtime
+                        self._last_synced_snapshot_sig = (st.st_mtime, st.st_size, str(cand_path))
+                        self._last_synced_manifest_seq = int(saved.get("manifestSeq", 0) or 0)
+                        self._last_synced_snapshot_hash = str(saved.get("sha256", "") or "").lower()
+        except Exception:
             pass
 
     def _emit(self, event_type: str, payload: Any) -> None:
@@ -169,6 +192,21 @@ class SyncEngine:
     def locks_dir(self) -> Path:
         return self.shared_dir / "locks"
 
+    def _iter_locks_dirs(self) -> List[Path]:
+        """Returns `locks/` plus any Google Drive conflict `locks (N)/` folders."""
+        dirs: List[Path] = []
+        if self.locks_dir.exists():
+            dirs.append(self.locks_dir)
+        pat = re.compile(r"^locks\s*\(\d+\)$", re.IGNORECASE)
+        try:
+            if self.shared_dir.exists():
+                for item in self.shared_dir.iterdir():
+                    if item.is_dir() and pat.match(item.name):
+                        dirs.append(item)
+        except OSError:
+            pass
+        return dirs
+
     @property
     def host_telemetry_path(self) -> Path:
         return self.locks_dir / "host-telemetry.json"
@@ -177,16 +215,30 @@ class SyncEngine:
     def shared_tunnel_dir(self) -> Path:
         return self.shared_dir / "tunnel"
 
-    def _ensure_shared_dirs(self) -> None:
+    def _ensure_shared_dirs(self, cleanup_conflicts: bool = True) -> None:
         try:
+            if (
+                not cleanup_conflicts
+                and os.path.isdir(self.locks_dir)
+                and os.path.isdir(self.shared_tunnel_dir)
+                and os.path.isdir(self.snapshots_dir)
+                and os.path.isdir(self.backups_dir)
+            ):
+                return
             self.shared_dir.mkdir(parents=True, exist_ok=True)
             self.snapshots_dir.mkdir(parents=True, exist_ok=True)
             self.backups_dir.mkdir(parents=True, exist_ok=True)
             self.locks_dir.mkdir(parents=True, exist_ok=True)
             self.shared_tunnel_dir.mkdir(parents=True, exist_ok=True)
-            self._cleanup_cloud_conflict_files()
+            if cleanup_conflicts:
+                self._cleanup_cloud_conflict_files()
         except Exception:
             pass
+
+    @staticmethod
+    def _strip_conflict_suffix(stem: str) -> str:
+        """Strips Google Drive / OneDrive / Dropbox conflict suffixes like ' (1)' from a file stem."""
+        return re.sub(r"\s*\(\d+\)$", "", stem).strip()
 
     @staticmethod
     def _sha256_file(target_path: Path) -> str:
@@ -200,27 +252,44 @@ class SyncEngine:
         return h.hexdigest()
 
     def _has_active_cloud_transfer(self) -> Optional[str]:
-        """Returns a human-readable notice if Google Drive / OneDrive is actively syncing a temp file."""
+        """Returns a human-readable notice if Google Drive / OneDrive / Dropbox is actively syncing a temp file."""
         now = time.time()
-        for folder in (self.shared_dir, self.snapshots_dir):
-            if not folder.exists():
-                continue
-            for marker_name in (".tmp.drivedownload", ".tmp.driveupload"):
-                mdir = folder / marker_name
-                if mdir.exists() and mdir.is_dir():
-                    try:
-                        for entry in mdir.iterdir():
+        marker_names = {".tmp.drivedownload", ".tmp.driveupload", ".dropbox.cache"}
+        for folder in (self.shared_dir, self.snapshots_dir, self.backups_dir, self.locks_dir):
+            try:
+                with os.scandir(folder) as it:
+                    for entry in it:
+                        ename = entry.name
+                        if ename in marker_names and entry.is_dir(follow_symlinks=False):
                             try:
-                                if not entry.is_file():
-                                    continue
-                                st = entry.stat()
-                                if st.st_size > 0 and (now - st.st_mtime) < 120:
-                                    action = "downloading" if "download" in marker_name else "uploading"
-                                    return f"Cloud sync is currently {action} files ({entry.name}, {round(st.st_size / (1024 * 1024), 1)} MB)."
+                                with os.scandir(entry.path) as mit:
+                                    for mentry in mit:
+                                        try:
+                                            if not mentry.is_file(follow_symlinks=False):
+                                                continue
+                                            st = mentry.stat(follow_symlinks=False)
+                                            age = now - st.st_mtime
+                                            if (st.st_size > 0 and age < 120) or (st.st_size == 0 and age < 15):
+                                                action = "uploading" if "upload" in ename else "downloading"
+                                                return f"Cloud sync is currently {action} files ({mentry.name}, {round(st.st_size / (1024 * 1024), 1)} MB)."
+                                        except OSError:
+                                            continue
+                            except OSError:
+                                pass
+                            continue
+                        lname = ename.lower()
+                        if (
+                            lname.endswith((".part", ".partial", ".crdownload"))
+                            or (lname.startswith("~") and lname.endswith(".tmp"))
+                        ) and entry.is_file(follow_symlinks=False):
+                            try:
+                                st = entry.stat(follow_symlinks=False)
+                                if (now - st.st_mtime) < 60:
+                                    return f"Cloud sync is currently downloading files ({ename}, {round(st.st_size / (1024 * 1024), 1)} MB)."
                             except OSError:
                                 continue
-                    except OSError:
-                        pass
+            except OSError:
+                continue
         return None
 
     def _copy_file_preserving_cloud_id(self, src_path: Path, dst_path: Path) -> None:
@@ -278,8 +347,10 @@ class SyncEngine:
     ) -> Dict[str, Any]:
         prev = self._read_sync_manifest()
         prev_seq = int(prev.get("snapshotSeq", 0)) if prev else 0
+        exp_seq, _, _ = self.get_expected_snapshot_state()
+        base_seq = max(prev_seq, self._last_synced_manifest_seq, exp_seq)
         manifest = {
-            "snapshotSeq": prev_seq + 1,
+            "snapshotSeq": base_seq + 1,
             "sha256": sha256_hex,
             "sizeBytes": int(size_bytes),
             "fileCount": int(file_count),
@@ -293,22 +364,52 @@ class SyncEngine:
         return manifest
 
     def _load_released_epochs(self) -> set:
-        released = set()
-        if not self.locks_dir.exists():
-            return released
-        try:
-            for item in self.locks_dir.iterdir():
-                if not item.is_file() or not item.name.startswith("released-") or not item.name.endswith(".json"):
-                    continue
-                epoch = item.name[len("released-"):-len(".json")]
-                if epoch:
-                    released.add(epoch)
-        except OSError:
-            pass
+        with self._lock_mutex:
+            released = set(self._known_released_epochs)
+        found = set()
+        for ldir in self._iter_locks_dirs():
+            try:
+                for item in ldir.iterdir():
+                    if not item.is_file() or not item.name.startswith("released-") or not item.name.endswith(".json"):
+                        continue
+                    raw_epoch = item.name[len("released-"):-len(".json")]
+                    epoch = self._strip_conflict_suffix(raw_epoch)
+                    if epoch:
+                        found.add(epoch)
+                    if raw_epoch != epoch:
+                        tdata = self._read_json_safe(item)
+                        if isinstance(tdata, dict) and tdata.get("lockEpoch"):
+                            ep = str(tdata["lockEpoch"]).strip()
+                            if ep:
+                                found.add(ep)
+            except OSError:
+                pass
+        if found:
+            with self._lock_mutex:
+                self._known_released_epochs.update(found)
+            released.update(found)
         return released
 
+    def _is_lock_effectively_active(self, lock: HostLock, now: Optional[float] = None) -> bool:
+        """Evaluates whether `lock` is active, respecting observed remote heartbeat progression for clock skew."""
+        if not lock.is_locked:
+            return False
+        t_now = now if now is not None else time.time()
+        if lock.machine_id and lock.machine_id != self.local_config.machine_id:
+            track_key = f"{lock.machine_id}:{lock.lock_epoch or int(lock.started_at)}"
+            with self._lock_mutex:
+                prev = self._remote_hb_tracker.get(track_key)
+            if prev is not None:
+                _, first_seen, obs_at = prev
+                if obs_at > 0.0 and (t_now - obs_at) <= LOCK_STALE_TIMEOUT_SEC:
+                    return True
+                ref_obs = obs_at if obs_at > 0.0 else first_seen
+                if lock.last_heartbeat > t_now + 30.0 and (t_now - ref_obs) > LOCK_STALE_TIMEOUT_SEC:
+                    return False
+        return lock.is_actively_locked(t_now)
+
     def _merge_cluster_config_conflict(self, conflict_path: Path) -> None:
-        """Merges any accounts or newer settings from a cloud conflict config file before cleanup."""
+        """Merges accounts and newer settings from a cloud conflict config file before cleanup."""
         try:
             cdata = self._read_json_safe(conflict_path)
             if not isinstance(cdata, dict) or not cdata:
@@ -319,8 +420,46 @@ class SyncEngine:
                 if ccfg.accounts:
                     self.save_cluster_config(ccfg)
                 return
-            by_id = {a.id: a for a in mcfg.accounts}
+
+            try:
+                c_mtime = conflict_path.stat().st_mtime
+            except OSError:
+                c_mtime = 0.0
+            try:
+                m_mtime = self.cluster_config_path.stat().st_mtime if self.cluster_config_path.exists() else 0.0
+            except OSError:
+                m_mtime = 0.0
+
             changed = False
+            # If the conflict file is newer than or equal to the main file, adopt its non-account cluster settings
+            if c_mtime >= m_mtime and c_mtime > 0.0:
+                for attr in (
+                    "server_name",
+                    "mc_software",
+                    "mc_version",
+                    "memory_min_mb",
+                    "memory_max_mb",
+                    "java_path",
+                    "jvm_flags",
+                    "server_port",
+                    "tunnel_enabled",
+                    "tunnel_provider",
+                    "public_join_address",
+                    "git_sync_enabled",
+                    "auto_backup_on_stop",
+                    "max_backups",
+                    "idle_shutdown_minutes",
+                    "auto_sync_interval_minutes",
+                    "gamerules",
+                ):
+                    if hasattr(ccfg, attr) and hasattr(mcfg, attr):
+                        c_val = getattr(ccfg, attr)
+                        m_val = getattr(mcfg, attr)
+                        if c_val != m_val:
+                            setattr(mcfg, attr, c_val)
+                            changed = True
+
+            by_id = {a.id: a for a in mcfg.accounts}
             for acc in ccfg.accounts:
                 existing = by_id.get(acc.id)
                 if existing is None:
@@ -345,12 +484,13 @@ class SyncEngine:
         after preserving any fresher active state, and prunes expired per-session tombstones in `locks/`.
         """
         conflict_pattern = re.compile(r"^(host-lock|cluster-config|latest-server|sync-manifest)\s*\(\d+\)\.(json|zip)$", re.IGNORECASE)
-        folder_conflict_pattern = re.compile(r"^(locks|snapshots)\s*\(\d+\)$", re.IGNORECASE)
+        folder_conflict_pattern = re.compile(r"^(locks|snapshots|tunnel)\s*\(\d+\)$", re.IGNORECASE)
         manifest = self._read_sync_manifest() if self.sync_manifest_path.exists() else None
         released_epochs = self._load_released_epochs()
         now = time.time()
+        transfer_active = bool(self._has_active_cloud_transfer())
 
-        # Reconcile duplicate conflict directories (e.g. Google Drive 'locks (1)' or 'snapshots (1)')
+        # Reconcile duplicate conflict directories (e.g. Google Drive 'locks (1)', 'snapshots (1)', 'tunnel (1)')
         try:
             if self.shared_dir.exists():
                 for item in list(self.shared_dir.iterdir()):
@@ -362,24 +502,75 @@ class SyncEngine:
                     base_dir_name = fm.group(1).lower()
                     if base_dir_name == "locks":
                         self.locks_dir.mkdir(parents=True, exist_ok=True)
+                        dir_has_live_remote = False
                         for sub in list(item.rglob("*.json")):
-                            target = self.locks_dir / sub.name
+                            norm_name = f"{self._strip_conflict_suffix(sub.stem)}{sub.suffix}"
+                            target = self.locks_dir / norm_name
                             try:
-                                if sub.name.startswith(("released-", "session-")) and not target.exists():
-                                    shutil.copy2(sub, target)
+                                if norm_name.startswith("released-"):
+                                    epoch = norm_name[len("released-"):-len(".json")]
+                                    if epoch:
+                                        released_epochs.add(epoch)
+                                        self._known_released_epochs.add(epoch)
+                                    if not target.exists():
+                                        shutil.copy2(sub, target)
+                                elif norm_name.startswith("session-"):
+                                    sdata = self._read_json_safe(sub)
+                                    slock = HostLock.from_dict(sdata) if isinstance(sdata, dict) else None
+                                    ep = (slock.lock_epoch if slock and slock.lock_epoch else norm_name[len("session-"):-len(".json")])
+                                    if ep in released_epochs:
+                                        continue
+                                    if (
+                                        slock
+                                        and slock.is_locked
+                                        and slock.machine_id != self.local_config.machine_id
+                                        and self._is_lock_effectively_active(slock, now)
+                                    ):
+                                        dir_has_live_remote = True
+                                    if not target.exists():
+                                        shutil.copy2(sub, target)
+                                    elif slock and slock.is_locked:
+                                        cur_sdata = self._read_json_safe(target)
+                                        cur_hb = float(cur_sdata.get("lastHeartbeat", 0.0) or 0.0) if isinstance(cur_sdata, dict) else 0.0
+                                        if slock.last_heartbeat > cur_hb:
+                                            shutil.copy2(sub, target)
+                                elif norm_name == "host-telemetry.json":
+                                    tdata = self._read_json_safe(sub)
+                                    if isinstance(tdata, dict):
+                                        t_upd = float(tdata.get("updatedAt", 0.0) or 0.0)
+                                        t_epoch = str(tdata.get("lockEpoch") or "")
+                                        if t_epoch and t_epoch in released_epochs:
+                                            continue
+                                        if (
+                                            tdata.get("isActive")
+                                            and str(tdata.get("machineId", "")) != self.local_config.machine_id
+                                            and (now - t_upd) < LOCK_STALE_TIMEOUT_SEC
+                                        ):
+                                            dir_has_live_remote = True
+                                        cur_t = self._read_json_safe(target) if target.exists() else None
+                                        cur_upd = float(cur_t.get("updatedAt", 0.0) or 0.0) if isinstance(cur_t, dict) else 0.0
+                                        if t_upd > cur_upd and (tdata.get("isActive") or cur_t is not None):
+                                            shutil.copy2(sub, target)
                             except OSError:
                                 pass
-                        for leftover in list(item.iterdir()):
-                            if leftover.name.lower() == "desktop.ini" or leftover.suffix.lower() == ".json":
+                        if not dir_has_live_remote:
+                            for leftover in sorted(item.rglob("*"), reverse=True):
                                 try:
-                                    leftover.unlink(missing_ok=True)
+                                    if leftover.is_file() and (
+                                        leftover.name.lower() == "desktop.ini"
+                                        or leftover.suffix.lower() == ".json"
+                                        or ".tmp." in leftover.name
+                                    ):
+                                        leftover.unlink(missing_ok=True)
+                                    elif leftover.is_dir() and not any(leftover.iterdir()):
+                                        leftover.rmdir()
                                 except OSError:
                                     pass
-                        try:
-                            if not any(item.iterdir()):
-                                item.rmdir()
-                        except OSError:
-                            pass
+                            try:
+                                if not any(item.iterdir()):
+                                    item.rmdir()
+                            except OSError:
+                                pass
                     elif base_dir_name == "snapshots":
                         for sub in list(item.glob("backups/*.zip")):
                             target = self.backups_dir / sub.name
@@ -402,7 +593,23 @@ class SyncEngine:
                                     manifest = c_manifest
                                 except OSError:
                                     pass
+                        if not transfer_active:
+                            try:
+                                recent = any((now - p.stat().st_mtime) < 15 for p in item.rglob("*") if p.is_file())
+                            except OSError:
+                                recent = False
+                            if not recent:
+                                try:
+                                    shutil.rmtree(item, ignore_errors=True)
+                                except OSError:
+                                    pass
+                    elif base_dir_name == "tunnel":
+                        self.shared_tunnel_dir.mkdir(parents=True, exist_ok=True)
+                        main_toml = self.shared_tunnel_dir / "playit.toml"
+                        c_toml = item / "playit.toml"
                         try:
+                            if c_toml.exists() and not main_toml.exists() and c_toml.stat().st_size > 0:
+                                shutil.copy2(c_toml, main_toml)
                             shutil.rmtree(item, ignore_errors=True)
                         except OSError:
                             pass
@@ -414,7 +621,7 @@ class SyncEngine:
         for folder in (self.shared_dir, self.snapshots_dir):
             if not folder.exists():
                 continue
-            for item in folder.iterdir():
+            for item in list(folder.iterdir()):
                 if not item.is_file():
                     continue
                 if ".tmp." in item.name:
@@ -428,6 +635,7 @@ class SyncEngine:
                 if not m:
                     continue
                 stem_base = m.group(1).lower()
+                should_unlink = True
                 if stem_base == "host-lock":
                     try:
                         cdata = self._read_json_safe(item)
@@ -436,11 +644,22 @@ class SyncEngine:
                             main_data = self._read_json_safe(self.host_lock_path)
                             main_lock = HostLock.from_dict(main_data) if isinstance(main_data, dict) else HostLock()
                             if (
-                                clock.is_actively_locked(now)
+                                self._is_lock_effectively_active(clock, now)
                                 and (not clock.lock_epoch or clock.lock_epoch not in released_epochs)
-                                and clock.last_heartbeat > main_lock.last_heartbeat
+                                and (
+                                    not self._is_lock_effectively_active(main_lock, now)
+                                    or clock.last_heartbeat > main_lock.last_heartbeat
+                                )
                             ):
                                 self._write_json_atomic(self.host_lock_path, clock.to_dict(), in_place_if_exists=True)
+                            elif (
+                                not clock.is_locked
+                                and not main_lock.is_locked
+                                and clock.expected_snapshot_seq > main_lock.expected_snapshot_seq
+                            ):
+                                main_lock.expected_snapshot_seq = clock.expected_snapshot_seq
+                                main_lock.expected_snapshot_hash = clock.expected_snapshot_hash
+                                self._write_json_atomic(self.host_lock_path, main_lock.to_dict(), in_place_if_exists=True)
                     except Exception:
                         pass
                 elif stem_base == "cluster-config":
@@ -465,42 +684,95 @@ class SyncEngine:
                                 if cand_src is not None:
                                     self._write_json_atomic(self.sync_manifest_path, cm, in_place_if_exists=True)
                                     manifest = cm
+                                elif transfer_active or (now - item.stat().st_mtime) < 120:
+                                    should_unlink = False
                     except Exception:
                         pass
-                elif stem_base == "latest-server" and manifest:
+                elif stem_base == "latest-server":
                     try:
-                        exp_size = int(manifest.get("sizeBytes", -1))
-                        exp_hash = str(manifest.get("sha256", ""))
-                        if item.stat().st_size == exp_size and exp_hash:
-                            main_ok = (
-                                self.latest_snapshot_path.exists()
-                                and self.latest_snapshot_path.stat().st_size == exp_size
-                                and self._sha256_file(self.latest_snapshot_path) == exp_hash
-                            )
-                            if not main_ok and self._sha256_file(item) == exp_hash:
-                                self._copy_file_preserving_cloud_id(item, self.latest_snapshot_path)
+                        if manifest:
+                            exp_size = int(manifest.get("sizeBytes", -1))
+                            exp_hash = str(manifest.get("sha256", "")).lower()
+                            if item.stat().st_size == exp_size and exp_hash:
+                                main_ok = (
+                                    self.latest_snapshot_path.exists()
+                                    and self.latest_snapshot_path.stat().st_size == exp_size
+                                    and self._sha256_file(self.latest_snapshot_path).lower() == exp_hash
+                                )
+                                if not main_ok and self._sha256_file(item).lower() == exp_hash:
+                                    self._copy_file_preserving_cloud_id(item, self.latest_snapshot_path)
+                            elif transfer_active or (now - item.stat().st_mtime) < 120:
+                                should_unlink = False
+                        elif transfer_active or (now - item.stat().st_mtime) < 120:
+                            should_unlink = False
                     except Exception:
                         pass
-                try:
-                    item.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                if should_unlink:
+                    try:
+                        item.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
+        # Reconcile and prune conflict copies + expired tombstones in locks/
         if self.locks_dir.exists():
             try:
-                for item in self.locks_dir.iterdir():
-                    if not item.is_file() or not item.name.endswith(".json"):
+                tel_conflicts: List[Tuple[float, Path]] = []
+                for item in list(self.locks_dir.iterdir()):
+                    if not item.is_file():
+                        continue
+                    if ".tmp." in item.name:
+                        try:
+                            if now - item.stat().st_mtime > 30:
+                                item.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        continue
+                    if not item.name.endswith(".json"):
                         continue
                     try:
                         age = now - item.stat().st_mtime
-                        if item.name.startswith("session-"):
-                            epoch = item.name[len("session-"):-len(".json")]
-                            if epoch in released_epochs and age > 60:
+                        norm_stem = self._strip_conflict_suffix(item.stem)
+                        is_conflict_copy = norm_stem != item.stem
+                        if norm_stem.startswith("session-"):
+                            epoch = norm_stem[len("session-"):]
+                            if epoch in released_epochs and (is_conflict_copy or age > 60):
                                 item.unlink(missing_ok=True)
-                        elif item.name.startswith("released-") and age > 3600:
-                            item.unlink(missing_ok=True)
+                            elif is_conflict_copy:
+                                sdata = self._read_json_safe(item)
+                                base_path = self.locks_dir / f"{norm_stem}.json"
+                                if isinstance(sdata, dict) and sdata.get("isLocked"):
+                                    cur_sdata = self._read_json_safe(base_path)
+                                    cur_hb = float(cur_sdata.get("lastHeartbeat", 0.0) or 0.0) if isinstance(cur_sdata, dict) else 0.0
+                                    if not base_path.exists() or float(sdata.get("lastHeartbeat", 0.0) or 0.0) > cur_hb:
+                                        self._write_json_atomic(base_path, sdata, in_place_if_exists=True)
+                                item.unlink(missing_ok=True)
+                        elif norm_stem.startswith("released-"):
+                            epoch = norm_stem[len("released-"):]
+                            if is_conflict_copy:
+                                base_path = self.locks_dir / f"{norm_stem}.json"
+                                if not base_path.exists():
+                                    rdata = self._read_json_safe(item)
+                                    if isinstance(rdata, dict):
+                                        self._write_json_atomic(base_path, rdata, in_place_if_exists=True)
+                                item.unlink(missing_ok=True)
+                            elif age > 86400:
+                                item.unlink(missing_ok=True)
+                        elif norm_stem == "host-telemetry" and is_conflict_copy:
+                            tdata = self._read_json_safe(item)
+                            t_upd = float(tdata.get("updatedAt", 0.0) or 0.0) if isinstance(tdata, dict) else 0.0
+                            tel_conflicts.append((t_upd, item))
                     except OSError:
                         pass
+                if tel_conflicts:
+                    cur_tel = self._read_json_safe(self.host_telemetry_path)
+                    cur_upd = float(cur_tel.get("updatedAt", 0.0) or 0.0) if isinstance(cur_tel, dict) else 0.0
+                    for t_upd, cpath in sorted(tel_conflicts, key=lambda x: x[0], reverse=True):
+                        cdata = self._read_json_safe(cpath)
+                        c_ep = str(cdata.get("lockEpoch") or "") if isinstance(cdata, dict) else ""
+                        if isinstance(cdata, dict) and t_upd > cur_upd and (not c_ep or c_ep not in released_epochs):
+                            self._write_json_atomic(self.host_telemetry_path, cdata, in_place_if_exists=True)
+                            cur_upd = t_upd
+                        cpath.unlink(missing_ok=True)
             except OSError:
                 pass
 
@@ -509,20 +781,32 @@ class SyncEngine:
         target_path: Path,
         data: Dict[str, Any],
         in_place_if_exists: bool = False,
+        fsync: bool = True,
     ) -> None:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        content = json.dumps(data, indent=2)
+        content_bytes = json.dumps(data, indent=2).encode("utf-8")
 
-        # Updating existing shared JSON in-place keeps Google Drive Cloud File IDs intact
+        # Updating existing shared JSON in-place keeps Google Drive Cloud File IDs intact.
+        # Pad trailing whitespace before truncating in binary mode so concurrent readers never observe
+        # leftover tail bytes from a longer previous JSON payload.
         if in_place_if_exists and target_path.exists():
             for attempt in range(8):
                 try:
-                    with open(target_path, "r+", encoding="utf-8") as f:
+                    with open(target_path, "r+b") as f:
+                        f.seek(0, os.SEEK_END)
+                        old_size = f.tell()
                         f.seek(0)
-                        f.write(content)
-                        f.truncate()
+                        if old_size > len(content_bytes):
+                            f.write(content_bytes + (b" " * (old_size - len(content_bytes))))
+                            f.flush()
+                            f.seek(len(content_bytes))
+                            f.truncate()
+                        else:
+                            f.write(content_bytes)
+                            f.truncate()
                         f.flush()
-                        os.fsync(f.fileno())
+                        if fsync:
+                            os.fsync(f.fileno())
                     return
                 except FileNotFoundError:
                     break
@@ -531,10 +815,11 @@ class SyncEngine:
 
         tmp_path = target_path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
         try:
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(content)
+            with open(tmp_path, "wb") as f:
+                f.write(content_bytes)
                 f.flush()
-                os.fsync(f.fileno())
+                if fsync:
+                    os.fsync(f.fileno())
             for attempt in range(8):
                 try:
                     os.replace(tmp_path, target_path)
@@ -851,6 +1136,15 @@ class SyncEngine:
             except Exception:
                 pass
 
+        backup_count = 0
+        try:
+            with os.scandir(self.backups_dir) as it:
+                for entry in it:
+                    if entry.name.endswith(".zip") and entry.is_file(follow_symlinks=False):
+                        backup_count += 1
+        except OSError:
+            backup_count = 0
+
         return {
             "sharedSyncDir": str(shared),
             "providerDetected": provider,
@@ -859,7 +1153,7 @@ class SyncEngine:
             "latestSnapshotExists": snap_exists,
             "latestSnapshotSizeBytes": snap_size,
             "latestSnapshotModifiedAt": snap_mtime,
-            "backupCount": len(list(self.backups_dir.glob("*.zip"))) if self.backups_dir.exists() else 0,
+            "backupCount": backup_count,
             "hasSharedTunnelSecret": (self.shared_tunnel_dir / "playit.toml").exists(),
             "isShortcutStreamPath": is_shortcut_stream,
             "mirroredAlternatives": mirrored_alternatives,
@@ -874,7 +1168,31 @@ class SyncEngine:
     def load_cluster_config(self) -> Optional[ClusterConfig]:
         data = self._read_json_safe(self.cluster_config_path)
         if not data:
-            return None
+            # Fallback to newest valid Google Drive conflict copy if main cluster-config.json is missing/corrupt
+            conflict_pattern = re.compile(r"^cluster-config\s*\(\d+\)\.json$", re.IGNORECASE)
+            candidates: List[Tuple[float, Dict[str, Any]]] = []
+            try:
+                if self.shared_dir.exists():
+                    for item in self.shared_dir.iterdir():
+                        if item.is_file() and conflict_pattern.match(item.name):
+                            cdata = self._read_json_safe(item)
+                            if isinstance(cdata, dict) and cdata.get("accounts"):
+                                try:
+                                    cmtime = item.stat().st_mtime
+                                except OSError:
+                                    cmtime = 0.0
+                                candidates.append((cmtime, cdata))
+            except OSError:
+                pass
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                data = candidates[0][1]
+                try:
+                    self._write_json_atomic(self.cluster_config_path, data, in_place_if_exists=True)
+                except Exception:
+                    pass
+            else:
+                return None
         cfg = ClusterConfig.from_dict(data)
         migrated = False
         for acc in cfg.accounts:
@@ -889,7 +1207,7 @@ class SyncEngine:
         return cfg
 
     def save_cluster_config(self, config: ClusterConfig) -> None:
-        self._ensure_shared_dirs()
+        self._ensure_shared_dirs(cleanup_conflicts=False)
         self._write_json_atomic(
             self.cluster_config_path,
             config.to_dict(include_secrets=True),
@@ -905,7 +1223,8 @@ class SyncEngine:
     ) -> None:
         if not lock_epoch:
             return
-        self._ensure_shared_dirs()
+        self._ensure_shared_dirs(cleanup_conflicts=False)
+        self._known_released_epochs.add(lock_epoch)
         tombstone = self.locks_dir / f"released-{lock_epoch}.json"
         self._write_json_atomic(
             tombstone,
@@ -920,30 +1239,59 @@ class SyncEngine:
             },
             in_place_if_exists=True,
         )
-        session_file = self.locks_dir / f"session-{lock_epoch}.json"
-        try:
-            if session_file.exists():
-                session_file.unlink(missing_ok=True)
-        except OSError:
-            pass
+        for ldir in self._iter_locks_dirs():
+            try:
+                for item in list(ldir.iterdir()):
+                    if not item.is_file() or not item.name.endswith(".json"):
+                        continue
+                    norm_stem = self._strip_conflict_suffix(item.stem)
+                    if norm_stem == f"session-{lock_epoch}":
+                        item.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    def write_host_telemetry(self, payload: Dict[str, Any]) -> None:
+    def write_host_telemetry(self, payload: Dict[str, Any], fsync: bool = False) -> None:
         """Publishes sanitized live telemetry and console tail for remote cluster observers."""
         try:
             self.locks_dir.mkdir(parents=True, exist_ok=True)
             data = dict(payload)
             data["updatedAt"] = time.time()
-            self._write_json_atomic(self.host_telemetry_path, data, in_place_if_exists=True)
+            self._write_json_atomic(self.host_telemetry_path, data, in_place_if_exists=True, fsync=fsync)
         except Exception:
             pass
 
     def read_host_telemetry(self, expected_epoch: str = "") -> Optional[Dict[str, Any]]:
-        data = self._read_json_safe(self.host_telemetry_path)
-        if not isinstance(data, dict):
+        """Reads the freshest host telemetry payload across `locks/` and Drive conflict folders/files."""
+        tel_pattern = re.compile(r"^host-telemetry(?:\s*\(\d+\))?\.json$", re.IGNORECASE)
+        candidates: List[Tuple[int, float, int, int, float, Dict[str, Any]]] = []
+        for ldir in self._iter_locks_dirs():
+            try:
+                for item in ldir.iterdir():
+                    if not item.is_file() or not tel_pattern.match(item.name):
+                        continue
+                    data = self._read_json_safe(item)
+                    if not isinstance(data, dict):
+                        continue
+                    d_epoch = str(data.get("lockEpoch") or "")
+                    if expected_epoch and d_epoch and d_epoch != expected_epoch:
+                        continue
+                    if not d_epoch and not data.get("isActive"):
+                        continue
+                    try:
+                        mtime = item.stat().st_mtime
+                    except OSError:
+                        mtime = 0.0
+                    exact_epoch = 1 if (expected_epoch and d_epoch == expected_epoch) else 0
+                    is_active = 1 if data.get("isActive") else 0
+                    has_logs = 1 if (isinstance(data.get("logs"), list) and len(data["logs"]) > 0) else 0
+                    upd = float(data.get("updatedAt") or 0.0)
+                    candidates.append((exact_epoch, upd, is_active, has_logs, mtime, data))
+            except OSError:
+                pass
+        if not candidates:
             return None
-        if expected_epoch and data.get("lockEpoch") and str(data.get("lockEpoch")) != expected_epoch:
-            return None
-        return data
+        candidates.sort(key=lambda c: (c[0], c[1], c[2], c[3], c[4]), reverse=True)
+        return candidates[0][5]
 
     def clear_host_telemetry(self) -> None:
         self.write_host_telemetry({
@@ -953,6 +1301,23 @@ class SyncEngine:
             "hostUsername": "",
             "logs": [],
         })
+        # Prune stale conflict telemetry files belonging to this machine or already-released epochs
+        tel_conflict_pat = re.compile(r"^host-telemetry\s*\(\d+\)\.json$", re.IGNORECASE)
+        released_epochs = self._load_released_epochs()
+        for ldir in self._iter_locks_dirs():
+            try:
+                for item in list(ldir.iterdir()):
+                    if not item.is_file() or not tel_conflict_pat.match(item.name):
+                        continue
+                    data = self._read_json_safe(item)
+                    if not isinstance(data, dict):
+                        continue
+                    ep = str(data.get("lockEpoch") or "")
+                    mid = str(data.get("machineId") or "")
+                    if mid == self.local_config.machine_id or (ep and ep in released_epochs) or not data.get("isActive"):
+                        item.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def get_expected_snapshot_state(self) -> Tuple[int, str, str]:
         """Returns `(expected_seq, expected_hash, released_by)` from the newest release record."""
@@ -960,15 +1325,22 @@ class SyncEngine:
         best_hash = ""
         best_by = ""
         try:
-            main_data = self._read_json_safe(self.host_lock_path)
-            if isinstance(main_data, dict):
-                lk = HostLock.from_dict(main_data)
-                if lk.expected_snapshot_seq > best_seq:
-                    best_seq = lk.expected_snapshot_seq
-                    best_hash = lk.expected_snapshot_hash
-                    best_by = lk.host_username or ""
-            if self.locks_dir.exists():
-                for item in self.locks_dir.iterdir():
+            lock_files = [self.host_lock_path]
+            conflict_pattern = re.compile(r"^host-lock\s*\(\d+\)\.json$", re.IGNORECASE)
+            if self.shared_dir.exists():
+                for item in self.shared_dir.iterdir():
+                    if item.is_file() and conflict_pattern.match(item.name):
+                        lock_files.append(item)
+            for lpath in lock_files:
+                main_data = self._read_json_safe(lpath)
+                if isinstance(main_data, dict):
+                    lk = HostLock.from_dict(main_data)
+                    if lk.expected_snapshot_seq > best_seq:
+                        best_seq = lk.expected_snapshot_seq
+                        best_hash = lk.expected_snapshot_hash
+                        best_by = lk.host_username or ""
+            for ldir in self._iter_locks_dirs():
+                for item in ldir.iterdir():
                     if not item.is_file() or not item.name.startswith("released-") or not item.name.endswith(".json"):
                         continue
                     tdata = self._read_json_safe(item)
@@ -990,123 +1362,210 @@ class SyncEngine:
             pass
         return best_seq, best_hash, best_by
 
-    def _write_lock_bundle(self, lock: HostLock, include_session: bool = True) -> None:
-        self._ensure_shared_dirs()
+    def _write_lock_bundle(self, lock: HostLock, include_session: bool = True, fsync: bool = True) -> None:
+        self._ensure_shared_dirs(cleanup_conflicts=False)
         payload = lock.to_dict()
-        self._write_json_atomic(self.host_lock_path, payload, in_place_if_exists=True)
+        self._write_json_atomic(self.host_lock_path, payload, in_place_if_exists=True, fsync=fsync)
         if include_session and lock.is_locked and lock.lock_epoch:
             session_file = self.locks_dir / f"session-{lock.lock_epoch}.json"
-            self._write_json_atomic(session_file, payload, in_place_if_exists=True)
+            self._write_json_atomic(session_file, payload, in_place_if_exists=True, fsync=fsync)
+            self._last_session_write_at = time.time()
+        try:
+            st_mtime = os.stat(self.host_lock_path).st_mtime
+        except OSError:
+            st_mtime = 0.0
+        with self._lock_mutex:
+            if self._owns_active_lock and lock.is_locked and lock.machine_id == self.local_config.machine_id:
+                self._cached_own_lock = HostLock.from_dict(payload)
+                self._cached_own_lock_mtime = st_mtime
+            elif not lock.is_locked:
+                self._cached_own_lock = None
+                self._cached_own_lock_mtime = 0.0
+
+    def _apply_clock_skew_tracking(self, chosen: HostLock, now: float) -> None:
+        if not chosen.machine_id or chosen.machine_id == self.local_config.machine_id:
+            return
+        track_key = f"{chosen.machine_id}:{chosen.lock_epoch or int(chosen.started_at)}"
+        prev = self._remote_hb_tracker.get(track_key)
+        if prev is None:
+            self._remote_hb_tracker[track_key] = (chosen.last_heartbeat, now, 0.0)
+        else:
+            prev_hb, first_seen, obs_at = prev
+            if chosen.last_heartbeat > prev_hb + 0.5:
+                obs_at = now
+                self._remote_hb_tracker[track_key] = (chosen.last_heartbeat, first_seen, obs_at)
+            # Behind-clock skew protection: active progression keeps lock fresh even if remote PC clock is slow
+            if (
+                obs_at > 0.0
+                and (now - obs_at) <= LOCK_STALE_TIMEOUT_SEC
+                and (now - chosen.last_heartbeat) > LOCK_STALE_TIMEOUT_SEC
+            ):
+                chosen.last_heartbeat = max(chosen.last_heartbeat, obs_at)
+            # Ahead-clock skew protection: if remote clock is ahead and heartbeat hasn't moved for > timeout, expire it
+            elif chosen.last_heartbeat > now + 30.0:
+                ref_obs = obs_at if obs_at > 0.0 else first_seen
+                if (now - ref_obs) > LOCK_STALE_TIMEOUT_SEC:
+                    chosen.last_heartbeat = min(chosen.last_heartbeat, ref_obs)
+        # Prune stale tracker entries
+        if len(self._remote_hb_tracker) > 64:
+            cutoff = now - 86400.0
+            for k in [k for k, v in self._remote_hb_tracker.items() if max(v[1], v[2]) < cutoff]:
+                self._remote_hb_tracker.pop(k, None)
 
     def get_lock(self) -> HostLock:
         now = time.time()
-        released_epochs = self._load_released_epochs()
-        main_data = self._read_json_safe(self.host_lock_path)
-        main_read_error = self.host_lock_path.exists() and main_data is None
-        any_read_error = main_read_error
+        owns_active = self._owns_active_lock
+        active_epoch = self._active_lock_epoch
+        released_epochs = set(self._known_released_epochs)
 
-        main_lock = HostLock.from_dict(main_data) if isinstance(main_data, dict) else HostLock(is_locked=False, status="idle")
+        locks_conflict_re = re.compile(r"^locks\s*\(\d+\)$", re.IGNORECASE)
+        host_conflict_re = re.compile(r"^host-lock\s*\(\d+\)\.json$", re.IGNORECASE)
+        locks_dirs: List[Path] = []
+        host_conflict_files: List[Tuple[Path, float]] = []
         try:
-            main_mtime = self.host_lock_path.stat().st_mtime if self.host_lock_path.exists() else 0.0
+            with os.scandir(self.shared_dir) as it:
+                for entry in it:
+                    ename = entry.name
+                    if ename == "locks" or locks_conflict_re.match(ename):
+                        if entry.is_dir(follow_symlinks=False):
+                            locks_dirs.append(Path(entry.path))
+                    elif ename.lower().startswith("host-lock") and host_conflict_re.match(ename):
+                        if entry.is_file(follow_symlinks=False):
+                            try:
+                                cmtime = entry.stat(follow_symlinks=False).st_mtime
+                            except OSError:
+                                cmtime = 0.0
+                            host_conflict_files.append((Path(entry.path), cmtime))
+        except OSError:
+            pass
+
+        session_files: List[Tuple[Path, str, float]] = []
+        found_released: set = set()
+        for ldir in locks_dirs:
+            try:
+                with os.scandir(ldir) as it:
+                    for entry in it:
+                        ename = entry.name
+                        if not ename.endswith(".json") or not entry.is_file(follow_symlinks=False):
+                            continue
+                        if ename.startswith("released-"):
+                            raw_epoch = ename[len("released-"):-len(".json")]
+                            epoch = self._strip_conflict_suffix(raw_epoch)
+                            if epoch:
+                                found_released.add(epoch)
+                            if raw_epoch != epoch:
+                                tdata = self._read_json_safe(Path(entry.path))
+                                if isinstance(tdata, dict) and tdata.get("lockEpoch"):
+                                    ep = str(tdata["lockEpoch"]).strip()
+                                    if ep:
+                                        found_released.add(ep)
+                        elif ename.startswith("session-"):
+                            try:
+                                smtime = entry.stat(follow_symlinks=False).st_mtime
+                            except OSError:
+                                smtime = 0.0
+                            session_files.append((Path(entry.path), ename, smtime))
+            except OSError:
+                pass
+
+        if found_released:
+            released_epochs.update(found_released)
+            if not found_released.issubset(self._known_released_epochs):
+                with self._lock_mutex:
+                    self._known_released_epochs.update(found_released)
+
+        main_data = self._read_json_safe(self.host_lock_path)
+        try:
+            main_mtime = os.stat(self.host_lock_path).st_mtime
+            main_exists = True
         except OSError:
             main_mtime = 0.0
+            main_exists = False
+        any_read_error = main_exists and main_data is None
+        main_lock = HostLock.from_dict(main_data) if isinstance(main_data, dict) else HostLock(is_locked=False, status="idle")
 
         # Collect locked candidates across host-lock.json, Drive conflict copies, and per-session locks/
-        candidates: List[Tuple[str, float, float, HostLock]] = []
+        candidates: List[Tuple[int, int, float, float, HostLock]] = []
+
+        def _add_candidate(lk: HostLock, fmtime: float) -> None:
+            is_active = 1 if self._is_lock_effectively_active(lk, now) else 0
+            is_own_epoch = 1 if (
+                owns_active
+                and active_epoch
+                and lk.lock_epoch == active_epoch
+                and lk.machine_id == self.local_config.machine_id
+            ) else 0
+            candidates.append((is_active, is_own_epoch, lk.last_heartbeat, fmtime, lk))
+
         if main_lock.is_locked and (not main_lock.lock_epoch or main_lock.lock_epoch not in released_epochs):
-            candidates.append(("main", main_lock.last_heartbeat, main_mtime, main_lock))
+            _add_candidate(main_lock, main_mtime)
 
-        conflict_pattern = re.compile(r"^host-lock\s*\(\d+\)\.json$", re.IGNORECASE)
-        try:
-            if self.shared_dir.exists():
-                for item in self.shared_dir.iterdir():
-                    if not item.is_file() or not conflict_pattern.match(item.name):
-                        continue
-                    cdata = self._read_json_safe(item)
-                    if cdata is None:
-                        any_read_error = True
-                        continue
-                    clock = HostLock.from_dict(cdata)
-                    if not clock.is_locked:
-                        continue
-                    if clock.lock_epoch and clock.lock_epoch in released_epochs:
-                        continue
-                    try:
-                        cmtime = item.stat().st_mtime
-                    except OSError:
-                        cmtime = 0.0
-                    # If main_lock explicitly unlocked a legacy session cleanly, ignore older conflict files
-                    if not main_lock.is_locked and main_data is not None and not clock.lock_epoch:
-                        if max(clock.last_heartbeat, cmtime) <= main_mtime + 2.0:
-                            continue
-                    candidates.append(("conflict", clock.last_heartbeat, cmtime, clock))
-        except OSError:
-            pass
+        for item, cmtime in host_conflict_files:
+            cdata = self._read_json_safe(item)
+            if cdata is None:
+                any_read_error = True
+                continue
+            clock = HostLock.from_dict(cdata)
+            if not clock.is_locked:
+                continue
+            if clock.lock_epoch and clock.lock_epoch in released_epochs:
+                continue
+            # If main_lock explicitly unlocked a legacy session cleanly, ignore older conflict files
+            if not main_lock.is_locked and main_data is not None and not clock.lock_epoch:
+                if max(clock.last_heartbeat, cmtime) <= main_mtime + 2.0:
+                    continue
+            _add_candidate(clock, cmtime)
 
-        try:
-            if self.locks_dir.exists():
-                for item in self.locks_dir.iterdir():
-                    if not item.is_file() or not item.name.startswith("session-") or not item.name.endswith(".json"):
-                        continue
-                    epoch = item.name[len("session-"):-len(".json")]
-                    if epoch and epoch in released_epochs:
-                        continue
-                    sdata = self._read_json_safe(item)
-                    if sdata is None:
-                        any_read_error = True
-                        continue
-                    slock = HostLock.from_dict(sdata)
-                    if not slock.lock_epoch:
-                        slock.lock_epoch = epoch
-                    if not slock.is_locked or slock.lock_epoch in released_epochs:
-                        continue
-                    try:
-                        smtime = item.stat().st_mtime
-                    except OSError:
-                        smtime = 0.0
-                    candidates.append(("session", slock.last_heartbeat, smtime, slock))
-        except OSError:
-            pass
+        for item, ename, smtime in session_files:
+            raw_epoch = ename[len("session-"):-len(".json")]
+            epoch = self._strip_conflict_suffix(raw_epoch)
+            if epoch and epoch in released_epochs:
+                continue
+            sdata = self._read_json_safe(item)
+            if sdata is None:
+                any_read_error = True
+                continue
+            slock = HostLock.from_dict(sdata)
+            if not slock.lock_epoch:
+                slock.lock_epoch = epoch
+            if not slock.is_locked or slock.lock_epoch in released_epochs:
+                continue
+            _add_candidate(slock, smtime)
 
         if candidates:
-            candidates.sort(key=lambda c: (c[1], c[3].started_at, c[2]), reverse=True)
-            chosen = candidates[0][3]
-
-            # Clock-skew protection: if a remote host actively increments last_heartbeat between polls,
-            # use our local observation timestamp for stale detection even if PC clocks differ
+            candidates.sort(key=lambda c: (c[0], c[1], c[2], c[4].started_at, c[3]), reverse=True)
+            chosen = candidates[0][4]
             if chosen.machine_id and chosen.machine_id != self.local_config.machine_id:
-                track_key = f"{chosen.machine_id}:{chosen.lock_epoch or int(chosen.started_at)}"
-                prev = self._remote_hb_tracker.get(track_key)
-                if prev is None:
-                    self._remote_hb_tracker[track_key] = (chosen.last_heartbeat, 0.0)
-                else:
-                    prev_hb, obs_at = prev
-                    if chosen.last_heartbeat > prev_hb + 0.5:
-                        obs_at = now
-                        self._remote_hb_tracker[track_key] = (chosen.last_heartbeat, obs_at)
-                    if (
-                        obs_at > 0.0
-                        and (now - obs_at) <= LOCK_STALE_TIMEOUT_SEC
-                        and (now - chosen.last_heartbeat) > LOCK_STALE_TIMEOUT_SEC
-                    ):
-                        chosen.last_heartbeat = max(chosen.last_heartbeat, obs_at)
-
-            self._last_known_remote_lock = HostLock.from_dict(chosen.to_dict())
-            self._last_known_remote_lock_at = now
+                with self._lock_mutex:
+                    self._apply_clock_skew_tracking(chosen, now)
+                    if chosen.is_actively_locked(now):
+                        self._last_known_remote_lock = HostLock.from_dict(chosen.to_dict())
+                        self._last_known_remote_lock_at = now
             return chosen
 
-        # Do not flicker back to 'idle' during transient Drive read locks if we just saw an active remote host
-        if any_read_error and self._last_known_remote_lock and (now - self._last_known_remote_lock_at) < 25.0:
-            return HostLock.from_dict(self._last_known_remote_lock.to_dict())
+        if any_read_error or self._last_known_remote_lock is not None:
+            with self._lock_mutex:
+                # Do not flicker back to 'idle' during transient Drive read locks if we just saw an active remote host
+                if any_read_error and self._last_known_remote_lock and (now - self._last_known_remote_lock_at) < 25.0:
+                    return HostLock.from_dict(self._last_known_remote_lock.to_dict())
 
-        if not any_read_error:
-            self._last_known_remote_lock = None
-            self._last_known_remote_lock_at = 0.0
+                if not any_read_error:
+                    self._last_known_remote_lock = None
+                    self._last_known_remote_lock_at = 0.0
         return HostLock(is_locked=False, status="idle")
 
-    def save_lock(self, lock: HostLock) -> None:
-        self._write_lock_bundle(lock, include_session=True)
+    def save_lock(self, lock: HostLock, fsync: bool = True, include_session: bool = True) -> None:
+        self._write_lock_bundle(lock, include_session=include_session, fsync=fsync)
         self._emit("lock_updated", lock.to_dict())
+
+    def owns_lock(self, lock_epoch: str = "") -> bool:
+        """Thread-safe check of whether this machine currently holds the active lock (optionally matching `lock_epoch`)."""
+        with self._lock_mutex:
+            if not self._owns_active_lock:
+                return False
+            if lock_epoch and self._active_lock_epoch and lock_epoch != self._active_lock_epoch:
+                return False
+            return True
 
     def is_locked_by_current_machine(self, lock: Optional[HostLock] = None) -> bool:
         lk = lock or self.get_lock()
@@ -1175,17 +1634,75 @@ class SyncEngine:
             ):
                 if not reuse_epoch:
                     self._write_lock_tombstone(lock_epoch, released_by="race_lost")
+                    try:
+                        self._write_json_atomic(self.host_lock_path, check.to_dict(), in_place_if_exists=True)
+                    except Exception:
+                        pass
                 raise HostLockConflictError(
                     f"Lock claim race won by '{check.host_username}' on '{check.machine_name}'."
                 )
 
+            self._last_known_remote_lock = None
+            self._last_known_remote_lock_at = 0.0
             self._owns_active_lock = True
+            self._active_lock_epoch = lock_epoch
+            self._cached_own_lock = HostLock.from_dict(new_lock.to_dict())
+            try:
+                self._cached_own_lock_mtime = os.stat(self.host_lock_path).st_mtime
+            except OSError:
+                self._cached_own_lock_mtime = 0.0
+            self._last_session_write_at = now
+            self._last_telemetry_publish_at = now
+            self.write_host_telemetry({
+                "isActive": True,
+                "lockEpoch": lock_epoch,
+                "machineId": self.local_config.machine_id,
+                "machineName": self.local_config.machine_name,
+                "hostUsername": user.username,
+                "status": initial_status,
+                "publicAddress": public_address,
+                "tunnelStatus": new_lock.tunnel_status,
+                "mcVersion": mc_version,
+                "startedAt": new_lock.started_at,
+                "onlinePlayers": [],
+                "maxPlayers": new_lock.max_players,
+                "logs": [],
+            })
             self._start_heartbeat_loop()
             return new_lock
 
-    def _apply_telemetry_provider(self, lock: HostLock) -> None:
-        if not self.telemetry_provider:
+    def _publish_telemetry_from_lock(self, lock: HostLock, snap: Dict[str, Any]) -> None:
+        if "logs" not in snap and not lock.is_locked:
             return
+        tel_payload = dict(snap)
+        if "logs" in tel_payload and isinstance(tel_payload["logs"], list):
+            tel_payload["logs"] = list(tel_payload["logs"])[-120:]
+        tel_payload["isActive"] = bool(lock.is_locked)
+        tel_payload["lockEpoch"] = lock.lock_epoch
+        tel_payload["machineId"] = lock.machine_id
+        tel_payload["machineName"] = lock.machine_name
+        tel_payload["hostUsername"] = lock.host_username
+        tel_payload["status"] = lock.status
+        tel_payload["startedAt"] = lock.started_at
+        tel_payload["tps"] = lock.tps
+        tel_payload["memoryUsedMb"] = lock.memory_used_mb
+        tel_payload["memoryMaxMb"] = lock.memory_max_mb
+        tel_payload["cpuPercent"] = lock.cpu_percent
+        tel_payload["serverReadyAt"] = lock.server_ready_at
+        tel_payload["onlinePlayers"] = list(lock.online_players)
+        tel_payload["maxPlayers"] = lock.max_players
+        if not tel_payload.get("publicAddress"):
+            tel_payload["publicAddress"] = lock.public_address
+        if not tel_payload.get("tunnelStatus"):
+            tel_payload["tunnelStatus"] = lock.tunnel_status
+        if not tel_payload.get("mcVersion"):
+            tel_payload["mcVersion"] = lock.mc_version
+        self.write_host_telemetry(tel_payload)
+        self._last_telemetry_publish_at = time.time()
+
+    def _apply_telemetry_provider(self, lock: HostLock, publish: bool = True) -> Optional[Dict[str, Any]]:
+        if not self.telemetry_provider:
+            return None
         try:
             snap = self.telemetry_provider() or {}
             if "memoryUsedMb" in snap:
@@ -1200,24 +1717,11 @@ class SyncEngine:
                 lock.server_ready_at = float(snap["serverReadyAt"] or 0.0)
             if "onlinePlayers" in snap and isinstance(snap["onlinePlayers"], list):
                 lock.online_players = [str(p) for p in snap["onlinePlayers"] if p]
-            if "logs" in snap:
-                self.write_host_telemetry({
-                    "isActive": bool(lock.is_locked),
-                    "lockEpoch": lock.lock_epoch,
-                    "machineId": lock.machine_id,
-                    "hostUsername": lock.host_username,
-                    "status": lock.status,
-                    "tps": lock.tps,
-                    "memoryUsedMb": lock.memory_used_mb,
-                    "memoryMaxMb": lock.memory_max_mb,
-                    "cpuPercent": lock.cpu_percent,
-                    "serverReadyAt": lock.server_ready_at,
-                    "onlinePlayers": lock.online_players,
-                    "maxPlayers": lock.max_players,
-                    "logs": list(snap["logs"])[-120:],
-                })
+            if publish:
+                self._publish_telemetry_from_lock(lock, snap)
+            return snap
         except Exception:
-            pass
+            return None
 
     def update_lock_state(
         self,
@@ -1234,11 +1738,29 @@ class SyncEngine:
         server_ready_at: Optional[float] = None,
     ) -> Optional[HostLock]:
         with self._lock_mutex:
-            current = self.get_lock()
+            current: Optional[HostLock] = None
+            if (
+                status is None
+                and self._owns_active_lock
+                and self._active_lock_epoch
+                and self._cached_own_lock is not None
+                and self._active_lock_epoch not in self._known_released_epochs
+                and not os.path.exists(self.locks_dir / f"released-{self._active_lock_epoch}.json")
+            ):
+                try:
+                    if os.stat(self.host_lock_path).st_mtime == self._cached_own_lock_mtime:
+                        current = HostLock.from_dict(self._cached_own_lock.to_dict())
+                except OSError:
+                    current = None
+            if current is None:
+                current = self.get_lock()
             if not current.is_locked or current.machine_id != self.local_config.machine_id:
                 return None
-            current.last_heartbeat = time.time()
-            self._apply_telemetry_provider(current)
+            if self._active_lock_epoch and current.lock_epoch and current.lock_epoch != self._active_lock_epoch:
+                return None
+            now = time.time()
+            current.last_heartbeat = now
+            snap = self._apply_telemetry_provider(current, publish=False)
             if status is not None:
                 current.status = status
             if public_address is not None:
@@ -1261,7 +1783,11 @@ class SyncEngine:
                 current.tps = round(float(tps), 2)
             if server_ready_at is not None:
                 current.server_ready_at = float(server_ready_at)
-            self.save_lock(current)
+            is_status_change = status is not None
+            include_session = is_status_change or ((now - self._last_session_write_at) >= 2.0)
+            self.save_lock(current, fsync=is_status_change, include_session=include_session)
+            if snap is not None and (is_status_change or (now - self._last_telemetry_publish_at) >= 0.5):
+                self._publish_telemetry_from_lock(current, snap)
             return current
 
     def release_lock(
@@ -1272,6 +1798,9 @@ class SyncEngine:
     ) -> HostLock:
         with self._lock_mutex:
             self._owns_active_lock = False
+            self._active_lock_epoch = ""
+            self._cached_own_lock = None
+            self._cached_own_lock_mtime = 0.0
             self._stop_heartbeat_loop()
             current = self.get_lock()
             if current.is_locked:
@@ -1285,21 +1814,21 @@ class SyncEngine:
                     raise HostLockConflictError(
                         f"Cannot release lock owned by '{current.host_username}' on '{current.machine_name}'."
                     )
-            if current.lock_epoch:
-                self._write_lock_tombstone(
-                    current.lock_epoch,
-                    released_by=user.username if user else "",
-                    expected_snapshot_seq=expected_snapshot_seq,
-                    expected_snapshot_hash=expected_snapshot_hash,
-                )
-            self._last_known_remote_lock = None
-            self._last_known_remote_lock_at = 0.0
-            self.clear_host_telemetry()
             carry_seq = int(expected_snapshot_seq or 0)
             carry_hash = str(expected_snapshot_hash or "")
             if carry_seq == 0:
                 prev_seq, prev_hash, _ = self.get_expected_snapshot_state()
                 carry_seq, carry_hash = prev_seq, prev_hash
+            if current.lock_epoch:
+                self._write_lock_tombstone(
+                    current.lock_epoch,
+                    released_by=user.username if user else "",
+                    expected_snapshot_seq=carry_seq,
+                    expected_snapshot_hash=carry_hash,
+                )
+            self._last_known_remote_lock = None
+            self._last_known_remote_lock_at = 0.0
+            self.clear_host_telemetry()
             unlocked = HostLock(
                 is_locked=False,
                 status="idle",
@@ -1312,45 +1841,102 @@ class SyncEngine:
             return unlocked
 
     def force_unlock(self) -> HostLock:
-        """Admin emergency lock override."""
+        """Admin emergency lock override that preserves expected snapshot verification state."""
         with self._lock_mutex:
             self._owns_active_lock = False
+            self._active_lock_epoch = ""
+            self._cached_own_lock = None
+            self._cached_own_lock_mtime = 0.0
             self._stop_heartbeat_loop()
             current = self.get_lock()
+
+            carry_seq, carry_hash, _ = self.get_expected_snapshot_state()
+            manifest = self._read_sync_manifest()
+            if manifest:
+                m_seq = int(manifest.get("snapshotSeq", 0) or 0)
+                m_hash = str(manifest.get("sha256", "") or "")
+                if m_seq > carry_seq:
+                    carry_seq, carry_hash = m_seq, m_hash
+
             if current.lock_epoch:
-                self._write_lock_tombstone(current.lock_epoch, released_by="force_unlock")
-            try:
-                if self.locks_dir.exists():
-                    for item in list(self.locks_dir.iterdir()):
+                self._write_lock_tombstone(
+                    current.lock_epoch,
+                    released_by="force_unlock",
+                    expected_snapshot_seq=carry_seq,
+                    expected_snapshot_hash=carry_hash,
+                )
+            for ldir in self._iter_locks_dirs():
+                try:
+                    for item in list(ldir.iterdir()):
                         if item.is_file() and item.name.startswith("session-") and item.name.endswith(".json"):
-                            epoch = item.name[len("session-"):-len(".json")]
-                            self._write_lock_tombstone(epoch, released_by="force_unlock")
+                            raw_epoch = item.name[len("session-"):-len(".json")]
+                            epoch = self._strip_conflict_suffix(raw_epoch)
+                            self._write_lock_tombstone(
+                                epoch,
+                                released_by="force_unlock",
+                                expected_snapshot_seq=carry_seq,
+                                expected_snapshot_hash=carry_hash,
+                            )
+                            item.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            conflict_pattern = re.compile(r"^host-lock\s*\(\d+\)\.json$", re.IGNORECASE)
+            try:
+                if self.shared_dir.exists():
+                    for item in list(self.shared_dir.iterdir()):
+                        if item.is_file() and conflict_pattern.match(item.name):
+                            item.unlink(missing_ok=True)
             except OSError:
                 pass
+
             self._last_known_remote_lock = None
             self._last_known_remote_lock_at = 0.0
             self.clear_host_telemetry()
-            unlocked = HostLock(is_locked=False, status="idle")
+            unlocked = HostLock(
+                is_locked=False,
+                status="idle",
+                expected_snapshot_seq=carry_seq,
+                expected_snapshot_hash=carry_hash,
+            )
             self._write_lock_bundle(unlocked, include_session=False)
             self._emit("lock_updated", unlocked.to_dict())
+            self.git_push_if_enabled("Force unlock host lock")
             return unlocked
 
     def _start_heartbeat_loop(self) -> None:
         self._stop_heartbeat_loop()
-        self._heartbeat_stop.clear()
+        stop_event = threading.Event()
+        self._heartbeat_stop = stop_event
+        expected_epoch = self._active_lock_epoch
 
         def _loop() -> None:
-            while not self._heartbeat_stop.wait(HEARTBEAT_INTERVAL_SEC):
+            while not stop_event.wait(HEARTBEAT_INTERVAL_SEC):
                 with self._lock_mutex:
-                    if not self._owns_active_lock:
+                    if stop_event.is_set() or not self._owns_active_lock:
+                        break
+                    if expected_epoch and self._active_lock_epoch and expected_epoch != self._active_lock_epoch:
                         break
                     current = self.get_lock()
-                    if current.is_locked and current.machine_id == self.local_config.machine_id:
+                    if (
+                        current.is_locked
+                        and current.machine_id == self.local_config.machine_id
+                        and (not expected_epoch or not current.lock_epoch or current.lock_epoch == expected_epoch)
+                    ):
                         current.last_heartbeat = time.time()
-                        self._apply_telemetry_provider(current)
-                        self.save_lock(current)
+                        snap = self._apply_telemetry_provider(current, publish=False)
+                        self.save_lock(current, fsync=False)
+                        if snap is not None:
+                            self._publish_telemetry_from_lock(current, snap)
                     else:
                         self._owns_active_lock = False
+                        self._active_lock_epoch = ""
+                        self._cached_own_lock = None
+                        self._cached_own_lock_mtime = 0.0
+                        self._emit("lock_lost", {
+                            "expectedEpoch": expected_epoch,
+                            "currentLock": current.to_dict(),
+                        })
                         break
 
         self._heartbeat_thread = threading.Thread(target=_loop, daemon=True, name="HostLockHeartbeat")
@@ -1371,24 +1957,36 @@ class SyncEngine:
         """
         with self._sync_mutex:
             manifest = self._read_sync_manifest()
-            if not self.latest_snapshot_path.exists() and not manifest:
+            expected_seq, expected_hash, _ = self.get_expected_snapshot_state()
+            if not self.latest_snapshot_path.exists() and not manifest and expected_seq == 0:
                 self._ensure_default_runtime_files()
                 return
             try:
                 manifest_seq = int(manifest.get("snapshotSeq", 0)) if manifest else 0
+                manifest_hash = str(manifest.get("sha256", "") or "").strip().lower() if manifest else ""
+                if expected_seq > 0 and (
+                    not manifest
+                    or manifest_seq < expected_seq
+                    or (expected_hash and manifest_seq == expected_seq and manifest_hash != expected_hash.lower())
+                ):
+                    self.pull_world_to_runtime(strict=strict)
+                    return
+
+                missing_runtime = not (self.runtime_dir / "server.properties").exists()
+                last_mtime, last_size, last_path = self._last_synced_snapshot_sig
                 if self.latest_snapshot_path.exists():
                     st = self.latest_snapshot_path.stat()
-                    last_mtime, last_size, last_path = self._last_synced_snapshot_sig
-                    snap_changed = (
-                        abs(st.st_mtime - last_mtime) > 1e-3
-                        or st.st_size != last_size
-                        or str(self.latest_snapshot_path) != last_path
-                    )
+                    if last_path == str(self.latest_snapshot_path):
+                        snap_changed = abs(st.st_mtime - last_mtime) > 1e-3 or st.st_size != last_size
+                    elif manifest_seq > 0 and manifest_seq == self._last_synced_manifest_seq and manifest_hash and manifest_hash == self._last_synced_snapshot_hash:
+                        snap_changed = False
+                    else:
+                        snap_changed = True
                 else:
                     snap_changed = bool(manifest)
 
                 manifest_changed = bool(manifest and manifest_seq > 0 and manifest_seq != self._last_synced_manifest_seq)
-                if snap_changed or manifest_changed:
+                if missing_runtime or snap_changed or manifest_changed:
                     self.pull_world_to_runtime(strict=strict)
             except OSError:
                 if strict:
@@ -1396,10 +1994,13 @@ class SyncEngine:
 
     def _safe_extract_zip(self, zf: zipfile.ZipFile, dest_dir: Path) -> None:
         """
-        Safely extracts all zip members preventing zip-slip path traversal vulnerabilities.
+        Safely extracts all zip members preventing zip-slip path traversal and symlink vulnerabilities.
         """
         dest_resolved = dest_dir.resolve()
         for member in zf.infolist():
+            # Reject POSIX symlink entries inside archives
+            if ((member.external_attr >> 16) & 0o170000) == 0o120000:
+                raise ValueError(f"Symlink entry not allowed in snapshot: {member.filename}")
             target_path = (dest_dir / member.filename).resolve()
             if not (target_path == dest_resolved or target_path.is_relative_to(dest_resolved)):
                 raise ValueError(f"Zip path traversal detected: {member.filename}")
@@ -1481,6 +2082,10 @@ class SyncEngine:
                     if not dst.exists():
                         shutil.move(str(src), str(dst))
                     elif src.is_dir():
+                        for existing_sub in list(dst.iterdir()):
+                            if dst.name == "plugins" and existing_sub.name == ".paper-remapped":
+                                continue
+                            self._remove_path_with_retry(existing_sub)
                         shutil.copytree(str(src), str(dst), dirs_exist_ok=True, copy_function=shutil.copyfile)
                     else:
                         shutil.copyfile(str(src), str(dst))
@@ -1548,7 +2153,6 @@ class SyncEngine:
 
         exp_hash = str(manifest.get("sha256", "")).strip().lower()
         exp_size = int(manifest.get("sizeBytes", -1) or -1)
-        manifest_ts = float(manifest.get("updatedAt", 0.0) or 0.0)
         host_name = str(manifest.get("hostUsername", "") or "the previous host")
         backup_name = Path(str(manifest.get("backupFile", "") or "")).name
 
@@ -1578,15 +2182,6 @@ class SyncEngine:
             for item in self.snapshots_dir.iterdir():
                 if item.is_file() and conflict_pattern.match(item.name) and _matches(item):
                     return item, ""
-
-        # Backward compatibility: if a legacy v1.0.1 peer pushed a significantly newer latest-server.zip without manifest
-        if snap_exists:
-            try:
-                snap_st = self.latest_snapshot_path.stat()
-                if manifest_ts > 0 and snap_st.st_mtime > (manifest_ts + 15.0) and snap_st.st_size > 0:
-                    return self.latest_snapshot_path, ""
-            except OSError:
-                pass
 
         exp_mb = round(max(0, exp_size) / (1024 * 1024), 1)
         reason = (
@@ -1644,17 +2239,23 @@ class SyncEngine:
                 self._ensure_default_runtime_files()
                 return {"synced": False, "reason": f"Using local runtime files ({msg})"}
 
-            if self.latest_snapshot_path.exists():
-                st = self.latest_snapshot_path.stat()
-                snap_mtime, snap_size = st.st_mtime, st.st_size
-            else:
-                st = source_zip.stat()
-                snap_mtime, snap_size = st.st_mtime, st.st_size
-
+            st = source_zip.stat()
+            snap_mtime, snap_size = st.st_mtime, st.st_size
+            snap_hash = (
+                str(manifest.get("sha256", "") or "").lower()
+                if manifest
+                else self._sha256_file(source_zip).lower()
+            )
             manifest_seq = int(manifest.get("snapshotSeq", 0)) if manifest else 0
             self._last_synced_snapshot_mtime = snap_mtime
-            self._last_synced_snapshot_sig = (snap_mtime, snap_size, str(self.latest_snapshot_path))
-            self._save_sync_state(snap_mtime, snap_size, str(self.latest_snapshot_path), manifest_seq=manifest_seq)
+            self._last_synced_snapshot_sig = (snap_mtime, snap_size, str(source_zip))
+            self._save_sync_state(
+                snap_mtime,
+                snap_size,
+                str(source_zip),
+                manifest_seq=manifest_seq,
+                sha256_hex=snap_hash,
+            )
             return {
                 "synced": True,
                 "snapshotPath": str(source_zip),
@@ -1662,11 +2263,28 @@ class SyncEngine:
                 "timestamp": time.time(),
             }
 
+    def _verify_required_lock_epoch(self, require_lock_epoch: str) -> None:
+        if not require_lock_epoch:
+            return
+        if not self.owns_lock(require_lock_epoch):
+            raise HostLockConflictError("Host lock lost before snapshot push; aborting to prevent overwrite.")
+        if require_lock_epoch in self._load_released_epochs():
+            raise HostLockConflictError("Host lock epoch was already released; aborting snapshot push.")
+        current = self.get_lock()
+        if current.is_locked and (
+            current.machine_id != self.local_config.machine_id
+            or (current.lock_epoch and current.lock_epoch != require_lock_epoch)
+        ):
+            raise HostLockConflictError("Host lock was transferred to another machine; aborting snapshot push.")
+
     def push_world_from_runtime(
         self,
         create_backup: bool = True,
         backup_label: str = "auto",
         host_username: str = "",
+        require_lock_epoch: str = "",
+        strict_files: bool = True,
+        stage_copy_before_zip: bool = False,
     ) -> Dict[str, Any]:
         """
         Packages `./data/runtime-server` (worlds, server.properties, ops, whitelist, plugins, configs)
@@ -1674,38 +2292,80 @@ class SyncEngine:
         updates `snapshots/latest-server.zip` in-place (preserving Cloud File IDs), and updates `sync-manifest.json`.
         """
         with self._sync_mutex:
+            self._verify_required_lock_epoch(require_lock_epoch)
             self._ensure_shared_dirs()
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
 
             # Build zip inside local non-cloud data_dir so Google Drive never sees half-written temp zips
             tmp_zip = self.base_data_dir / f".push_stage.{os.getpid()}.{threading.get_ident()}.zip"
+            stage_root = self.base_data_dir / f".push_files_{os.getpid()}_{threading.get_ident()}"
             excluded_top = {"cache", "libraries", "versions", "logs", "crash-reports"}
             excluded_files = {"server.jar", "jar-version.json", "session.lock"}
+
+            def _iter_eligible_files() -> List[Tuple[Path, Path]]:
+                items: List[Tuple[Path, Path]] = []
+                for root, dirs, files in os.walk(self.runtime_dir):
+                    rel_root = Path(root).relative_to(self.runtime_dir)
+                    if rel_root.parts and rel_root.parts[0] in excluded_top:
+                        dirs[:] = []
+                        continue
+                    if ".paper-remapped" in dirs:
+                        dirs.remove(".paper-remapped")
+                    if "tmp-client" in dirs:
+                        dirs.remove("tmp-client")
+                    for file in files:
+                        if file in excluded_files or file.endswith(".lck") or file.endswith(".tmp"):
+                            continue
+                        abs_file = Path(root) / file
+                        items.append((abs_file, abs_file.relative_to(self.runtime_dir)))
+                return items
 
             file_count = 0
             backup_name = None
             try:
-                with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-                    for root, dirs, files in os.walk(self.runtime_dir):
-                        rel_root = Path(root).relative_to(self.runtime_dir)
-                        if rel_root.parts and rel_root.parts[0] in excluded_top:
-                            dirs[:] = []
-                            continue
-                        if ".paper-remapped" in dirs:
-                            dirs.remove(".paper-remapped")
-                        if "tmp-client" in dirs:
-                            dirs.remove("tmp-client")
-                        for file in files:
-                            if file in excluded_files or file.endswith(".lck") or file.endswith(".tmp"):
-                                continue
-                            abs_file = Path(root) / file
-                            rel_file = abs_file.relative_to(self.runtime_dir)
-                            try:
-                                zf.write(abs_file, arcname=str(rel_file))
-                                file_count += 1
-                            except OSError:
-                                pass
+                eligible = _iter_eligible_files()
+                zip_sources: List[Tuple[Path, Path]] = []
 
+                if stage_copy_before_zip:
+                    if stage_root.exists():
+                        shutil.rmtree(stage_root, ignore_errors=True)
+                    stage_root.mkdir(parents=True, exist_ok=True)
+                    for abs_file, rel_file in eligible:
+                        dst_file = stage_root / rel_file
+                        dst_file.parent.mkdir(parents=True, exist_ok=True)
+                        last_err: Optional[Exception] = None
+                        for attempt in range(4):
+                            try:
+                                shutil.copyfile(abs_file, dst_file)
+                                last_err = None
+                                break
+                            except OSError as e:
+                                last_err = e
+                                time.sleep(0.08 * (attempt + 1))
+                        if last_err is not None:
+                            if strict_files:
+                                raise RuntimeError(f"Cannot stage '{rel_file}' for snapshot: {last_err}")
+                            continue
+                        zip_sources.append((dst_file, rel_file))
+                else:
+                    zip_sources = eligible
+
+                with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+                    for src_file, rel_file in zip_sources:
+                        last_err = None
+                        for attempt in range(4):
+                            try:
+                                zf.write(src_file, arcname=str(rel_file))
+                                file_count += 1
+                                last_err = None
+                                break
+                            except OSError as e:
+                                last_err = e
+                                time.sleep(0.08 * (attempt + 1))
+                        if last_err is not None and strict_files:
+                            raise RuntimeError(f"Cannot archive '{rel_file}' for snapshot: {last_err}")
+
+                self._verify_required_lock_epoch(require_lock_epoch)
                 sha256_hex = self._sha256_file(tmp_zip)
                 staged_size = tmp_zip.stat().st_size
 
@@ -1714,8 +2374,23 @@ class SyncEngine:
                     safe_label = "".join(c for c in backup_label if c.isalnum() or c in ("-", "_")) or "backup"
                     backup_name = f"world-{ts}-{safe_label}.zip"
                     backup_target = self.backups_dir / backup_name
-                    shutil.copyfile(tmp_zip, backup_target)
-                    self._prune_old_backups()
+                    if backup_target.exists():
+                        backup_name = f"world-{ts}-{int(time.time() * 1000) % 1000:03d}-{safe_label}.zip"
+                        backup_target = self.backups_dir / backup_name
+                    tmp_bk = self.backups_dir / f".{backup_name}.tmp.{os.getpid()}.{threading.get_ident()}"
+                    try:
+                        shutil.copyfile(tmp_zip, tmp_bk)
+                        os.replace(tmp_bk, backup_target)
+                    except OSError:
+                        if tmp_bk.exists():
+                            shutil.copyfile(tmp_bk, backup_target)
+                    finally:
+                        try:
+                            if tmp_bk.exists():
+                                tmp_bk.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    self._prune_old_backups(protect_name=backup_name)
 
                 self._copy_file_preserving_cloud_id(tmp_zip, self.latest_snapshot_path)
                 try:
@@ -1738,6 +2413,11 @@ class SyncEngine:
                         tmp_zip.unlink(missing_ok=True)
                 except OSError:
                     pass
+                try:
+                    if stage_root.exists():
+                        shutil.rmtree(stage_root, ignore_errors=True)
+                except OSError:
+                    pass
 
             self._last_synced_snapshot_mtime = st.st_mtime
             self._last_synced_snapshot_sig = (st.st_mtime, st.st_size, str(self.latest_snapshot_path))
@@ -1746,6 +2426,7 @@ class SyncEngine:
                 st.st_size,
                 str(self.latest_snapshot_path),
                 manifest_seq=int(manifest.get("snapshotSeq", 0)),
+                sha256_hex=sha256_hex,
             )
 
             self.git_push_if_enabled(f"Sync world snapshot ({file_count} files)")
@@ -1759,8 +2440,37 @@ class SyncEngine:
                 "timestamp": time.time(),
             }
 
+    def push_live_snapshot(
+        self,
+        lock_epoch: str = "",
+        create_backup: bool = False,
+        host_username: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Pushes a staged world snapshot while the server is actively running without dropping
+        or modifying `host-lock.json` / `session-<epoch>.json`.
+        Uses a bounded `_sync_mutex` acquire so periodic auto-sync never collides with stop/backup.
+        """
+        acquired = self._sync_mutex.acquire(timeout=2.0)
+        if not acquired:
+            return {"pushed": False, "skipped": True, "reason": "Another snapshot sync is already in progress."}
+        try:
+            eff_epoch = lock_epoch or self._active_lock_epoch
+            if not eff_epoch or not self.owns_lock(eff_epoch):
+                return {"pushed": False, "skipped": True, "reason": "Host lock is not held by this machine."}
+            return self.push_world_from_runtime(
+                create_backup=create_backup,
+                backup_label=host_username or "autosync",
+                host_username=host_username,
+                require_lock_epoch=eff_epoch,
+                strict_files=True,
+                stage_copy_before_zip=True,
+            )
+        finally:
+            self._sync_mutex.release()
+
     def list_backups(self) -> List[Dict[str, Any]]:
-        self._ensure_shared_dirs()
+        self._ensure_shared_dirs(cleanup_conflicts=False)
         entries = []
         for f in self.backups_dir.glob("*.zip"):
             try:
@@ -1780,15 +2490,20 @@ class SyncEngine:
         if not safe_name or safe_name in (".", ".."):
             raise ValueError("Invalid backup name.")
 
-        with self._lock_mutex:
-            current_lock = self.get_lock()
-            if current_lock.is_actively_locked():
-                raise HostLockConflictError(
-                    f"Cannot restore backup while '{current_lock.host_username}' is hosting on '{current_lock.machine_name}'. Stop the server first."
-                )
+        with self._sync_mutex:
+            with self._lock_mutex:
+                self.git_pull_if_enabled()
+                current_lock = self.get_lock()
+                if current_lock.is_actively_locked():
+                    raise HostLockConflictError(
+                        f"Cannot restore backup while '{current_lock.host_username}' is hosting on '{current_lock.machine_name}'. Stop the server first."
+                    )
 
-            with self._sync_mutex:
                 self._ensure_shared_dirs()
+                transfer_msg = self._has_active_cloud_transfer()
+                if transfer_msg:
+                    raise RuntimeError(f"{transfer_msg} Wait for cloud sync to finish before restoring a backup.")
+
                 source = self.backups_dir / safe_name
                 if not source.exists() or not source.is_file():
                     raise FileNotFoundError(f"Backup '{safe_name}' not found.")
@@ -1831,9 +2546,10 @@ class SyncEngine:
                     st.st_size,
                     str(self.latest_snapshot_path),
                     manifest_seq=int(manifest.get("snapshotSeq", 0)),
+                    sha256_hex=sha256_hex,
                 )
 
-                # Clean up any empty/corrupt unlocked host-lock.json cleanly
+                # Clean up any stale/empty unlocked host-lock.json while preserving expectedSnapshotSeq/Hash
                 if not self.get_lock().is_actively_locked():
                     try:
                         self.force_unlock()
@@ -1858,15 +2574,40 @@ class SyncEngine:
             return False
         target = self.backups_dir / safe_name
         if target.exists() and target.is_file():
+            manifest = self._read_sync_manifest()
+            if manifest and Path(str(manifest.get("backupFile", "") or "")).name == safe_name:
+                exp_hash = str(manifest.get("sha256", "") or "").lower()
+                snap_ok = (
+                    self.latest_snapshot_path.exists()
+                    and exp_hash
+                    and self._sha256_file(self.latest_snapshot_path).lower() == exp_hash
+                )
+                if not snap_ok:
+                    raise RuntimeError(
+                        f"Cannot delete '{safe_name}' while it is the active fallback for the latest cloud snapshot."
+                    )
+                manifest["backupFile"] = ""
+                self._write_json_atomic(self.sync_manifest_path, manifest, in_place_if_exists=True)
             target.unlink()
             return True
         return False
 
-    def _prune_old_backups(self) -> None:
+    def _prune_old_backups(self, protect_name: str = "") -> None:
         cfg = self.load_cluster_config()
         max_b = cfg.max_backups if cfg else 10
-        backups = sorted(self.backups_dir.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
-        for old in backups[max_b:]:
+        manifest = self._read_sync_manifest()
+        manifest_bk = Path(str(manifest.get("backupFile", "") or "")).name if manifest else ""
+        protected = {n for n in (protect_name, manifest_bk) if n}
+        with_mtime: List[Tuple[float, Path]] = []
+        for p in self.backups_dir.glob("*.zip"):
+            try:
+                with_mtime.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+        with_mtime.sort(key=lambda item: item[0], reverse=True)
+        for _, old in with_mtime[max_b:]:
+            if old.name in protected:
+                continue
             try:
                 old.unlink()
             except OSError:

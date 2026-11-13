@@ -46,8 +46,9 @@ Playing on a self-hosted Minecraft server with friends usually hits a wall when 
   - **Member Host Accounts (`MC-HOST-XXXX-XXXX-XXXX`)**: Dedicated personal passkeys for friends allowing them to **Start, Stop, Restart, and Host** the server, copy the Join IP, and monitor live player counts—without exposing Admin controls or server files.
 - **Distributed Host Lock & Auto Cloud Sync**
   - Works seamlessly with **Google Drive, OneDrive, Dropbox, LAN folders, or Git**.
-  - Automatic conflict file cleanup and Zip-Slip safe snapshot extraction.
-  - Incremental snapshot state tracking (`.sync-state.json`) avoids redundant extraction on restarts while immediately detecting updates from remote hosts.
+  - **Customizable Periodic Drive Auto-Sync**: Configurable interval (minutes, or `0` to disable) flushes `save-off` → `save-all` → live snapshot upload → `save-on` safely while hosting so progress stays up to date in the cloud without stopping the server.
+  - Hardened split-brain lock fencing, Google Drive conflict-folder (`locks (N)/`, `cluster-config (N).json`, `host-telemetry (N).json`) reconciliation, active cloud-transfer detection, and Zip-Slip safe snapshot extraction.
+  - Incremental snapshot state tracking (`.sync-state.json`) with SHA-256 verification avoids redundant extraction on restarts while immediately detecting updates from remote hosts.
 - **Zero-Port-Forward Networking (`playit.gg`)**
   - Integrated tunnel process manager & secret-key syncing so every host machine advertises the exact same public Minecraft join address.
 - **Full Server Management Suite**
@@ -118,7 +119,8 @@ The compiled executable will be written to `dist/MineRelay.exe`.
 │   ├── bootstrap_runtime.py# Auto Paper/Vanilla/Purpur JAR, Paperclip cache & Java JRE installer
 │   └── models.py           # ClusterConfig, HostLock, UserAccount & null-safe models
 ├── tests/
-│   ├── verify_all.py               # 16 end-to-end functional, security & UI integration tests
+│   ├── verify_all.py               # 19+ end-to-end functional, security & UI integration tests
+│   ├── test_stage2_e2e.py          # Periodic Drive auto-sync, lock/transfer safety & mirroring suite
 │   ├── test_concurrent_player_api.py
 │   ├── test_stress_player_monitor.py
 │   ├── stress_api_sse.py
@@ -134,6 +136,7 @@ The compiled executable will be written to `dist/MineRelay.exe`.
 
 ```bash
 python tests/verify_all.py
+python tests/test_stage2_e2e.py
 python tests/test_concurrent_player_api.py
 python tests/test_stress_player_monitor.py
 python tests/stress_api_sse.py

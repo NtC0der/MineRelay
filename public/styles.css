@@ -12,7 +12,9 @@
 
   /* Precision Borders & Specular Highlights */
   --border-color: rgba(148, 163, 184, 0.14);
+  --border-subtle: rgba(148, 163, 184, 0.14);
   --border-highlight: rgba(148, 163, 184, 0.26);
+  --bg-card-hover: rgba(51, 65, 85, 0.45);
   --border-glow: rgba(16, 185, 129, 0.4);
   --glass-highlight: inset 0 1px 0 0 rgba(255, 255, 255, 0.07);
 
@@ -1144,12 +1146,16 @@ html.session-restoring .session-boot-veil {
   color: #f87171;
   background: rgba(239, 68, 68, 0.08);
 }
-.log-CMD {
+.log-CMD,
+.log-AdminConsole {
   color: #818cf8;
   font-weight: 600;
 }
 .log-SyncEngine {
   color: #34d399;
+}
+.log-Tunnel {
+  color: #38bdf8;
 }
 
 .console-input-bar {
@@ -1728,6 +1734,44 @@ html.session-restoring .session-boot-veil {
   color: var(--text-secondary);
 }
 
+.claim-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.remote-admin-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.autosync-badge {
+  font-size: 0.68rem;
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+
+.autosync-badge-active {
+  background: rgba(56, 189, 248, 0.14);
+  color: #7dd3fc;
+  border-color: rgba(56, 189, 248, 0.4);
+}
+
+.autosync-badge-error {
+  background: rgba(239, 68, 68, 0.15);
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.btn-confirm-armed {
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.55);
+}
+
 .toast-container {
   position: fixed;
   bottom: 1.35rem;
@@ -1735,6 +1779,7 @@ html.session-restoring .session-boot-veil {
   display: flex;
   flex-direction: column;
   gap: 0.55rem;
+  max-width: min(420px, calc(100vw - 2rem));
   z-index: 2000;
 }
 

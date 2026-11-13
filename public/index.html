@@ -216,7 +216,7 @@
     </section>
 
     <!-- Prominent One-Time playit.gg Claim Banner (Shown automatically when playit.exe needs initial pairing) -->
-    <div id="hero-claim-banner" class="alert-box alert-warning hidden" style="display:flex; align-items:center; justify-content:space-between; gap:1rem;">
+    <div id="hero-claim-banner" class="alert-box alert-warning claim-banner hidden">
       <div>
         <strong>One-Time Zero-Port-Forward Setup (`playit.gg`):</strong>
         To get your permanent public address for friends outside your Wi-Fi, click <strong>Claim Public Tunnel</strong>, sign in to playit.gg, and add a <strong>Minecraft Java (Port 25565)</strong> tunnel. (On this PC, you can already join right now using <code>localhost:25565</code> or your LAN IP!)
@@ -282,6 +282,13 @@
 
     <!-- Main Content Area -->
     <main class="dashboard-content">
+      <!-- Remote Host Read-Only Guard Banner (Shown on Admin config/players/files/sync tabs when another PC holds the host lock) -->
+      <div id="remote-admin-banner" class="alert-box alert-warning remote-admin-banner hidden">
+        <div id="remote-admin-banner-text">
+          Another member's PC currently holds the active host lock. Live server, player, file, and world controls are locked to prevent sync conflicts.
+        </div>
+      </div>
+
       <!-- ================================================================= -->
       <!-- TAB 1: OVERVIEW & LIVE CONSOLE (Accessible to Admin & Members)    -->
       <!-- ================================================================= -->
@@ -363,7 +370,10 @@
         <div class="panel-card console-card">
           <div class="panel-header">
             <div>
-              <h3>Live Server Console &amp; Sync Log</h3>
+              <div style="display:flex; align-items:center; gap:0.55rem; flex-wrap:wrap;">
+                <h3>Live Server Console &amp; Sync Log</h3>
+                <span id="overview-autosync-badge" class="badge badge-outline autosync-badge hidden" title="Periodic Google Drive auto-sync status"></span>
+              </div>
               <p class="panel-subtitle">Real-time output from the Minecraft Server, World Sync Engine, and playit.gg Tunnel</p>
             </div>
             <div id="admin-quick-cmds" class="quick-cmd-group admin-only">
@@ -580,8 +590,12 @@
                 </div>
                 <div class="form-group">
                   <label class="form-label" for="cfg-server-port">Server Local Port</label>
-                  <input type="number" id="cfg-server-port" class="form-input" value="25565" />
+                  <input type="number" id="cfg-server-port" class="form-input" min="1" max="65535" value="25565" />
                 </div>
+              </div>
+              <div class="form-group">
+                <label class="form-label" for="cfg-auto-sync-minutes">Periodic Drive Auto-Sync Interval (Minutes while running; 0 = Disabled)</label>
+                <input type="number" id="cfg-auto-sync-minutes" class="form-input" min="0" max="1440" step="1" value="10" />
               </div>
               <div class="form-group">
                 <label class="form-label" for="cfg-jvm-flags">JVM Flags (Aikar's G1GC Flags)</label>
@@ -1162,6 +1176,28 @@
                   <li>Create a folder (e.g. <code>MineRelay-Shared</code>) in your Google Drive, right-click it &rarr; <strong>Share</strong> with your friends (Editor access), and have each friend click <strong>"Add shortcut to My Drive"</strong>.</li>
                   <li>On each PC, click <strong>Browse...</strong> above and select that shared folder (e.g. <code>G:\My Drive\MineRelay-Shared</code>). Passkeys, world saves, and the active host lock will sync automatically!</li>
                 </ol>
+              </div>
+
+              <div class="form-group">
+                <label class="form-label" for="net-auto-sync-preset">Periodic Drive Auto-Sync While Hosting</label>
+                <p class="form-hint">
+                  Safely flushes chunks (<code>save-off</code> &rarr; <code>save-all</code> &rarr; snapshot upload &rarr; <code>save-on</code>) at this interval without dropping the host lock. Set <code>0</code> to disable.
+                </p>
+                <div class="form-row-2">
+                  <select id="net-auto-sync-preset" class="form-select" aria-label="Drive auto-sync preset">
+                    <option value="0">Disabled (Only sync on Stop)</option>
+                    <option value="5">Every 5 minutes</option>
+                    <option value="10">Every 10 minutes (Default)</option>
+                    <option value="15">Every 15 minutes</option>
+                    <option value="30">Every 30 minutes</option>
+                    <option value="60">Every 60 minutes</option>
+                    <option value="custom">Custom interval (minutes)...</option>
+                  </select>
+                  <div class="input-row">
+                    <input type="number" id="net-auto-sync-minutes" class="form-input" min="0" max="1440" step="1" value="10" aria-label="Custom Drive auto-sync minutes" />
+                    <span style="font-size:0.8rem; color:var(--text-secondary); white-space:nowrap;">min</span>
+                  </div>
+                </div>
               </div>
 
               <div class="toggle-grid">

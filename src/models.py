@@ -6,6 +6,8 @@ from typing import List, Dict, Optional, Any
 
 HEARTBEAT_INTERVAL_SEC = 15
 LOCK_STALE_TIMEOUT_SEC = 240
+AUTO_SYNC_DEFAULT_MINUTES = 10
+AUTO_SYNC_MAX_MINUTES = 1440
 
 
 def _safe_str(val: Any, default: str = "") -> str:
@@ -119,12 +121,12 @@ class HostLock:
             "machineName": self.machine_name,
             "startedAt": self.started_at,
             "lastHeartbeat": self.last_heartbeat,
-            "secondsSinceHeartbeat": round(now - self.last_heartbeat, 1) if self.last_heartbeat else None,
+            "secondsSinceHeartbeat": max(0.0, round(now - self.last_heartbeat, 1)) if self.last_heartbeat else None,
             "status": self.status if self.is_locked else "idle",
             "publicAddress": self.public_address,
             "tunnelStatus": self.tunnel_status,
             "mcVersion": self.mc_version,
-            "onlinePlayers": self.online_players,
+            "onlinePlayers": list(self.online_players),
             "maxPlayers": self.max_players,
             "lockEpoch": self.lock_epoch,
             "memoryUsedMb": self.memory_used_mb,
@@ -156,7 +158,7 @@ class HostLock:
             tunnel_status=_safe_str(data.get("tunnel_status", data.get("tunnelStatus")), "stopped") or "stopped",
             mc_version=_safe_str(data.get("mc_version", data.get("mcVersion")), ""),
             online_players=players_list,
-            max_players=_safe_int(data.get("max_players", data.get("maxPlayers")), 20),
+            max_players=max(1, _safe_int(data.get("max_players", data.get("maxPlayers")), 20)),
             lock_epoch=_safe_str(data.get("lock_epoch", data.get("lockEpoch")), ""),
             memory_used_mb=_safe_int(data.get("memory_used_mb", data.get("memoryUsedMb")), 0),
             memory_max_mb=max(512, _safe_int(data.get("memory_max_mb", data.get("memoryMaxMb")), 4096)),
@@ -186,6 +188,7 @@ class ClusterConfig:
     auto_backup_on_stop: bool = True
     max_backups: int = 10
     idle_shutdown_minutes: int = 0
+    auto_sync_interval_minutes: int = AUTO_SYNC_DEFAULT_MINUTES
     gamerules: Dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     accounts: List[UserAccount] = field(default_factory=list)
@@ -208,6 +211,7 @@ class ClusterConfig:
             "autoBackupOnStop": self.auto_backup_on_stop,
             "maxBackups": self.max_backups,
             "idleShutdownMinutes": self.idle_shutdown_minutes,
+            "autoSyncIntervalMinutes": self.auto_sync_interval_minutes,
             "gamerules": dict(self.gamerules) if self.gamerules else {},
             "createdAt": self.created_at,
         }
@@ -242,10 +246,19 @@ class ClusterConfig:
                 )
         mem_max = max(512, _safe_int(data.get("memoryMaxMb", data.get("memory_max_mb")), 4096))
         mem_min = max(256, min(mem_max, _safe_int(data.get("memoryMinMb", data.get("memory_min_mb")), 2048)))
+        raw_sw = _safe_str(data.get("mcSoftware", data.get("mc_software")), "paper").strip().lower()
+        mc_software = raw_sw if raw_sw in ("paper", "vanilla") else "paper"
+        raw_port = _safe_int(data.get("serverPort", data.get("server_port")), 25565)
+        server_port = raw_port if 1 <= raw_port <= 65535 else 25565
+        raw_auto_sync = data.get("autoSyncIntervalMinutes", data.get("auto_sync_interval_minutes"))
+        auto_sync_interval = max(
+            0,
+            min(AUTO_SYNC_MAX_MINUTES, _safe_int(raw_auto_sync, AUTO_SYNC_DEFAULT_MINUTES)),
+        )
         return ClusterConfig(
             cluster_id=_safe_str(data.get("clusterId", data.get("cluster_id")), str(uuid.uuid4())) or str(uuid.uuid4()),
             server_name=_safe_str(data.get("serverName", data.get("server_name")), "Shared Minecraft Server") or "Shared Minecraft Server",
-            mc_software=_safe_str(data.get("mcSoftware", data.get("mc_software")), "paper") or "paper",
+            mc_software=mc_software,
             mc_version=_safe_str(data.get("mcVersion", data.get("mc_version")), "26.3") or "26.3",
             memory_min_mb=mem_min,
             memory_max_mb=mem_max,
@@ -254,14 +267,18 @@ class ClusterConfig:
                 data.get("jvmFlags", data.get("jvm_flags")),
                 "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200",
             ),
-            server_port=_safe_int(data.get("serverPort", data.get("server_port")), 25565),
+            server_port=server_port,
             tunnel_enabled=_safe_bool(data.get("tunnelEnabled", data.get("tunnel_enabled")), True),
             tunnel_provider=_safe_str(data.get("tunnelProvider", data.get("tunnel_provider")), "playit") or "playit",
             public_join_address=_safe_str(data.get("publicJoinAddress", data.get("public_join_address")), ""),
             git_sync_enabled=_safe_bool(data.get("gitSyncEnabled", data.get("git_sync_enabled")), False),
             auto_backup_on_stop=_safe_bool(data.get("autoBackupOnStop", data.get("auto_backup_on_stop")), True),
             max_backups=max(1, _safe_int(data.get("maxBackups", data.get("max_backups")), 10)),
-            idle_shutdown_minutes=max(0, _safe_int(data.get("idleShutdownMinutes", data.get("idle_shutdown_minutes")), 0)),
+            idle_shutdown_minutes=max(
+                0,
+                min(AUTO_SYNC_MAX_MINUTES, _safe_int(data.get("idleShutdownMinutes", data.get("idle_shutdown_minutes")), 0)),
+            ),
+            auto_sync_interval_minutes=auto_sync_interval,
             gamerules=dict(data.get("gamerules", {})) if isinstance(data.get("gamerules"), dict) else {},
             created_at=_safe_float(data.get("createdAt", data.get("created_at")), time.time()),
             accounts=accounts,
@@ -289,10 +306,11 @@ class LocalMachineConfig:
     def from_dict(data: Dict[str, Any], default_sync_dir: str) -> "LocalMachineConfig":
         if not isinstance(data, dict):
             return LocalMachineConfig(shared_sync_dir=default_sync_dir)
+        raw_dp = _safe_int(data.get("dashboardPort", data.get("dashboard_port")), 3080)
         return LocalMachineConfig(
             machine_id=_safe_str(data.get("machineId", data.get("machine_id")), str(uuid.uuid4())) or str(uuid.uuid4()),
             machine_name=_safe_str(data.get("machineName", data.get("machine_name")), socket.gethostname()) or socket.gethostname(),
             shared_sync_dir=_safe_str(data.get("sharedSyncDir", data.get("shared_sync_dir")), default_sync_dir) or default_sync_dir,
             java_override_path=_safe_str(data.get("javaOverridePath", data.get("java_override_path")), ""),
-            dashboard_port=_safe_int(data.get("dashboardPort", data.get("dashboard_port")), 3080),
+            dashboard_port=raw_dp if 1 <= raw_dp <= 65535 else 3080,
         )

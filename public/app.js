@@ -5,7 +5,16 @@ const state = {
   account: null,
   status: null,
   sse: null,
+  sseReconnectTimer: null,
+  sseWatchdogTimer: null,
+  sseBackoffMs: 2000,
+  lastSseEventAt: 0,
   pollTimer: null,
+  uptimeTimer: null,
+  uptimeAnchor: null,
+  activeTabId: "tab-overview",
+  availableVersions: null,
+  isRemoteHosting: false,
   currentFileDir: "",
   fileSearchQuery: "",
   filesRequestSeq: 0,
@@ -13,19 +22,22 @@ const state = {
   editingFilePath: "",
   editingFileSavedContent: "",
   lastOnlinePlayersKey: null,
+  lastMirrorEpoch: "",
   consoleFilter: "ALL",
   consoleSearch: "",
   consoleLogs: [],
+  tunnelLogSeq: 0,
   cmdHistory: [],
   cmdHistoryIdx: -1,
   pendingAction: null,
   pendingActionAt: 0,
+  actionInFlight: false,
   statusSeq: 0,
 };
 
 function clearPendingActionIfSettled(localStatus, lastError) {
   if (!state.pendingAction) return;
-  if (Date.now() - state.pendingActionAt > 20000) {
+  if (!state.actionInFlight && Date.now() - state.pendingActionAt > 20000) {
     state.pendingAction = null;
     return;
   }
@@ -121,6 +133,132 @@ function formatTimeAgo(ts) {
   return new Date(ts * 1000).toLocaleDateString();
 }
 
+function formatTimeUntil(ts) {
+  if (!ts || ts <= 0) return "—";
+  const diff = Math.max(0, Math.floor(ts - Date.now() / 1000));
+  if (diff < 5) return "Due now";
+  if (diff < 60) return `in ${diff}s`;
+  const m = Math.floor(diff / 60);
+  const s = diff % 60;
+  if (m < 60) return s > 0 ? `in ${m}m ${s}s` : `in ${m}m`;
+  const h = Math.floor(m / 60);
+  const remM = m % 60;
+  return `in ${h}h ${remM}m`;
+}
+
+async function copyTextToClipboard(text, successMsg) {
+  const val = String(text ?? "");
+  if (!val) return;
+  try {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(val);
+      showToast(successMsg, "success");
+      return;
+    }
+  } catch (_) {}
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = val;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    if (ok) {
+      showToast(successMsg, "success");
+      return;
+    }
+  } catch (_) {}
+  showToast("Could not access clipboard. Please copy manually.", "error");
+}
+
+async function runWithButtonBusy(btn, busyText, fn) {
+  if (btn && btn.disabled) return;
+  const origText = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    if (busyText) btn.textContent = busyText;
+  }
+  try {
+    return await fn();
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = origText;
+    }
+  }
+}
+
+function armTwoStepConfirm(btn, confirmLabel, onConfirm, timeoutMs = 4500) {
+  if (!btn) return;
+  const defaultLabel = btn.dataset.defaultLabel || btn.textContent;
+  btn.dataset.defaultLabel = defaultLabel;
+  let timerId = null;
+  const reset = () => {
+    clearTimeout(timerId);
+    btn.dataset.confirmArmed = "";
+    btn.textContent = defaultLabel;
+    btn.classList.remove("btn-confirm-armed");
+  };
+  btn.addEventListener("click", async () => {
+    if (btn.disabled) return;
+    if (btn.dataset.confirmArmed !== "1") {
+      btn.dataset.confirmArmed = "1";
+      btn.textContent = confirmLabel;
+      btn.classList.add("btn-confirm-armed");
+      clearTimeout(timerId);
+      timerId = setTimeout(reset, timeoutMs);
+      return;
+    }
+    reset();
+    await onConfirm();
+  });
+}
+
+function syncAutoSyncInputs(rawMinutes, sourceElId = "") {
+  const parsed = Number.parseInt(rawMinutes, 10);
+  const clamped = Number.isFinite(parsed) ? Math.max(0, Math.min(1440, parsed)) : 10;
+  const presetEl = document.getElementById("net-auto-sync-preset");
+  const netInp = document.getElementById("net-auto-sync-minutes");
+  const cfgInp = document.getElementById("cfg-auto-sync-minutes");
+  if (netInp && sourceElId !== "net-auto-sync-minutes" && document.activeElement !== netInp) {
+    netInp.value = String(clamped);
+  }
+  if (cfgInp && sourceElId !== "cfg-auto-sync-minutes" && document.activeElement !== cfgInp) {
+    cfgInp.value = String(clamped);
+  }
+  if (presetEl && sourceElId !== "net-auto-sync-preset" && document.activeElement !== presetEl) {
+    const presetValues = ["0", "5", "10", "15", "30", "60"];
+    presetEl.value = presetValues.includes(String(clamped)) ? String(clamped) : "custom";
+  }
+}
+
+function renderUptimeTick() {
+  const el = document.getElementById("metric-uptime");
+  if (!el) return;
+  const anchor = state.uptimeAnchor;
+  if (!anchor || !anchor.running) {
+    el.textContent = `Uptime: ${formatDuration(anchor ? anchor.baseSec : 0)}`;
+    return;
+  }
+  const elapsed = Math.max(0, Math.floor((Date.now() - anchor.receivedAt) / 1000));
+  el.textContent = `Uptime: ${formatDuration(anchor.baseSec + elapsed)}`;
+}
+
+function startUptimeTicker() {
+  if (state.uptimeTimer) clearInterval(state.uptimeTimer);
+  state.uptimeTimer = setInterval(renderUptimeTick, 1000);
+}
+
+function stopUptimeTicker() {
+  if (state.uptimeTimer) {
+    clearInterval(state.uptimeTimer);
+    state.uptimeTimer = null;
+  }
+}
+
 // ============================================================================
 // Setup & Auth Flow
 // ============================================================================
@@ -152,8 +290,10 @@ async function checkInitialSetup() {
     const setup = await apiFetch("/api/setup/status");
     document.getElementById("auth-sync-dir-label").textContent = setup.sharedSyncDir;
     document.getElementById("input-sync-dir").value = setup.sharedSyncDir;
-    document.getElementById("login-machine-name").value = setup.machineName || "";
-    document.getElementById("setup-machine-name").value = setup.machineName || "";
+    const loginMachEl = document.getElementById("login-machine-name");
+    const setupMachEl = document.getElementById("setup-machine-name");
+    if (loginMachEl && !loginMachEl.value.trim()) loginMachEl.value = setup.machineName || "";
+    if (setupMachEl && !setupMachEl.value.trim()) setupMachEl.value = setup.machineName || "";
 
     // Render detected cloud folder quick chips
     const presetsEl = document.getElementById("cloud-folder-presets");
@@ -254,13 +394,31 @@ async function enterDashboard() {
   }
 
   connectEventStream();
+  startUptimeTicker();
   if (state.pollTimer) clearInterval(state.pollTimer);
   state.pollTimer = setInterval(() => {
     if (!document.hidden) refreshServerStatus();
   }, 5000);
+  if (state.sseWatchdogTimer) clearInterval(state.sseWatchdogTimer);
+  state.sseWatchdogTimer = setInterval(() => {
+    if (!state.token || document.hidden) return;
+    const stale = state.lastSseEventAt > 0 && Date.now() - state.lastSseEventAt > 25000;
+    const closed = !state.sse || state.sse.readyState === EventSource.CLOSED;
+    if (closed || stale) {
+      connectEventStream();
+    }
+  }, 10000);
 }
 
 function leaveDashboard() {
+  if (state.sseReconnectTimer) {
+    clearTimeout(state.sseReconnectTimer);
+    state.sseReconnectTimer = null;
+  }
+  if (state.sseWatchdogTimer) {
+    clearInterval(state.sseWatchdogTimer);
+    state.sseWatchdogTimer = null;
+  }
   if (state.sse) {
     state.sse.close();
     state.sse = null;
@@ -269,27 +427,61 @@ function leaveDashboard() {
     clearInterval(state.pollTimer);
     state.pollTimer = null;
   }
+  stopUptimeTicker();
+  state.uptimeAnchor = null;
+  state.lastSseEventAt = 0;
+  state.sseBackoffMs = 2000;
   state.token = "";
   state.account = null;
   state.status = null;
+  state.availableVersions = null;
+  state.isRemoteHosting = false;
+  state.activeTabId = "tab-overview";
   state.currentFileDir = "";
   state.fileSearchQuery = "";
+  state.filesRequestSeq++;
   state.fileCache = {};
   state.editingFilePath = "";
   state.editingFileSavedContent = "";
   state.lastOnlinePlayersKey = null;
+  state.lastMirrorEpoch = "";
+  state.consoleFilter = "ALL";
+  state.consoleSearch = "";
   state.consoleLogs = [];
+  state.tunnelLogSeq = 0;
   state.cmdHistory = [];
   state.cmdHistoryIdx = -1;
   state.pendingAction = null;
+  state.actionInFlight = false;
   state.statusSeq++;
   renderedLogIds.clear();
-  const term = document.getElementById("console-output");
-  if (term) term.innerHTML = "";
-  const editorBox = document.getElementById("file-editor-box");
-  if (editorBox) editorBox.classList.add("hidden");
-  const loginPk = document.getElementById("login-passkey");
-  if (loginPk) loginPk.value = "";
+  const clearIds = [
+    "console-output",
+    "accounts-tbody",
+    "ops-list-container",
+    "whitelist-container",
+    "banned-container",
+    "installed-plugins-container",
+    "plugin-catalog-container",
+    "backups-list-container",
+    "files-list-container",
+    "file-search-status",
+  ];
+  clearIds.forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = "";
+  });
+  ["console-search", "input-file-search", "input-plugin-search", "world-seed-input", "login-passkey"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.value = "";
+  });
+  ["file-editor-box", "world-reset-confirm-box", "jar-download-progress-wrap", "remote-admin-banner", "overview-autosync-badge", "file-search-status"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.classList.add("hidden");
+  });
+  document.querySelectorAll(".filter-pill").forEach((p) => {
+    p.classList.toggle("active", p.getAttribute("data-filter") === "ALL");
+  });
   localStorage.removeItem("minerelay_token");
   document.documentElement.classList.remove("session-restoring");
   document.getElementById("dashboard-view").classList.add("hidden");
@@ -297,20 +489,141 @@ function leaveDashboard() {
   checkInitialSetup();
 }
 
+function scheduleSseReconnect(delayMs) {
+  if (state.sseReconnectTimer || !state.token) return;
+  const wait = typeof delayMs === "number" ? delayMs : state.sseBackoffMs;
+  state.sseReconnectTimer = setTimeout(async () => {
+    state.sseReconnectTimer = null;
+    if (!state.token) return;
+    try {
+      await apiFetch("/api/auth/me");
+      state.sseBackoffMs = Math.min(15000, Math.round(state.sseBackoffMs * 1.5));
+      connectEventStream();
+    } catch (err) {
+      if (err && (err.status === 401 || err.status === 403)) {
+        showToast("Session expired or passkey was rotated/revoked.", "error");
+        leaveDashboard();
+      } else {
+        state.sseBackoffMs = Math.min(15000, Math.round(state.sseBackoffMs * 1.5));
+        scheduleSseReconnect(state.sseBackoffMs);
+      }
+    }
+  }, wait);
+}
+
+function applyRemoteLockStateToSummary(newLock) {
+  if (!state.status || !newLock) return;
+  state.status.lock = newLock;
+  const myMachineId = state.status.environment && state.status.environment.machineId;
+  const lockedByMe = Boolean(newLock.isLocked && myMachineId && newLock.machineId === myMachineId);
+  state.status.isLocalMachineHosting = lockedByMe || state.status.localStatus !== "idle";
+
+  if (lockedByMe && state.status.localStatus === "idle" && newLock.status && newLock.status !== "idle") {
+    state.status.localStatus = newLock.status;
+  }
+
+  if (!lockedByMe) {
+    if (newLock.isActivelyLocked) {
+      if (Array.isArray(newLock.onlinePlayers)) {
+        state.status.onlinePlayers = [...newLock.onlinePlayers];
+      }
+      const prevTel = state.status.telemetry || {};
+      const readyAt = Number(newLock.serverReadyAt || 0);
+      const isRunning = newLock.status === "running";
+      state.status.telemetry = {
+        ...prevTel,
+        tps: isRunning ? (typeof newLock.tps === "number" && newLock.tps > 0 ? newLock.tps : (prevTel.tps || 20.0)) : 0,
+        cpuPercent: typeof newLock.cpuPercent === "number" ? newLock.cpuPercent : (prevTel.cpuPercent || 0),
+        memoryUsedMb: typeof newLock.memoryUsedMb === "number" ? newLock.memoryUsedMb : (prevTel.memoryUsedMb || 0),
+        memoryMaxMb: newLock.memoryMaxMb || prevTel.memoryMaxMb || (state.status.cluster && state.status.cluster.memoryMaxMb) || 4096,
+        uptimeSeconds: isRunning && readyAt > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - readyAt)) : (isRunning ? (prevTel.uptimeSeconds || 0) : 0),
+      };
+      state.status.tunnel = {
+        ...(state.status.tunnel || {}),
+        status: newLock.tunnelStatus || "stopped",
+        publicAddress: newLock.publicAddress || "",
+        hostLanIp: newLock.hostLanIp || (state.status.tunnel && state.status.tunnel.hostLanIp) || "",
+        claimUrl: "",
+      };
+    } else if (state.status.localStatus === "idle") {
+      state.status.onlinePlayers = [];
+      state.status.telemetry = {
+        tps: 0,
+        cpuPercent: 0,
+        memoryUsedMb: 0,
+        memoryMaxMb: (state.status.cluster && state.status.cluster.memoryMaxMb) || 4096,
+        uptimeSeconds: 0,
+      };
+      if (state.status.tunnel) {
+        state.status.tunnel.status = "stopped";
+        state.status.tunnel.publicAddress = "";
+        state.status.tunnel.hostLanIp = "";
+        state.status.tunnel.claimUrl = "";
+      }
+    }
+  }
+}
+
+function handleConsoleEpochTransition(incoming) {
+  const lock = (incoming && incoming.lock) || {};
+  const env = (incoming && incoming.environment) || {};
+  const isLocal = Boolean(incoming.isLocalMachineHosting || (incoming.localStatus && incoming.localStatus !== "idle"));
+  const isRemote = Boolean(lock.isActivelyLocked && !isLocal);
+  const activeEpoch = lock.lockEpoch ? String(lock.lockEpoch) : "";
+
+  if (isRemote && activeEpoch && activeEpoch !== state.lastMirrorEpoch) {
+    state.lastMirrorEpoch = activeEpoch;
+    clearLocalConsoleBuffer();
+    if (!Array.isArray(incoming.logs)) {
+      setTimeout(() => {
+        if (state.token) refreshServerStatus();
+      }, 150);
+    }
+  } else if (!lock.isActivelyLocked && state.lastMirrorEpoch) {
+    state.lastMirrorEpoch = "";
+  }
+}
+
 function connectEventStream() {
+  if (state.sseReconnectTimer) {
+    clearTimeout(state.sseReconnectTimer);
+    state.sseReconnectTimer = null;
+  }
   if (state.sse) {
     state.sse.close();
+    state.sse = null;
   }
+  if (!state.token) return;
+
   const es = new EventSource(`/api/events?token=${encodeURIComponent(state.token)}`);
+  state.lastSseEventAt = Date.now();
+
+  es.onopen = () => {
+    state.sseBackoffMs = 2000;
+    state.lastSseEventAt = Date.now();
+  };
+
   es.onmessage = (ev) => {
+    state.lastSseEventAt = Date.now();
     try {
       const payload = JSON.parse(ev.data);
       if (payload.event === "console_log") {
         appendConsoleLine(payload.data);
+      } else if (payload.event === "tunnel_log") {
+        const line = payload.data && payload.data.line;
+        if (line) {
+          state.tunnelLogSeq++;
+          appendConsoleLine({
+            id: `tunnel-${Date.now()}-${state.tunnelLogSeq}`,
+            timestamp: new Date().toTimeString().slice(0, 8),
+            level: /error|failed/i.test(line) ? "ERROR" : /warn/i.test(line) ? "WARN" : "INFO",
+            source: "Tunnel",
+            text: line,
+          });
+        }
       } else if (payload.event === "status_changed" || payload.event === "connected") {
         const incoming = payload.data;
         if (!incoming) return;
-        // Ignore stale intermediate events that contradict an active user button click
         if (state.pendingAction === "starting" && incoming.localStatus === "idle" && !incoming.lastError) {
           return;
         }
@@ -324,9 +637,13 @@ function connectEventStream() {
         state.statusSeq++;
         const prevStatus = state.status ? state.status.localStatus : "idle";
         state.status = incoming;
+        handleConsoleEpochTransition(incoming);
         renderStatusSummary(incoming);
-        if (incoming.logs) {
-          renderAllConsoleLogs(incoming.logs);
+        if (Array.isArray(incoming.logs)) {
+          renderAllConsoleLogs(incoming.logs, { isSnapshot: true });
+        }
+        if (incoming.world) {
+          renderWorldGeneratorInfo(incoming.world);
         }
         if (
           (prevStatus === "starting" || prevStatus === "syncing_pull" || prevStatus === "restarting") &&
@@ -347,32 +664,15 @@ function connectEventStream() {
       } else if (payload.event === "lock_updated") {
         if (state.pendingAction) return;
         if (state.status && payload.data) {
-          state.status.lock = payload.data;
-          const myMachineId = state.status.environment && state.status.environment.machineId;
-          const lockedByMe = Boolean(
-            payload.data.isLocked && myMachineId && payload.data.machineId === myMachineId
-          );
-          state.status.isLocalMachineHosting = lockedByMe;
-          if (lockedByMe && state.status.localStatus === "idle" && payload.data.status && payload.data.status !== "idle") {
-            state.status.localStatus = payload.data.status;
-          }
+          applyRemoteLockStateToSummary(payload.data);
+          handleConsoleEpochTransition(state.status);
           renderStatusSummary(state.status);
         }
       } else if (payload.event === "heartbeat") {
         if (state.pendingAction) return;
         if (payload.data && payload.data.lock && state.status) {
-          state.status.lock = payload.data.lock;
-          const myMachineId = state.status.environment && state.status.environment.machineId;
-          if (
-            payload.data.lock.isLocked &&
-            myMachineId &&
-            payload.data.lock.machineId === myMachineId &&
-            state.status.localStatus === "idle" &&
-            payload.data.lock.status &&
-            payload.data.lock.status !== "idle"
-          ) {
-            state.status.localStatus = payload.data.lock.status;
-          }
+          applyRemoteLockStateToSummary(payload.data.lock);
+          handleConsoleEpochTransition(state.status);
           renderStatusSummary(state.status);
         }
       } else if (payload.event === "tunnel_updated") {
@@ -383,14 +683,10 @@ function connectEventStream() {
       }
     } catch (_) {}
   };
+
   es.onerror = () => {
-    // Reconnect automatically if the browser closes the SSE stream permanently
     if (es.readyState === EventSource.CLOSED && state.token && state.sse === es) {
-      setTimeout(() => {
-        if (state.token && (!state.sse || state.sse === es)) {
-          connectEventStream();
-        }
-      }, 4000);
+      scheduleSseReconnect(state.sseBackoffMs);
     }
   };
   state.sse = es;
@@ -398,25 +694,30 @@ function connectEventStream() {
 
 async function refreshServerStatus() {
   if (!state.token) return;
+  if (state.actionInFlight) return;
   if (state.pendingAction && Date.now() - state.pendingActionAt < 15000) return;
   const reqSeq = ++state.statusSeq;
   try {
     const summary = await apiFetch("/api/server/status");
-    if (reqSeq !== state.statusSeq || state.pendingAction) return;
+    if (reqSeq !== state.statusSeq || state.actionInFlight || state.pendingAction) return;
     state.status = summary;
     if (summary.currentUser) {
       state.account = summary.currentUser;
     }
+    handleConsoleEpochTransition(summary);
     renderStatusSummary(summary);
-    if (summary.logs) {
-      renderAllConsoleLogs(summary.logs);
+    if (Array.isArray(summary.logs)) {
+      renderAllConsoleLogs(summary.logs, { isSnapshot: true });
+    }
+    if (summary.world) {
+      renderWorldGeneratorInfo(summary.world);
     }
     const tabPlayers = document.getElementById("tab-players");
     if (tabPlayers && !tabPlayers.classList.contains("hidden") && state.account && state.account.role === "admin") {
       loadAdminPlayers();
     }
   } catch (err) {
-    if (err.status === 401) {
+    if (err.status === 401 || err.status === 403) {
       showToast("Session expired or passkey was rotated/revoked.", "error");
       leaveDashboard();
     }
@@ -427,6 +728,111 @@ async function refreshServerStatus() {
 // Rendering Server Status & Distributed Host Lock Banner
 // ============================================================================
 
+function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}) {
+  state.isRemoteHosting = Boolean(isRemoteHosting);
+  const isAdmin = Boolean(state.account && state.account.role === "admin");
+
+  const banner = document.getElementById("remote-admin-banner");
+  const bannerText = document.getElementById("remote-admin-banner-text");
+  if (banner && bannerText) {
+    if (isAdmin && isRemoteHosting) {
+      bannerText.innerHTML =
+        `🔒 <strong>${escapeHtml(lock.hostUsername || "Another member")}</strong> (<code>${escapeHtml(lock.machineName || "remote PC")}</code>) currently holds the active host lock (` +
+        `<strong>${escapeHtml(String(lock.status || "running").toUpperCase())}</strong>). Live server, world, file, plugin, and player mutations are locked to prevent sync conflicts. ` +
+        `Emergency Force-Unlock remains available in <strong>Zero-Port-Forward &amp; Sync</strong> if their PC crashed.`;
+    }
+    banner.classList.toggle("hidden", !isAdmin || !isRemoteHosting || state.activeTabId === "tab-overview");
+  }
+
+  if (!isAdmin) return;
+
+  const lockSelectors = [
+    "#btn-download-jar",
+    "#btn-world-reset-random",
+    "#btn-world-reset-custom",
+    "#btn-world-confirm-yes",
+    "#form-jvm-settings button[type='submit']",
+    "#form-server-properties button[type='submit']",
+    "#form-gamerules button[type='submit']",
+    "#form-add-op button[type='submit']",
+    "#form-add-whitelist button[type='submit']",
+    "#form-add-ban button[type='submit']",
+    "#form-create-backup button[type='submit']",
+    "#input-file-upload",
+    "#btn-save-file",
+    "#btn-save-public-address",
+    "#btn-save-playit-secret",
+    "#btn-install-playit",
+    "#btn-net-browse-sync",
+    "#btn-net-save-sync",
+    "#btn-save-sync-toggles",
+    "#ops-list-container button",
+    "#whitelist-container button",
+    "#banned-container button",
+    "#installed-plugins-container button",
+    "#plugin-catalog-container button",
+    "#backups-list-container .btn-restore-bk",
+    "#backups-list-container .btn-del-bk",
+    "#files-list-container .btn-del-file",
+  ];
+  lockSelectors.forEach((sel) => {
+    document.querySelectorAll(sel).forEach((el) => {
+      if (isRemoteHosting) {
+        if (!el.disabled) {
+          el.dataset.remoteLocked = "1";
+          el.disabled = true;
+          el.title = "Locked while another PC is actively hosting";
+        }
+      } else if (el.dataset.remoteLocked === "1") {
+        delete el.dataset.remoteLocked;
+        el.disabled = false;
+        if (el.title === "Locked while another PC is actively hosting") {
+          el.title = "";
+        }
+      }
+    });
+  });
+}
+
+function renderAutoSyncBadge(autoSync, cluster, isHosting) {
+  const badge = document.getElementById("overview-autosync-badge");
+  if (!badge) return;
+  const syncInfo = autoSync || {};
+  const interval = syncInfo.intervalMinutes !== undefined
+    ? Number(syncInfo.intervalMinutes)
+    : Number(cluster && cluster.autoSyncIntervalMinutes !== undefined ? cluster.autoSyncIntervalMinutes : 10);
+  const enabled = syncInfo.enabled !== undefined ? Boolean(syncInfo.enabled) : interval > 0;
+
+  if (!enabled || interval <= 0) {
+    badge.className = "badge badge-outline autosync-badge";
+    badge.textContent = "Drive Auto-Sync: Off";
+    badge.title = "Periodic Drive auto-sync is disabled (syncs on Stop only).";
+    return;
+  }
+
+  if (syncInfo.inProgress) {
+    badge.className = "badge autosync-badge autosync-badge-active";
+    badge.textContent = "⏳ Drive Auto-Syncing...";
+    badge.title = "Flushing chunks and uploading live world snapshot to Shared Folder.";
+    return;
+  }
+
+  if (syncInfo.lastSyncStatus === "error") {
+    badge.className = "badge autosync-badge autosync-badge-error";
+    badge.textContent = `⚠️ Auto-Sync Failed (${interval}m)`;
+    badge.title = syncInfo.lastSyncError || "Last periodic Drive auto-sync failed.";
+    return;
+  }
+
+  const lastTxt = syncInfo.lastSyncAt ? `Last: ${formatTimeAgo(syncInfo.lastSyncAt)}` : "Ready";
+  const nextTxt = isHosting && syncInfo.nextSyncAt ? ` • Next ${formatTimeUntil(syncInfo.nextSyncAt)}` : "";
+  badge.className = "badge badge-outline autosync-badge";
+  badge.textContent = `☁️ Auto-Sync ${interval}m • ${lastTxt}${nextTxt}`;
+  badge.title = syncInfo.lastSyncAt
+    ? `Last auto-sync: ${new Date(syncInfo.lastSyncAt * 1000).toLocaleTimeString()}`
+    : `Auto-syncs every ${interval} minutes while server is running.`;
+}
+
 function renderStatusSummary(summary) {
   if (!summary) return;
   const cluster = summary.cluster || {};
@@ -434,10 +840,21 @@ function renderStatusSummary(summary) {
   const env = summary.environment || {};
   const tunnel = summary.tunnel || {};
   const telemetry = summary.telemetry || {};
+  const autoSync = summary.autoSync || (env.syncDiagnostics && env.syncDiagnostics.autoSync) || {};
 
-  document.getElementById("top-server-name").textContent = cluster.serverName || "Shared Minecraft Server";
+  const isLockedByThisMachine = Boolean(lock.isLocked && env.machineId && lock.machineId === env.machineId);
+  const isLocalHosting = Boolean(state.pendingAction) || isLockedByThisMachine || summary.localStatus !== "idle";
+  const isLockedByOther = Boolean(lock.isActivelyLocked && !isLocalHosting);
+  const isStaleLock = Boolean(lock.isLocked && lock.isStale && !isLocalHosting);
+  const isRemoteHosting = Boolean(lock.isActivelyLocked && !summary.isLocalMachineHosting && !isLocalHosting);
+
+  const activeSoftware = ((isRemoteHosting && lock.mcSoftware) || cluster.mcSoftware || "paper").toUpperCase();
+  const activeVersion = (isRemoteHosting && lock.mcVersion) || cluster.mcVersion || "26.3";
+
+  document.getElementById("top-server-name").textContent =
+    (isRemoteHosting && lock.serverName) || cluster.serverName || "Shared Minecraft Server";
   document.getElementById("top-version-badge").textContent =
-    `${(cluster.mcSoftware || "paper").toUpperCase()} ${cluster.mcVersion || "1.21.4"} • Synced Folder: ${env.sharedSyncDir || ""}`;
+    `${activeSoftware} ${activeVersion} • Synced Folder: ${env.sharedSyncDir || ""}`;
   document.getElementById("user-machine-label").textContent = `@${env.machineName || "PC"}`;
 
   // Hero Status Banner Logic
@@ -447,11 +864,6 @@ function renderStatusSummary(summary) {
   const btnStart = document.getElementById("btn-start-host");
   const btnRestart = document.getElementById("btn-restart-host");
   const btnStop = document.getElementById("btn-stop-host");
-
-  const isLockedByThisMachine = Boolean(lock.isLocked && env.machineId && lock.machineId === env.machineId);
-  const isLocalHosting = Boolean(state.pendingAction) || isLockedByThisMachine || summary.localStatus !== "idle";
-  const isLockedByOther = Boolean(lock.isActivelyLocked && !isLocalHosting);
-  const isStaleLock = Boolean(lock.isLocked && lock.isStale && !isLocalHosting);
 
   if (isLocalHosting) {
     const rawSt =
@@ -465,7 +877,7 @@ function renderStatusSummary(summary) {
     if (st === "running") {
       dot.className = "status-dot status-running";
       headline.textContent = `Hosting Active on Your PC (${env.machineName})`;
-      detail.textContent = `You (${lock.hostUsername || state.account.username}) are currently hosting the server (${(cluster.mcSoftware || "paper").toUpperCase()} ${cluster.mcVersion || "26.3"}). When you finish playing, click "Stop & Sync World" so other members can host.`;
+      detail.textContent = `You (${lock.hostUsername || state.account.username}) are currently hosting the server (${activeSoftware} ${activeVersion}). When you finish playing, click "Stop & Sync World" so other members can host.`;
       btnStart.classList.add("hidden");
       btnStop.classList.remove("hidden");
       btnStop.textContent = "⏹ Stop & Sync World";
@@ -526,9 +938,10 @@ function renderStatusSummary(summary) {
       btnStop.disabled = false;
     }
   } else if (isLockedByOther) {
-    dot.className = "status-dot status-locked-other";
+    const remoteErr = summary.lastError && isRemoteHosting ? ` • Note: ${summary.lastError}` : "";
+    dot.className = lock.status === "running" ? "status-dot status-running" : "status-dot status-locked-other";
     headline.textContent = `Currently Hosted by ${lock.hostUsername} (on ${lock.machineName})`;
-    detail.textContent = `Local hosting is locked while ${lock.hostUsername} is hosting (${lock.status.toUpperCase()}). Join using the IP on the right!`;
+    detail.textContent = `Local hosting is locked while ${lock.hostUsername} is hosting (${String(lock.status || "running").toUpperCase()}). Join using the IP on the right!${remoteErr}`;
     btnStart.classList.remove("hidden");
     btnStart.disabled = true;
     btnStart.textContent = `🔒 Hosted by ${lock.hostUsername}`;
@@ -559,15 +972,38 @@ function renderStatusSummary(summary) {
     if (btnRestart) btnRestart.classList.add("hidden");
   }
 
-  // Join IP & Tunnel Badge
-  const joinAddress =
-    lock.publicAddress ||
-    tunnel.publicAddress ||
-    cluster.publicJoinAddress ||
-    `${tunnel.lanIp || "127.0.0.1"}:${cluster.serverPort || 25565}`;
-  document.getElementById("hero-join-ip").textContent = joinAddress;
+  // Join IP & Tunnel Badge (never show viewer's own LAN IP as remote host's address)
+  const portSuffix = cluster.serverPort || 25565;
+  const remoteHostLan = tunnel.hostLanIp || lock.hostLanIp || "";
+  const formattedRemoteLan = remoteHostLan
+    ? (remoteHostLan.includes(":") ? remoteHostLan : `${remoteHostLan}:${portSuffix}`)
+    : "";
+  const joinAddress = isRemoteHosting
+    ? (
+        lock.publicAddress ||
+        tunnel.publicAddress ||
+        cluster.publicJoinAddress ||
+        formattedRemoteLan ||
+        "Waiting for host address..."
+      )
+    : (
+        lock.publicAddress ||
+        tunnel.publicAddress ||
+        cluster.publicJoinAddress ||
+        `${tunnel.lanIp || "127.0.0.1"}:${portSuffix}`
+      );
+  const joinIpEl = document.getElementById("hero-join-ip");
+  const isWaitingAddr = joinAddress === "Waiting for host address...";
+  if (joinIpEl) joinIpEl.textContent = joinAddress;
 
-  const hostPart = (joinAddress || "").trim().toLowerCase().split(":")[0];
+  const btnCopyIp = document.getElementById("btn-copy-ip");
+  if (btnCopyIp) btnCopyIp.disabled = isWaitingAddr;
+  const btnCopyLocalIp = document.getElementById("btn-copy-local-ip");
+  if (btnCopyLocalIp) {
+    btnCopyLocalIp.classList.toggle("hidden", isRemoteHosting);
+  }
+
+  const hostPart = isWaitingAddr ? "" : (joinAddress || "").trim().toLowerCase().split(":")[0];
   const isLanAddress =
     !hostPart ||
     hostPart === "localhost" ||
@@ -581,11 +1017,14 @@ function renderStatusSummary(summary) {
   if (!isLanAddress && (tStat === "online" || tStat === "relay_ready")) {
     tunnelBadge.textContent = "PUBLIC TUNNEL ONLINE";
     tunnelBadge.className = "badge badge-member";
-  } else if (tStat === "claim_required" || tunnel.claimUrl) {
+  } else if (tStat === "claim_required" || (!isRemoteHosting && tunnel.claimUrl)) {
     tunnelBadge.textContent = "CLAIM LINK READY";
     tunnelBadge.className = "badge badge-admin";
+  } else if (tStat === "starting" && lock.isActivelyLocked) {
+    tunnelBadge.textContent = "TUNNEL STARTING...";
+    tunnelBadge.className = "badge badge-outline";
   } else if (isLanAddress && lock.isActivelyLocked) {
-    tunnelBadge.textContent = "LAN ONLY (SAME WI-FI)";
+    tunnelBadge.textContent = isWaitingAddr ? "TUNNEL CONNECTING" : "LAN ONLY (SAME WI-FI)";
     tunnelBadge.className = "badge badge-outline";
   } else if (tStat === "starting" || tStat === "lan_only") {
     tunnelBadge.textContent = "LOCAL / LAN READY";
@@ -597,10 +1036,10 @@ function renderStatusSummary(summary) {
 
   const heroClaimBanner = document.getElementById("hero-claim-banner");
   if (heroClaimBanner) {
-    if (tunnel.claimUrl) {
+    if (!isRemoteHosting && tunnel.claimUrl) {
       heroClaimBanner.classList.remove("hidden");
       document.getElementById("hero-claim-btn").href = tunnel.claimUrl;
-    } else if (isLanAddress && lock.isActivelyLocked && summary.isLocalMachineHosting) {
+    } else if (!isRemoteHosting && isLanAddress && lock.isActivelyLocked && summary.isLocalMachineHosting) {
       heroClaimBanner.classList.remove("hidden");
       document.getElementById("hero-claim-btn").href = "https://playit.gg/account/tunnels";
     } else {
@@ -620,36 +1059,66 @@ function renderStatusSummary(summary) {
       ? `Device: ${lock.machineName || "Remote PC"} (${formatTimeAgo(lock.lastHeartbeat)})`
       : "Ready for any member to host";
 
-  const onlineList = Array.isArray(summary.onlinePlayers)
+  const effectiveStatus = isLocalHosting
+    ? (state.pendingAction || (summary.localStatus !== "idle" ? summary.localStatus : lock.status || "idle"))
+    : (lock.isActivelyLocked ? (lock.status || "running") : "idle");
+
+  const rawPlayers = Array.isArray(summary.onlinePlayers)
     ? summary.onlinePlayers
     : (lock.isActivelyLocked && Array.isArray(lock.onlinePlayers) ? lock.onlinePlayers : []);
-  const maxP = lock.maxPlayers || cluster.maxPlayers || 20;
+  const onlineList = effectiveStatus === "idle" && !lock.isActivelyLocked ? [] : rawPlayers;
+  const maxP = lock.maxPlayers || telemetry.maxPlayers || cluster.maxPlayers || 20;
   document.getElementById("metric-players").textContent = `${onlineList.length} / ${maxP}`;
   document.getElementById("metric-players-list").textContent =
-    onlineList.length > 0 ? onlineList.join(", ") : "No players currently online";
+    onlineList.length > 0
+      ? onlineList.join(", ")
+      : (effectiveStatus === "running" ? "No players currently online" : "Server offline");
 
   // Synchronize Tab 4 dedicated online players list in real time
-  renderOnlinePlayersList(onlineList);
+  renderOnlinePlayersList(onlineList, isRemoteHosting);
 
-  const tpsVal = typeof telemetry.tps === "number" ? telemetry.tps : 20.0;
-  document.getElementById("metric-tps").textContent = lock.isActivelyLocked
-    ? `${tpsVal.toFixed(1)} TPS`
-    : "Offline";
-  document.getElementById("metric-cpu").textContent = `CPU Load: ${telemetry.cpuPercent ?? 0}%`;
+  const phaseLabels = {
+    syncing_pull: "Pulling World...",
+    starting: "Starting...",
+    restarting: "Restarting...",
+    stopping: "Stopping...",
+    syncing_push: "Syncing World...",
+  };
+  const tpsEl = document.getElementById("metric-tps");
+  if (effectiveStatus === "running") {
+    const tpsVal = typeof telemetry.tps === "number" && telemetry.tps > 0 ? telemetry.tps : 20.0;
+    tpsEl.textContent = `${tpsVal.toFixed(1)} TPS`;
+  } else if (effectiveStatus !== "idle") {
+    tpsEl.textContent = phaseLabels[effectiveStatus] || "Busy...";
+  } else {
+    tpsEl.textContent = "Offline";
+  }
 
-  document.getElementById("metric-ram").textContent =
-    `${telemetry.memoryUsedMb ?? 0} / ${telemetry.memoryMaxMb ?? cluster.memoryMaxMb ?? 4096} MB`;
-  document.getElementById("metric-uptime").textContent =
-    `Uptime: ${formatDuration(telemetry.uptimeSeconds ?? 0)}`;
+  const cpuVal = effectiveStatus !== "idle" ? (telemetry.cpuPercent ?? 0) : 0;
+  document.getElementById("metric-cpu").textContent = `CPU Load: ${cpuVal}%`;
 
-  // Sync Console Command Bar & Mirror Footer for Local vs Remote Host
+  const memUsed = effectiveStatus !== "idle" ? (telemetry.memoryUsedMb ?? 0) : 0;
+  const memMax = telemetry.memoryMaxMb ?? cluster.memoryMaxMb ?? 4096;
+  document.getElementById("metric-ram").textContent = `${memUsed} / ${memMax} MB`;
+
+  state.uptimeAnchor = {
+    baseSec: effectiveStatus === "running" ? Math.max(0, Number(telemetry.uptimeSeconds ?? 0)) : 0,
+    receivedAt: Date.now(),
+    running: effectiveStatus === "running",
+  };
+  renderUptimeTick();
+
+  renderAutoSyncBadge(autoSync, cluster, effectiveStatus === "running");
+
+  // Sync Console Command Bar, Clear button & Mirror Footer for Local vs Remote Host
   const isAdmin = state.account && state.account.role === "admin";
-  const isRemoteHosting = Boolean(lock.isActivelyLocked && !summary.isLocalMachineHosting);
   const cmdForm = document.getElementById("form-console-cmd");
   const quickCmds = document.getElementById("admin-quick-cmds");
+  const clearConsoleBtn = document.getElementById("btn-clear-console");
   const consoleFooter = document.getElementById("member-console-footer");
   if (cmdForm) cmdForm.classList.toggle("hidden", !isAdmin || isRemoteHosting);
   if (quickCmds) quickCmds.classList.toggle("hidden", !isAdmin || isRemoteHosting);
+  if (clearConsoleBtn) clearConsoleBtn.classList.toggle("hidden", !isAdmin || isRemoteHosting);
   if (consoleFooter) {
     consoleFooter.classList.toggle("hidden", isAdmin && !isRemoteHosting);
     consoleFooter.textContent = isRemoteHosting
@@ -657,10 +1126,11 @@ function renderStatusSummary(summary) {
       : "Console command execution is restricted to the Admin account.";
   }
 
+  applyRemoteAdminLockGuards(isRemoteHosting, lock);
   updateMotdPreview();
 
   // Admin Config & Network Tab Status Boxes
-  if (state.account && state.account.role === "admin") {
+  if (isAdmin) {
     renderAdminEnvBoxes(summary);
   }
 }
@@ -669,6 +1139,9 @@ function renderAdminEnvBoxes(summary) {
   const env = summary.environment || {};
   const tunnel = summary.tunnel || {};
   const cluster = summary.cluster || {};
+  const lock = summary.lock || {};
+  const autoSync = summary.autoSync || (env.syncDiagnostics && env.syncDiagnostics.autoSync) || {};
+  const isRemoteHosting = Boolean(lock.isActivelyLocked && !summary.isLocalMachineHosting && summary.localStatus === "idle");
 
   const jarBox = document.getElementById("jar-env-status");
   if (jarBox) {
@@ -680,13 +1153,21 @@ function renderAdminEnvBoxes(summary) {
     `;
   }
 
+  if (cluster.autoSyncIntervalMinutes !== undefined) {
+    syncAutoSyncInputs(cluster.autoSyncIntervalMinutes);
+  }
+
   const syncDiagBox = document.getElementById("sync-diagnostics-card");
   if (syncDiagBox && env.syncDiagnostics) {
     const d = env.syncDiagnostics;
     const altMirror = Array.isArray(d.mirroredAlternatives) && d.mirroredAlternatives.length > 0 ? d.mirroredAlternatives[0] : "";
+    const intervalMin = autoSync.intervalMinutes !== undefined
+      ? Number(autoSync.intervalMinutes)
+      : Number(cluster.autoSyncIntervalMinutes !== undefined ? cluster.autoSyncIntervalMinutes : 10);
     const diagSig = JSON.stringify([
       d.providerDetected,
       d.clusterConfigExists,
+      d.hostLockExists,
       d.latestSnapshotExists,
       d.latestSnapshotSizeBytes,
       d.latestSnapshotModifiedAt,
@@ -695,11 +1176,34 @@ function renderAdminEnvBoxes(summary) {
       altMirror,
       d.cloudTransferActive,
       d.syncManifest && d.syncManifest.snapshotSeq,
+      d.syncManifest && d.syncManifest.updatedAt,
+      d.syncManifest && d.syncManifest.hostUsername,
+      intervalMin,
+      autoSync.inProgress,
+      autoSync.lastSyncAt,
+      autoSync.nextSyncAt,
+      autoSync.lastSyncStatus,
+      autoSync.lastSyncError,
     ]);
     if (syncDiagBox.dataset.sig !== diagSig) {
       syncDiagBox.dataset.sig = diagSig;
       const manifestLine = d.syncManifest
         ? `<div><strong>Latest Verified World:</strong> Snapshot #${escapeHtml(d.syncManifest.snapshotSeq)} by ${escapeHtml(d.syncManifest.hostUsername || "Host")} (${formatTimeAgo(d.syncManifest.updatedAt)})</div>`
+        : "";
+      let autoSyncSummary = "";
+      if (intervalMin <= 0 || autoSync.enabled === false) {
+        autoSyncSummary = "Disabled (syncs on server stop only)";
+      } else if (autoSync.inProgress) {
+        autoSyncSummary = `⏳ Syncing live world snapshot now... (every ${intervalMin}m)`;
+      } else {
+        const lastPart = autoSync.lastSyncAt
+          ? `Last: ${formatTimeAgo(autoSync.lastSyncAt)} (${escapeHtml(autoSync.lastSyncStatus || "ok")})`
+          : `Last: ${escapeHtml(autoSync.lastSyncStatus || "idle")}`;
+        const nextPart = autoSync.nextSyncAt ? ` • Next: ${formatTimeUntil(autoSync.nextSyncAt)}` : "";
+        autoSyncSummary = `Every ${intervalMin}m • ${lastPart}${nextPart}`;
+      }
+      const autoSyncErrLine = autoSync.lastSyncStatus === "error" && autoSync.lastSyncError
+        ? `<div class="alert-box alert-warning" style="margin-top:0.25rem; padding:0.4rem 0.65rem;">⚠️ Last auto-sync error: ${escapeHtml(autoSync.lastSyncError)}</div>`
         : "";
       const transferLine = d.cloudTransferActive
         ? `<div class="alert-box alert-warning" style="margin-top:0.35rem; padding:0.45rem 0.65rem;">⏳ ${escapeHtml(d.cloudTransferActive)}</div>`
@@ -716,7 +1220,9 @@ function renderAdminEnvBoxes(summary) {
           <div><strong>Cluster Config Synced:</strong> ${d.clusterConfigExists ? "✅ cluster-config.json Ready" : "⚠️ Not initialized"}</div>
           <div><strong>Latest World Snapshot:</strong> ${d.latestSnapshotExists ? `✅ latest-server.zip (${formatBytes(d.latestSnapshotSizeBytes)} • ${formatTimeAgo(d.latestSnapshotModifiedAt)})` : "ℹ️ Created on first server stop"}</div>
           ${manifestLine}
+          <div><strong>Periodic Drive Auto-Sync:</strong> ${autoSyncSummary}</div>
           <div><strong>Rolling World Backups:</strong> ${d.backupCount || 0} archives in shared folder</div>
+          ${autoSyncErrLine}
           ${transferLine}
           ${shortcutWarn}
         </div>
@@ -744,34 +1250,43 @@ function renderAdminEnvBoxes(summary) {
   }
 
   const dlWrap = document.getElementById("jar-download-progress-wrap");
-  if (env.jarDownloading) {
-    dlWrap.classList.remove("hidden");
-    document.getElementById("jar-download-bar").style.width = `${env.jarDownloadProgress || 0}%`;
-    document.getElementById("jar-download-label").textContent = env.jarDownloadStatus || "Downloading...";
-  } else if (env.jarDownloadStatus) {
-    dlWrap.classList.remove("hidden");
-    document.getElementById("jar-download-bar").style.width = `100%`;
-    document.getElementById("jar-download-label").textContent = env.jarDownloadStatus;
+  if (dlWrap) {
+    if (env.jarDownloading) {
+      dlWrap.classList.remove("hidden");
+      document.getElementById("jar-download-bar").style.width = `${env.jarDownloadProgress || 0}%`;
+      document.getElementById("jar-download-label").textContent = env.jarDownloadStatus || "Downloading...";
+    } else if (env.jarDownloadStatus) {
+      dlWrap.classList.remove("hidden");
+      document.getElementById("jar-download-bar").style.width = `100%`;
+      document.getElementById("jar-download-label").textContent = env.jarDownloadStatus;
+    } else {
+      dlWrap.classList.add("hidden");
+    }
   }
 
   const tunnelBox = document.getElementById("tunnel-status-card");
   if (tunnelBox) {
+    const lanLabel = isRemoteHosting && tunnel.hostLanIp
+      ? `Active Host LAN IP: <code>${escapeHtml(tunnel.hostLanIp)}:${escapeHtml(cluster.serverPort || 25565)}</code>`
+      : `This PC LAN IP: <code>${escapeHtml(tunnel.lanIp || "127.0.0.1")}:${escapeHtml(cluster.serverPort || 25565)}</code>`;
     tunnelBox.innerHTML = `
       <div style="display:flex; flex-direction:column; gap:0.35rem; font-size:0.84rem;">
         <div><strong>Tunnel Status:</strong> <span class="badge badge-outline">${escapeHtml((tunnel.status || "stopped").toUpperCase())}</span></div>
-        <div><strong>playit.gg Agent Binary:</strong> ${tunnel.binaryInstalled ? `✅ Installed (${escapeHtml(tunnel.binaryPath)})` : `ℹ️ Using Shared Relay / Click below to auto-download playit.exe`}</div>
+        <div><strong>playit.gg Agent Binary (This PC):</strong> ${tunnel.binaryInstalled ? `✅ Installed (${escapeHtml(tunnel.binaryPath)})` : `ℹ️ Using Shared Relay / Click below to auto-download playit.exe`}</div>
         <div><strong>Shared Secret (playit.toml):</strong> ${tunnel.hasSharedSecret ? `✅ Synced in Shared Folder` : `Not set yet`}</div>
-        <div><strong>Local LAN Fallback IP:</strong> <code>${escapeHtml(tunnel.lanIp || "127.0.0.1")}:${escapeHtml(cluster.serverPort || 25565)}</code></div>
+        <div><strong>${isRemoteHosting && tunnel.hostLanIp ? "Host LAN Address" : "Local LAN Fallback"}:</strong> ${lanLabel}</div>
       </div>
     `;
   }
 
   const claimAlert = document.getElementById("tunnel-claim-alert");
-  if (tunnel.claimUrl) {
-    claimAlert.classList.remove("hidden");
-    document.getElementById("tunnel-claim-link").href = tunnel.claimUrl;
-  } else {
-    claimAlert.classList.add("hidden");
+  if (claimAlert) {
+    if (!isRemoteHosting && tunnel.claimUrl) {
+      claimAlert.classList.remove("hidden");
+      document.getElementById("tunnel-claim-link").href = tunnel.claimUrl;
+    } else {
+      claimAlert.classList.add("hidden");
+    }
   }
 }
 
@@ -781,6 +1296,13 @@ function renderAdminEnvBoxes(summary) {
 
 let renderedLogIds = new Set();
 
+function clearLocalConsoleBuffer() {
+  state.consoleLogs = [];
+  renderedLogIds.clear();
+  const term = document.getElementById("console-output");
+  if (term) term.innerHTML = "";
+}
+
 function matchesConsoleFilter(entry) {
   if (!entry) return false;
   if (state.consoleFilter && state.consoleFilter !== "ALL") {
@@ -788,6 +1310,9 @@ function matchesConsoleFilter(entry) {
     const lvl = (entry.level || "INFO").toUpperCase();
     if (state.consoleFilter === "WARN") {
       if (lvl !== "WARN" && lvl !== "ERROR") return false;
+    } else if (state.consoleFilter === "Minecraft") {
+      const mcSources = ["minecraft", "server", "servermain", "adminconsole", "launcher", "installer", "plugins", "worldgen"];
+      if (!mcSources.includes(src)) return false;
     } else if (src !== state.consoleFilter.toLowerCase()) {
       return false;
     }
@@ -823,13 +1348,33 @@ function rebuildConsoleView() {
   }
 }
 
-function renderAllConsoleLogs(logs) {
+function renderAllConsoleLogs(logs, opts = {}) {
   const term = document.getElementById("console-output");
-  if (!logs || logs.length === 0) return;
+  if (!term || !Array.isArray(logs)) return;
+
+  if (logs.length === 0) {
+    if (opts.isSnapshot && state.isRemoteHosting && state.consoleLogs.length > 0) {
+      clearLocalConsoleBuffer();
+    }
+    return;
+  }
+
+  // Reconcile if incoming snapshot represents a cleared/restarted/switched log stream (no overlapping IDs)
+  if (opts.isSnapshot && state.consoleLogs.length > 0) {
+    const incomingIds = new Set(logs.map((e) => e && e.id).filter(Boolean));
+    const hasOverlap = state.consoleLogs.some((e) => e && incomingIds.has(e.id));
+    if (!hasOverlap) {
+      clearLocalConsoleBuffer();
+    }
+  }
+
   const autoScrollEl = document.getElementById("console-autoscroll");
-  const shouldScroll = (!autoScrollEl || autoScrollEl.checked) && (term.scrollTop + term.clientHeight >= term.scrollHeight - 40);
+  const isFirstFill = term.childElementCount === 0;
+  const nearBottom = term.scrollTop + term.clientHeight >= term.scrollHeight - 48;
+  const shouldScroll = (!autoScrollEl || autoScrollEl.checked) && (isFirstFill || nearBottom);
+
   logs.forEach((entry) => {
-    if (!renderedLogIds.has(entry.id)) {
+    if (entry && !renderedLogIds.has(entry.id)) {
       appendConsoleLine(entry, false);
     }
   });
@@ -842,12 +1387,19 @@ function appendConsoleLine(entry, autoScroll = true) {
   if (!entry || renderedLogIds.has(entry.id)) return;
   renderedLogIds.add(entry.id);
   state.consoleLogs.push(entry);
-  if (state.consoleLogs.length > 600) {
-    state.consoleLogs.shift();
+  while (state.consoleLogs.length > 600) {
+    const removed = state.consoleLogs.shift();
+    if (removed && removed.id) {
+      renderedLogIds.delete(removed.id);
+    }
   }
   if (!matchesConsoleFilter(entry)) return;
   const term = document.getElementById("console-output");
+  if (!term) return;
   term.appendChild(createConsoleLogElement(entry));
+  while (term.childElementCount > 600) {
+    term.removeChild(term.firstElementChild);
+  }
   const autoScrollEl = document.getElementById("console-autoscroll");
   if (autoScroll && (!autoScrollEl || autoScrollEl.checked)) {
     term.scrollTop = term.scrollHeight;
@@ -963,7 +1515,7 @@ async function loadAdminAccounts() {
       }
       const delBtn = tr.querySelector(".btn-delete-acc");
       if (delBtn) {
-        delBtn.addEventListener("click", async () => {
+        armTwoStepConfirm(delBtn, "Confirm Revoke?", async () => {
           try {
             await apiFetch(`/api/admin/accounts/${encodeURIComponent(acc.id)}`, {
               method: "DELETE",
@@ -1012,7 +1564,7 @@ function formatWorldTypeLabel(levelType) {
   return "Normal";
 }
 
-function renderWorldGeneratorInfo(worldInfo, props = {}) {
+function renderWorldGeneratorInfo(worldInfo, props = {}, forceSeedSync = false) {
   const w = worldInfo || {};
   const activeSeed = w.seed !== undefined ? w.seed : (props["level-seed"] || "");
   const levelType = w.levelType || props["level-type"] || "minecraft:normal";
@@ -1058,12 +1610,35 @@ function renderWorldGeneratorInfo(worldInfo, props = {}) {
     disEndChk.checked = Boolean(w.disableEnd !== undefined ? w.disableEnd : (props["disable-end"] === "true" || props["allow-end"] === "false"));
   }
   const seedInput = document.getElementById("world-seed-input");
-  if (seedInput && activeSeed && !seedInput.value.trim()) {
-    seedInput.value = String(activeSeed);
+  if (seedInput && document.activeElement !== seedInput && (forceSeedSync || (activeSeed && !seedInput.value.trim()))) {
+    seedInput.value = activeSeed ? String(activeSeed) : "";
   }
   const propSeedInput = document.getElementById("prop-level-seed");
   if (propSeedInput && activeSeed !== undefined) {
     propSeedInput.value = String(activeSeed || "");
+  }
+}
+
+function populateMcVersions(software, preferredVersion = "") {
+  const vers = state.availableVersions;
+  const sel = document.getElementById("cfg-mc-version");
+  if (!sel || !vers) return;
+  const sw = software || "paper";
+  const list = vers[sw] || vers.paper || [];
+  const latestRel = vers.latestRelease || "26.3";
+  if (list.length > 0) {
+    sel.innerHTML = "";
+    list.forEach((v) => {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = v === latestRel ? `${v} (Latest Official Release)` : v;
+      sel.appendChild(opt);
+    });
+  }
+  if (preferredVersion && list.includes(preferredVersion)) {
+    sel.value = preferredVersion;
+  } else if (list.length > 0 && !list.includes(sel.value)) {
+    sel.value = list[0];
   }
 }
 
@@ -1079,25 +1654,16 @@ async function loadAdminProperties(includeVersions = true) {
     const env = statusRes.environment || {};
 
     if (versRes && versRes.versions) {
-      const sw = c.mcSoftware || "paper";
-      const list = versRes.versions[sw] || versRes.versions.paper || [];
-      const latestRel = versRes.versions.latestRelease || "26.3";
-      if (list.length > 0) {
-        const sel = document.getElementById("cfg-mc-version");
-        sel.innerHTML = "";
-        list.forEach((v) => {
-          const opt = document.createElement("option");
-          opt.value = v;
-          opt.textContent = v === latestRel ? `${v} (Latest Official Release)` : v;
-          sel.appendChild(opt);
-        });
-      }
+      state.availableVersions = versRes.versions;
     }
+    populateMcVersions(c.mcSoftware || "paper", c.mcVersion || "26.3");
 
     // Cluster & JVM form
     document.getElementById("cfg-server-name").value = c.serverName || "";
     document.getElementById("cfg-mc-software").value = c.mcSoftware || "paper";
-    document.getElementById("cfg-mc-version").value = c.mcVersion || "26.3";
+    if (!state.availableVersions) {
+      document.getElementById("cfg-mc-version").value = c.mcVersion || "26.3";
+    }
     document.getElementById("cfg-mem-min").value = c.memoryMinMb || 2048;
     document.getElementById("cfg-mem-max").value = c.memoryMaxMb || 4096;
     document.getElementById("cfg-java-path").value = c.javaPath || "java";
@@ -1113,6 +1679,7 @@ async function loadAdminProperties(includeVersions = true) {
     document.getElementById("net-sync-dir").value = env.sharedSyncDir || "";
     document.getElementById("net-auto-backup").checked = c.autoBackupOnStop !== false;
     document.getElementById("net-git-sync").checked = !!c.gitSyncEnabled;
+    syncAutoSyncInputs(c.autoSyncIntervalMinutes !== undefined ? c.autoSyncIntervalMinutes : 10);
 
     // server.properties visual form
     document.getElementById("prop-motd").value = p["motd"] || "";
@@ -1136,8 +1703,9 @@ async function loadAdminProperties(includeVersions = true) {
     const spEl = document.getElementById("prop-spawn-protection");
     if (spEl) spEl.value = p["spawn-protection"] || "0";
 
-    renderWorldGeneratorInfo(propsRes.world, p);
+    renderWorldGeneratorInfo(propsRes.world, p, true);
     updateMotdPreview();
+    applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
   } catch (err) {
     showToast(err.message, "error");
   }
@@ -1181,12 +1749,16 @@ async function loadAdminPlayers() {
   }
 }
 
-function renderOnlinePlayersList(online) {
+function renderOnlinePlayersList(online, isRemoteHosting = state.isRemoteHosting) {
   const onlineEl = document.getElementById("online-players-container");
   if (!onlineEl) return;
   const list = Array.isArray(online) ? online : [];
-  const nextKey = JSON.stringify(list);
-  const activeFocusedInside = onlineEl.contains(document.activeElement);
+  const remote = Boolean(isRemoteHosting);
+  const nextKey = JSON.stringify([remote, list]);
+  const activeEl = document.activeElement;
+  const activeFocusedInside = Boolean(
+    activeEl && onlineEl.contains(activeEl) && (activeEl.tagName === "SELECT" || activeEl.tagName === "INPUT")
+  );
   if (activeFocusedInside || (nextKey === state.lastOnlinePlayersKey && onlineEl.childElementCount > 0)) {
     return;
   }
@@ -1202,12 +1774,9 @@ function renderOnlinePlayersList(online) {
     row.style.width = "100%";
     const safeName = escapeHtml(name);
     const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(name)}/24`;
-    row.innerHTML = `
-      <div style="display:flex;align-items:center;gap:0.55rem;">
-        <img class="player-avatar" src="${avatarUrl}" alt="${safeName}" onerror="this.style.display='none'" />
-        <strong>🟢 ${safeName}</strong>
-      </div>
-      <div style="display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">
+    const controlsHtml = remote
+      ? `<span class="badge badge-outline">Mirrored from remote host</span>`
+      : `<div style="display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">
         <select class="select-sm player-gm-select" style="width:auto;padding:0.18rem 0.4rem;font-size:0.75rem;">
           <option value="">Gamemode...</option>
           <option value="survival">Survival</option>
@@ -1220,26 +1789,34 @@ function renderOnlinePlayersList(online) {
         <button class="btn btn-secondary btn-xs btn-act-op">OP</button>
         <button class="btn btn-ghost btn-xs btn-act-kick">Kick</button>
         <button class="btn btn-danger btn-xs btn-act-ban">Ban</button>
+      </div>`;
+    row.innerHTML = `
+      <div style="display:flex;align-items:center;gap:0.55rem;">
+        <img class="player-avatar" src="${avatarUrl}" alt="${safeName}" onerror="this.style.display='none'" />
+        <strong>🟢 ${safeName}</strong>
       </div>
+      ${controlsHtml}
     `;
-    const gmSel = row.querySelector(".player-gm-select");
-    if (gmSel) {
-      gmSel.addEventListener("change", () => {
-        if (!gmSel.value) return;
-        triggerPlayerAction("gamemode", name, { value: gmSel.value });
-        gmSel.value = "";
-      });
+    if (!remote) {
+      const gmSel = row.querySelector(".player-gm-select");
+      if (gmSel) {
+        gmSel.addEventListener("change", () => {
+          if (!gmSel.value) return;
+          triggerPlayerAction("gamemode", name, { value: gmSel.value });
+          gmSel.value = "";
+        });
+      }
+      const healBtn = row.querySelector(".btn-act-heal");
+      if (healBtn) healBtn.addEventListener("click", () => triggerPlayerAction("heal", name));
+      const tpBtn = row.querySelector(".btn-act-tpspawn");
+      if (tpBtn) tpBtn.addEventListener("click", () => triggerPlayerAction("tp_spawn", name));
+      const opBtn = row.querySelector(".btn-act-op");
+      if (opBtn) opBtn.addEventListener("click", () => triggerPlayerAction("op", name));
+      const kickBtn = row.querySelector(".btn-act-kick");
+      if (kickBtn) kickBtn.addEventListener("click", () => triggerPlayerAction("kick", name));
+      const banBtn = row.querySelector(".btn-act-ban");
+      if (banBtn) banBtn.addEventListener("click", () => triggerPlayerAction("ban", name));
     }
-    const healBtn = row.querySelector(".btn-act-heal");
-    if (healBtn) healBtn.addEventListener("click", () => triggerPlayerAction("heal", name));
-    const tpBtn = row.querySelector(".btn-act-tpspawn");
-    if (tpBtn) tpBtn.addEventListener("click", () => triggerPlayerAction("tp_spawn", name));
-    const opBtn = row.querySelector(".btn-act-op");
-    if (opBtn) opBtn.addEventListener("click", () => triggerPlayerAction("op", name));
-    const kickBtn = row.querySelector(".btn-act-kick");
-    if (kickBtn) kickBtn.addEventListener("click", () => triggerPlayerAction("kick", name));
-    const banBtn = row.querySelector(".btn-act-ban");
-    if (banBtn) banBtn.addEventListener("click", () => triggerPlayerAction("ban", name));
     onlineEl.appendChild(row);
   });
 }
@@ -1249,7 +1826,7 @@ function renderPlayersTab(data) {
 
   // Online players
   if (data.online !== undefined) {
-    renderOnlinePlayersList(data.online);
+    renderOnlinePlayersList(data.online, state.isRemoteHosting);
   }
 
   // OPs
@@ -1310,6 +1887,7 @@ function renderPlayersTab(data) {
       banEl.appendChild(row);
     });
   }
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
 }
 
 window.triggerPlayerAction = async function (action, username, extra = {}) {
@@ -1377,7 +1955,7 @@ function renderInstalledPlugins(plugins) {
         showToast(err.message, "error");
       }
     });
-    row.querySelector(".btn-del-plg").addEventListener("click", async () => {
+    armTwoStepConfirm(row.querySelector(".btn-del-plg"), "Confirm Delete?", async () => {
       try {
         const res = await apiFetch(`/api/admin/plugins?filename=${encodeURIComponent(p.filename)}`, {
           method: "DELETE",
@@ -1390,6 +1968,7 @@ function renderInstalledPlugins(plugins) {
     });
     container.appendChild(row);
   });
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
 }
 
 function renderPluginCatalog(catalog) {
@@ -1440,6 +2019,7 @@ function renderPluginCatalog(catalog) {
     });
     container.appendChild(card);
   });
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
 }
 
 async function loadAdminBackups() {
@@ -1532,7 +2112,7 @@ function renderBackupsList(backups) {
     }
     const delBtn = row.querySelector(".btn-del-bk");
     if (delBtn) {
-      delBtn.addEventListener("click", async () => {
+      armTwoStepConfirm(delBtn, "Confirm Delete?", async () => {
         try {
           const res = await apiFetch(`/api/admin/backups/${encodeURIComponent(b.name)}`, {
             method: "DELETE",
@@ -1546,6 +2126,7 @@ function renderBackupsList(backups) {
     }
     container.appendChild(row);
   });
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
 }
 
 function renderFileBreadcrumbs(currentDir) {
@@ -1681,7 +2262,7 @@ function renderFilesList(files, currentDir, isSearching) {
     const editBtn = row.querySelector(".btn-edit-file");
     if (editBtn) editBtn.addEventListener("click", () => openFileInEditor(f.path));
 
-    row.querySelector(".btn-del-file").addEventListener("click", async () => {
+    armTwoStepConfirm(row.querySelector(".btn-del-file"), "Confirm Delete?", async () => {
       try {
         await apiFetch(`/api/admin/files?path=${encodeURIComponent(f.path)}`, {
           method: "DELETE",
@@ -1696,6 +2277,7 @@ function renderFilesList(files, currentDir, isSearching) {
 
     container.appendChild(row);
   });
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
 }
 
 async function loadAdminFiles(dirPath = "", searchQuery = "") {
@@ -1789,7 +2371,32 @@ async function loadAdminFiles(dirPath = "", searchQuery = "") {
   }
 }
 
+let pendingDiscardFilePath = "";
+let pendingDiscardFileTimer = null;
+
 async function openFileInEditor(relPath) {
+  const editorBox = document.getElementById("file-editor-box");
+  const textarea = document.getElementById("file-editor-textarea");
+  if (
+    editorBox &&
+    !editorBox.classList.contains("hidden") &&
+    state.editingFilePath &&
+    state.editingFilePath !== relPath &&
+    textarea &&
+    textarea.value !== state.editingFileSavedContent
+  ) {
+    if (pendingDiscardFilePath !== relPath) {
+      pendingDiscardFilePath = relPath;
+      clearTimeout(pendingDiscardFileTimer);
+      pendingDiscardFileTimer = setTimeout(() => {
+        pendingDiscardFilePath = "";
+      }, 4500);
+      showToast(`Unsaved edits in ${state.editingFilePath}! Click '${relPath}' again to discard & open.`, "info");
+      return;
+    }
+  }
+  pendingDiscardFilePath = "";
+  clearTimeout(pendingDiscardFileTimer);
   try {
     const data = await apiFetch(`/api/admin/files/read?path=${encodeURIComponent(relPath)}`);
     state.editingFilePath = data.path;
@@ -1797,6 +2404,9 @@ async function openFileInEditor(relPath) {
     document.getElementById("file-editor-path").textContent = data.path;
     document.getElementById("file-editor-textarea").value = data.content;
     document.getElementById("file-editor-box").classList.remove("hidden");
+    const btnClose = document.getElementById("btn-close-file");
+    if (btnClose) btnClose.textContent = "Close";
+    applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
   } catch (err) {
     showToast(err.message, "error");
   }
@@ -1807,6 +2417,7 @@ async function openFileInEditor(relPath) {
 // ============================================================================
 
 function switchDashboardTab(tabId) {
+  state.activeTabId = tabId;
   document.querySelectorAll(".nav-tab").forEach((btn) => {
     btn.classList.toggle("active", btn.getAttribute("data-tab") === tabId);
   });
@@ -1814,6 +2425,7 @@ function switchDashboardTab(tabId) {
     panel.classList.toggle("hidden", panel.id !== tabId);
     panel.classList.toggle("active", panel.id === tabId);
   });
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -1836,8 +2448,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   document.getElementById("passkey-modal-copy").addEventListener("click", () => {
     const pk = document.getElementById("passkey-modal-value").textContent;
-    navigator.clipboard.writeText(pk);
-    showToast("Passkey copied to clipboard!", "success");
+    copyTextToClipboard(pk, "Passkey copied to clipboard!");
   });
 
   // Auth tabs
@@ -1895,12 +2506,14 @@ document.addEventListener("DOMContentLoaded", () => {
         const inp = document.getElementById(inputId);
         const newDir = inp ? inp.value.trim() : "";
         if (!newDir) return;
-        try {
-          await applySyncDir(newDir);
-          showToast("Updated Shared Sync Folder path!", "success");
-        } catch (err) {
-          showToast(err.message, "error");
-        }
+        await runWithButtonBusy(saveBtn, "Saving...", async () => {
+          try {
+            await applySyncDir(newDir);
+            showToast("Updated Shared Sync Folder path!", "success");
+          } catch (err) {
+            showToast(err.message, "error");
+          }
+        });
       });
     }
   }
@@ -1929,56 +2542,62 @@ document.addEventListener("DOMContentLoaded", () => {
   // Login submit
   document.getElementById("form-login").addEventListener("submit", async (e) => {
     e.preventDefault();
+    const submitBtn = e.currentTarget.querySelector("button[type='submit']");
     const passkey = document.getElementById("login-passkey").value.trim();
     const machineName = document.getElementById("login-machine-name").value.trim();
-    try {
-      const res = await apiFetch("/api/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ passkey, machineName }),
-      });
-      state.token = res.token;
-      state.account = res.account;
-      state.status = res.status;
-      localStorage.setItem("minerelay_token", res.token);
-      showToast(`Signed in as ${res.account.username} (${res.account.role.toUpperCase()})`, "success");
-      enterDashboard();
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(submitBtn, "Signing in...", async () => {
+      try {
+        const res = await apiFetch("/api/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ passkey, machineName }),
+        });
+        state.token = res.token;
+        state.account = res.account;
+        state.status = res.status;
+        localStorage.setItem("minerelay_token", res.token);
+        showToast(`Signed in as ${res.account.username} (${res.account.role.toUpperCase()})`, "success");
+        enterDashboard();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
   // Initial Cluster Setup submit
   document.getElementById("form-setup").addEventListener("submit", async (e) => {
     e.preventDefault();
+    const submitBtn = e.currentTarget.querySelector("button[type='submit']");
     const serverName = document.getElementById("setup-server-name").value.trim();
     const adminUsername = document.getElementById("setup-admin-user").value.trim();
     const machineName = document.getElementById("setup-machine-name").value.trim();
     const customPasskey = document.getElementById("setup-custom-passkey").value.trim();
     const sharedSyncDir = document.getElementById("input-sync-dir").value.trim();
 
-    try {
-      const res = await apiFetch("/api/setup/init", {
-        method: "POST",
-        body: JSON.stringify({
-          serverName,
-          adminUsername,
-          machineName,
-          customPasskey: customPasskey || null,
-          sharedSyncDir: sharedSyncDir || null,
-        }),
-      });
-      state.token = res.token;
-      state.account = res.account;
-      localStorage.setItem("minerelay_token", res.token);
-      enterDashboard();
-      showPasskeyModal(
-        "👑 Admin Passkey Created",
-        res.generatedPasskey,
-        "Save your master Admin passkey! You have full control over the server and can create Member passkeys in the Accounts tab."
-      );
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(submitBtn, "Initializing...", async () => {
+      try {
+        const res = await apiFetch("/api/setup/init", {
+          method: "POST",
+          body: JSON.stringify({
+            serverName,
+            adminUsername,
+            machineName,
+            customPasskey: customPasskey || null,
+            sharedSyncDir: sharedSyncDir || null,
+          }),
+        });
+        state.token = res.token;
+        state.account = res.account;
+        localStorage.setItem("minerelay_token", res.token);
+        enterDashboard();
+        showPasskeyModal(
+          "👑 Admin Passkey Created",
+          res.generatedPasskey,
+          "Save your master Admin passkey! You have full control over the server and can create Member passkeys in the Accounts tab."
+        );
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
   // Logout
@@ -1992,8 +2611,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // Copy Join IP & Local IP
   document.getElementById("btn-copy-ip").addEventListener("click", () => {
     const ip = document.getElementById("hero-join-ip").textContent;
-    navigator.clipboard.writeText(ip);
-    showToast(`Copied Server IP: ${ip}`, "success");
+    copyTextToClipboard(ip, `Copied Server IP: ${ip}`);
   });
 
   const btnCopyLocalIp = document.getElementById("btn-copy-local-ip");
@@ -2001,13 +2619,14 @@ document.addEventListener("DOMContentLoaded", () => {
     btnCopyLocalIp.addEventListener("click", () => {
       const port = (state.status && state.status.cluster && state.status.cluster.serverPort) || 25565;
       const localIp = `localhost:${port}`;
-      navigator.clipboard.writeText(localIp);
-      showToast(`Copied Host PC Local Address: ${localIp}`, "success");
+      copyTextToClipboard(localIp, `Copied Host PC Local Address: ${localIp}`);
     });
   }
 
   // Start, Restart & Stop Hosting Buttons (Available to both Admin and Member accounts)
   document.getElementById("btn-start-host").addEventListener("click", async () => {
+    if (state.actionInFlight) return;
+    state.actionInFlight = true;
     state.pendingAction = "starting";
     state.pendingActionAt = Date.now();
     state.statusSeq++;
@@ -2016,9 +2635,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     try {
       const summary = await apiFetch("/api/server/start", { method: "POST" });
+      state.statusSeq++;
       state.pendingAction = null;
       state.status = summary;
       renderStatusSummary(summary);
+      if (Array.isArray(summary.logs)) {
+        renderAllConsoleLogs(summary.logs, state.isRemoteHosting, summary.lock || {});
+      }
       if (summary.localStatus === "running") {
         showToast("✅ Minecraft Server is ONLINE and ready to join!", "success");
       } else {
@@ -2028,12 +2651,16 @@ document.addEventListener("DOMContentLoaded", () => {
       state.pendingAction = null;
       showToast(err.message, "error");
       refreshServerStatus();
+    } finally {
+      state.actionInFlight = false;
     }
   });
 
   const btnRestartHost = document.getElementById("btn-restart-host");
   if (btnRestartHost) {
     btnRestartHost.addEventListener("click", async () => {
+      if (state.actionInFlight) return;
+      state.actionInFlight = true;
       state.pendingAction = "restarting";
       state.pendingActionAt = Date.now();
       state.statusSeq++;
@@ -2042,19 +2669,27 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       try {
         const summary = await apiFetch("/api/server/restart", { method: "POST" });
+        state.statusSeq++;
         state.pendingAction = null;
         state.status = summary;
         renderStatusSummary(summary);
+        if (Array.isArray(summary.logs)) {
+          renderAllConsoleLogs(summary.logs, state.isRemoteHosting, summary.lock || {});
+        }
         showToast("Server restarted and world snapshot synced!", "success");
       } catch (err) {
         state.pendingAction = null;
         showToast(err.message, "error");
         refreshServerStatus();
+      } finally {
+        state.actionInFlight = false;
       }
     });
   }
 
   document.getElementById("btn-stop-host").addEventListener("click", async () => {
+    if (state.actionInFlight) return;
+    state.actionInFlight = true;
     state.pendingAction = "stopping";
     state.pendingActionAt = Date.now();
     state.statusSeq++;
@@ -2063,9 +2698,13 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     try {
       const summary = await apiFetch("/api/server/stop", { method: "POST" });
+      state.statusSeq++;
       state.pendingAction = null;
       state.status = summary;
       renderStatusSummary(summary);
+      if (Array.isArray(summary.logs)) {
+        renderAllConsoleLogs(summary.logs, state.isRemoteHosting, summary.lock || {});
+      }
       showToast("Server stopped, world synced to Shared Folder, and host lock released!", "success");
       if (state.account && state.account.role === "admin") {
         loadAdminBackups();
@@ -2074,6 +2713,8 @@ document.addEventListener("DOMContentLoaded", () => {
       state.pendingAction = null;
       showToast(err.message, "error");
       refreshServerStatus();
+    } finally {
+      state.actionInFlight = false;
     }
   });
 
@@ -2117,6 +2758,16 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
+  const autoScrollChk = document.getElementById("console-autoscroll");
+  if (autoScrollChk) {
+    autoScrollChk.addEventListener("change", () => {
+      if (autoScrollChk.checked) {
+        const term = document.getElementById("console-output");
+        if (term) term.scrollTop = term.scrollHeight;
+      }
+    });
+  }
+
   const btnCopyConsole = document.getElementById("btn-copy-console");
   if (btnCopyConsole) {
     btnCopyConsole.addEventListener("click", () => {
@@ -2124,18 +2775,18 @@ document.addEventListener("DOMContentLoaded", () => {
         .filter((e) => matchesConsoleFilter(e))
         .map((e) => e.text)
         .join("\n");
-      navigator.clipboard.writeText(text || "");
-      showToast("Copied console logs to clipboard!", "success");
+      copyTextToClipboard(text || "", "Copied console logs to clipboard!");
     });
   }
 
   const btnClearConsole = document.getElementById("btn-clear-console");
   if (btnClearConsole) {
     btnClearConsole.addEventListener("click", async () => {
-      state.consoleLogs = [];
-      renderedLogIds.clear();
-      const term = document.getElementById("console-output");
-      if (term) term.innerHTML = "";
+      if (state.isRemoteHosting) {
+        showToast("Console is mirrored from remote host and cannot be cleared remotely.", "info");
+        return;
+      }
+      clearLocalConsoleBuffer();
       if (state.account && state.account.role === "admin") {
         try {
           await apiFetch("/api/admin/console/clear", { method: "POST" });
@@ -2171,6 +2822,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   document.getElementById("form-console-cmd").addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (state.isRemoteHosting) {
+      showToast("Cannot send console commands while another PC is actively hosting.", "error");
+      return;
+    }
     const inp = document.getElementById("input-console-cmd");
     const cmd = inp.value.trim();
     if (!cmd) return;
@@ -2190,6 +2845,10 @@ document.addEventListener("DOMContentLoaded", () => {
   // Quick Console Command Buttons
   document.querySelectorAll(".quick-cmd").forEach((btn) => {
     btn.addEventListener("click", async () => {
+      if (state.isRemoteHosting) {
+        showToast("Cannot send console commands while another PC is actively hosting.", "error");
+        return;
+      }
       const cmd = btn.getAttribute("data-cmd");
       try {
         await apiFetch("/api/admin/console", {
@@ -2205,44 +2864,87 @@ document.addEventListener("DOMContentLoaded", () => {
   // Create Member Account Form (Admin Only)
   document.getElementById("form-create-member").addEventListener("submit", async (e) => {
     e.preventDefault();
+    const submitBtn = e.currentTarget.querySelector("button[type='submit']");
     const username = document.getElementById("new-member-username").value.trim();
     const customPasskey = document.getElementById("new-member-passkey").value.trim();
-    try {
-      const res = await apiFetch("/api/admin/accounts", {
-        method: "POST",
-        body: JSON.stringify({
-          username,
-          customPasskey: customPasskey || null,
-        }),
-      });
-      document.getElementById("new-member-username").value = "";
-      document.getElementById("new-member-passkey").value = "";
-      showPasskeyModal(
-        `🔑 Member Passkey for ${res.account.username}`,
-        res.generatedPasskey,
-        `Share this passkey with ${res.account.username}. They will be able to Start, Stop, and Host the server locally whenever nobody else is hosting.`
-      );
-      loadAdminAccounts();
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(submitBtn, "Creating...", async () => {
+      try {
+        const res = await apiFetch("/api/admin/accounts", {
+          method: "POST",
+          body: JSON.stringify({
+            username,
+            customPasskey: customPasskey || null,
+          }),
+        });
+        document.getElementById("new-member-username").value = "";
+        document.getElementById("new-member-passkey").value = "";
+        showPasskeyModal(
+          `🔑 Member Passkey for ${res.account.username}`,
+          res.generatedPasskey,
+          `Share this passkey with ${res.account.username}. They will be able to Start, Stop, and Host the server locally whenever nobody else is hosting.`
+        );
+        loadAdminAccounts();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
   // Download Server Jar Button
-  document.getElementById("btn-download-jar").addEventListener("click", async () => {
+  document.getElementById("btn-download-jar").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
     const software = document.getElementById("cfg-mc-software").value;
     const version = document.getElementById("cfg-mc-version").value;
-    try {
-      await apiFetch("/api/admin/install-jar", {
-        method: "POST",
-        body: JSON.stringify({ software, version }),
-      });
-      showToast(`Started downloading ${software.toUpperCase()} ${version} server.jar...`, "info");
-      refreshServerStatus();
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(btn, "Starting Download...", async () => {
+      try {
+        await apiFetch("/api/admin/install-jar", {
+          method: "POST",
+          body: JSON.stringify({ software, version }),
+        });
+        showToast(`Started downloading ${software.toUpperCase()} ${version} server.jar...`, "info");
+        refreshServerStatus();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
+
+  // Repopulate MC versions when software changes
+  const cfgSoftwareEl = document.getElementById("cfg-mc-software");
+  if (cfgSoftwareEl) {
+    cfgSoftwareEl.addEventListener("change", () => {
+      const curVer = document.getElementById("cfg-mc-version")?.value || "";
+      populateMcVersions(cfgSoftwareEl.value, curVer);
+    });
+  }
+
+  // Auto-sync interval bidirectional inputs (Tab 3 <-> Tab 6)
+  const netAutoSyncPreset = document.getElementById("net-auto-sync-preset");
+  const netAutoSyncMinutes = document.getElementById("net-auto-sync-minutes");
+  const cfgAutoSyncMinutes = document.getElementById("cfg-auto-sync-minutes");
+  if (netAutoSyncPreset) {
+    netAutoSyncPreset.addEventListener("change", () => {
+      if (netAutoSyncPreset.value === "custom") {
+        if (netAutoSyncMinutes) netAutoSyncMinutes.focus();
+        return;
+      }
+      syncAutoSyncInputs(netAutoSyncPreset.value, "net-auto-sync-preset");
+    });
+  }
+  if (netAutoSyncMinutes) {
+    netAutoSyncMinutes.addEventListener("input", () => {
+      if (netAutoSyncMinutes.value !== "") {
+        syncAutoSyncInputs(netAutoSyncMinutes.value, "net-auto-sync-minutes");
+      }
+    });
+  }
+  if (cfgAutoSyncMinutes) {
+    cfgAutoSyncMinutes.addEventListener("input", () => {
+      if (cfgAutoSyncMinutes.value !== "") {
+        syncAutoSyncInputs(cfgAutoSyncMinutes.value, "cfg-auto-sync-minutes");
+      }
+    });
+  }
 
   // Live MOTD preview listeners & Disable-End checkbox sync
   const motdInput = document.getElementById("prop-motd");
@@ -2265,32 +2967,58 @@ document.addEventListener("DOMContentLoaded", () => {
   // Save JVM & Cluster Settings
   document.getElementById("form-jvm-settings").addEventListener("submit", async (e) => {
     e.preventDefault();
-    try {
-      const idleSel = document.getElementById("cfg-idle-shutdown");
-      await apiFetch("/api/admin/settings", {
-        method: "PUT",
-        body: JSON.stringify({
-          serverName: document.getElementById("cfg-server-name").value.trim(),
-          mcSoftware: document.getElementById("cfg-mc-software").value,
-          mcVersion: document.getElementById("cfg-mc-version").value,
-          memoryMinMb: parseInt(document.getElementById("cfg-mem-min").value, 10),
-          memoryMaxMb: parseInt(document.getElementById("cfg-mem-max").value, 10),
-          javaPath: document.getElementById("cfg-java-path").value.trim(),
-          serverPort: parseInt(document.getElementById("cfg-server-port").value, 10),
-          idleShutdownMinutes: idleSel ? parseInt(idleSel.value, 10) : 0,
-          jvmFlags: document.getElementById("cfg-jvm-flags").value.trim(),
-        }),
-      });
-      showToast("Saved JVM and cluster configuration!", "success");
-      refreshServerStatus();
-    } catch (err) {
-      showToast(err.message, "error");
+    const submitBtn = e.currentTarget.querySelector("button[type='submit']");
+    const memMin = parseInt(document.getElementById("cfg-mem-min").value, 10);
+    const memMax = parseInt(document.getElementById("cfg-mem-max").value, 10);
+    const serverPort = parseInt(document.getElementById("cfg-server-port").value, 10);
+    const idleSel = document.getElementById("cfg-idle-shutdown");
+    const idleMinutes = idleSel ? parseInt(idleSel.value, 10) : 0;
+    const autoSyncEl = document.getElementById("cfg-auto-sync-minutes");
+    const autoSyncMinutes = autoSyncEl ? parseInt(autoSyncEl.value, 10) : 10;
+
+    if (!Number.isFinite(memMin) || memMin < 512 || !Number.isFinite(memMax) || memMax < memMin) {
+      showToast("Invalid RAM range: Min RAM must be >= 512 MB and <= Max RAM.", "error");
+      return;
     }
+    if (!Number.isFinite(serverPort) || serverPort < 1 || serverPort > 65535) {
+      showToast("Invalid Server Port (must be between 1 and 65535).", "error");
+      return;
+    }
+    if (!Number.isFinite(autoSyncMinutes) || autoSyncMinutes < 0 || autoSyncMinutes > 1440) {
+      showToast("Drive Auto-Sync interval must be 0 (Off) or 1–1440 minutes.", "error");
+      return;
+    }
+
+    await runWithButtonBusy(submitBtn, "Saving...", async () => {
+      try {
+        await apiFetch("/api/admin/settings", {
+          method: "PUT",
+          body: JSON.stringify({
+            serverName: document.getElementById("cfg-server-name").value.trim(),
+            mcSoftware: document.getElementById("cfg-mc-software").value,
+            mcVersion: document.getElementById("cfg-mc-version").value,
+            memoryMinMb: memMin,
+            memoryMaxMb: memMax,
+            javaPath: document.getElementById("cfg-java-path").value.trim(),
+            serverPort,
+            idleShutdownMinutes: Number.isFinite(idleMinutes) ? idleMinutes : 0,
+            autoSyncIntervalMinutes: autoSyncMinutes,
+            jvmFlags: document.getElementById("cfg-jvm-flags").value.trim(),
+          }),
+        });
+        syncAutoSyncInputs(autoSyncMinutes);
+        showToast("Saved JVM and cluster configuration!", "success");
+        refreshServerStatus();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
   // Save server.properties
   document.getElementById("form-server-properties").addEventListener("submit", async (e) => {
     e.preventDefault();
+    const submitBtn = e.currentTarget.querySelector("button[type='submit']");
     const hcEl = document.getElementById("prop-hardcore");
     const netherEl = document.getElementById("prop-allow-nether");
     const endEl = document.getElementById("prop-disable-end");
@@ -2314,16 +3042,18 @@ document.addEventListener("DOMContentLoaded", () => {
       "level-seed": document.getElementById("prop-level-seed").value.trim(),
       "spawn-protection": spEl ? spEl.value : "0",
     };
-    try {
-      const res = await apiFetch("/api/admin/properties", {
-        method: "PUT",
-        body: JSON.stringify({ properties: updates }),
-      });
-      renderWorldGeneratorInfo(res.world, res.properties || updates);
-      showToast("Saved server.properties and synced to Shared Folder!", "success");
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(submitBtn, "Saving...", async () => {
+      try {
+        const res = await apiFetch("/api/admin/properties", {
+          method: "PUT",
+          body: JSON.stringify({ properties: updates }),
+        });
+        renderWorldGeneratorInfo(res.world, res.properties || updates, true);
+        showToast("Saved server.properties and synced to Shared Folder!", "success");
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
   // World Map & Seed Generator Controls
@@ -2336,8 +3066,7 @@ document.addEventListener("DOMContentLoaded", () => {
         showToast("No explicit seed set yet — generate or roll a seed first!", "info");
         return;
       }
-      navigator.clipboard.writeText(val);
-      showToast(`Copied world seed '${val}' to clipboard!`, "success");
+      copyTextToClipboard(val, `Copied world seed '${val}' to clipboard!`);
     });
   }
 
@@ -2470,7 +3199,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (seedInp && res.seed) {
           seedInp.value = String(res.seed);
         }
-        renderWorldGeneratorInfo(res.world, res.properties || {});
+        renderWorldGeneratorInfo(res.world, res.properties || {}, true);
         if (res.status) {
           renderStatusSummary(res.status);
         }
@@ -2496,6 +3225,7 @@ document.addEventListener("DOMContentLoaded", () => {
   if (formGamerules) {
     formGamerules.addEventListener("submit", async (e) => {
       e.preventDefault();
+      const submitBtn = e.currentTarget.querySelector("button[type='submit']");
       const sleepPct = parseInt(document.getElementById("gr-playersSleepingPercentage").value, 10);
       const tickSpeed = parseInt(document.getElementById("gr-randomTickSpeed").value, 10);
       const spawnRad = parseInt(document.getElementById("gr-spawnRadius").value, 10);
@@ -2513,15 +3243,17 @@ document.addEventListener("DOMContentLoaded", () => {
       if (Number.isFinite(sleepPct)) gamerules.playersSleepingPercentage = sleepPct;
       if (Number.isFinite(tickSpeed)) gamerules.randomTickSpeed = tickSpeed;
       if (Number.isFinite(spawnRad)) gamerules.spawnRadius = spawnRad;
-      try {
-        await apiFetch("/api/admin/gamerules", {
-          method: "PUT",
-          body: JSON.stringify({ gamerules }),
-        });
-        showToast("Saved & applied World Gamerules!", "success");
-      } catch (err) {
-        showToast(err.message, "error");
-      }
+      await runWithButtonBusy(submitBtn, "Saving...", async () => {
+        try {
+          await apiFetch("/api/admin/gamerules", {
+            method: "PUT",
+            body: JSON.stringify({ gamerules }),
+          });
+          showToast("Saved & applied World Gamerules!", "success");
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      });
     });
   }
 
@@ -2648,30 +3380,42 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("file-editor-box").classList.add("hidden");
   });
 
-  document.getElementById("btn-save-file").addEventListener("click", async () => {
+  document.getElementById("btn-save-file").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
     const content = document.getElementById("file-editor-textarea").value;
-    try {
-      await apiFetch("/api/admin/files/write", {
-        method: "POST",
-        body: JSON.stringify({ path: state.editingFilePath, content }),
-      });
-      state.editingFileSavedContent = content;
-      state.fileCache = {};
-      closeConfirmArmed = false;
-      btnCloseFile.textContent = "Close";
-      showToast(`Saved ${state.editingFilePath}!`, "success");
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(btn, "Saving...", async () => {
+      try {
+        await apiFetch("/api/admin/files/write", {
+          method: "POST",
+          body: JSON.stringify({ path: state.editingFilePath, content }),
+        });
+        state.editingFileSavedContent = content;
+        state.fileCache = {};
+        closeConfirmArmed = false;
+        btnCloseFile.textContent = "Close";
+        showToast(`Saved ${state.editingFilePath}!`, "success");
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
   document.getElementById("input-file-upload").addEventListener("change", (e) => {
     const fileInput = e.target;
     const file = fileInput.files[0];
     if (!file) return;
+    if (file.size > 35 * 1024 * 1024) {
+      showToast("File is larger than the 35 MB upload limit.", "error");
+      fileInput.value = "";
+      return;
+    }
     const reader = new FileReader();
+    reader.onerror = () => {
+      showToast(`Failed to read file '${file.name}'.`, "error");
+      fileInput.value = "";
+    };
     reader.onload = async () => {
-      const base64 = reader.result.split(",")[1];
+      const base64 = String(reader.result || "").split(",")[1] || "";
       try {
         await apiFetch("/api/admin/files/upload", {
           method: "POST",
@@ -2721,42 +3465,51 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   // Network & Sync Controls
-  document.getElementById("btn-save-public-address").addEventListener("click", async () => {
+  document.getElementById("btn-save-public-address").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
     const addr = document.getElementById("net-public-address").value.trim();
-    try {
-      await apiFetch("/api/admin/settings", {
-        method: "PUT",
-        body: JSON.stringify({ publicJoinAddress: addr }),
-      });
-      showToast("Updated shared Public Join Address!", "success");
-      refreshServerStatus();
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(btn, "Saving...", async () => {
+      try {
+        await apiFetch("/api/admin/settings", {
+          method: "PUT",
+          body: JSON.stringify({ publicJoinAddress: addr }),
+        });
+        showToast("Updated shared Public Join Address!", "success");
+        refreshServerStatus();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
-  document.getElementById("btn-save-playit-secret").addEventListener("click", async () => {
+  document.getElementById("btn-save-playit-secret").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
     const secretKey = document.getElementById("net-playit-secret").value.trim();
-    try {
-      await apiFetch("/api/admin/tunnel/secret", {
-        method: "POST",
-        body: JSON.stringify({ secretKey }),
-      });
-      document.getElementById("net-playit-secret").value = "";
-      showToast("Saved shared playit.gg secret key to Shared Folder!", "success");
-      refreshServerStatus();
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(btn, "Saving...", async () => {
+      try {
+        await apiFetch("/api/admin/tunnel/secret", {
+          method: "POST",
+          body: JSON.stringify({ secretKey }),
+        });
+        document.getElementById("net-playit-secret").value = "";
+        showToast("Saved shared playit.gg secret key to Shared Folder!", "success");
+        refreshServerStatus();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
-  document.getElementById("btn-install-playit").addEventListener("click", async () => {
-    try {
-      await apiFetch("/api/admin/tunnel/download", { method: "POST" });
-      showToast("Started downloading official playit.gg agent binary...", "info");
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+  document.getElementById("btn-install-playit").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    await runWithButtonBusy(btn, "Starting...", async () => {
+      try {
+        await apiFetch("/api/admin/tunnel/download", { method: "POST" });
+        showToast("Started downloading official playit.gg agent binary...", "info");
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
   bindSyncDirControls({
@@ -2766,30 +3519,45 @@ document.addEventListener("DOMContentLoaded", () => {
     onSaved: () => refreshServerStatus(),
   });
 
-  document.getElementById("btn-save-sync-toggles").addEventListener("click", async () => {
-    try {
-      await apiFetch("/api/admin/settings", {
-        method: "PUT",
-        body: JSON.stringify({
-          autoBackupOnStop: document.getElementById("net-auto-backup").checked,
-          gitSyncEnabled: document.getElementById("net-git-sync").checked,
-        }),
-      });
-      showToast("Saved synchronization preferences!", "success");
-    } catch (err) {
-      showToast(err.message, "error");
+  document.getElementById("btn-save-sync-toggles").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const autoSyncInp = document.getElementById("net-auto-sync-minutes");
+    const autoSyncMinutes = autoSyncInp ? parseInt(autoSyncInp.value, 10) : 10;
+    if (!Number.isFinite(autoSyncMinutes) || autoSyncMinutes < 0 || autoSyncMinutes > 1440) {
+      showToast("Drive Auto-Sync interval must be 0 (Off) or 1–1440 minutes.", "error");
+      return;
     }
+    await runWithButtonBusy(btn, "Saving...", async () => {
+      try {
+        await apiFetch("/api/admin/settings", {
+          method: "PUT",
+          body: JSON.stringify({
+            autoBackupOnStop: document.getElementById("net-auto-backup").checked,
+            gitSyncEnabled: document.getElementById("net-git-sync").checked,
+            autoSyncIntervalMinutes: autoSyncMinutes,
+          }),
+        });
+        syncAutoSyncInputs(autoSyncMinutes);
+        showToast("Saved synchronization preferences!", "success");
+        refreshServerStatus();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
-  document.getElementById("btn-force-unlock").addEventListener("click", async () => {
-    try {
-      await apiFetch("/api/admin/force-unlock", { method: "POST" });
-      showToast("Host lock forcefully released!", "success");
-      refreshServerStatus();
-    } catch (err) {
-      showToast(err.message, "error");
-    }
-  });
+  const btnForceUnlock = document.getElementById("btn-force-unlock");
+  if (btnForceUnlock) {
+    armTwoStepConfirm(btnForceUnlock, "Confirm Force-Unlock?", async () => {
+      try {
+        await apiFetch("/api/admin/force-unlock", { method: "POST" });
+        showToast("Host lock forcefully released!", "success");
+        refreshServerStatus();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
+  }
 
   // Boot app
   bootApp();

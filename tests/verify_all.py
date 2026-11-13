@@ -1197,6 +1197,42 @@ def run_verification():
             f"Remote host console logs missing on PC 1: {remote_log_texts}"
         )
 
+        # Simulate Google Drive splitting `locks/` into `locks (1)/` while `locks/host-telemetry.json` is empty!
+        bob_epoch_19 = res_19_stat["lock"]["lockEpoch"]
+        live_locks_conflict = pc1.ctx.sync_engine.shared_dir / "locks (1)"
+        live_locks_conflict.mkdir(exist_ok=True)
+        shutil.copy2(
+            pc1.ctx.sync_engine.locks_dir / f"session-{bob_epoch_19}.json",
+            live_locks_conflict / f"session-{bob_epoch_19}.json",
+        )
+        shutil.copy2(
+            pc1.ctx.sync_engine.host_telemetry_path,
+            live_locks_conflict / "host-telemetry.json",
+        )
+        # Inject a newer conflict-folder log entry while leaving main locks/host-telemetry.json cleared & stale
+        c_tel = json.loads((live_locks_conflict / "host-telemetry.json").read_text(encoding="utf-8"))
+        c_tel["logs"].append({
+            "id": f"{int(time.time() * 1000)}-conflict19",
+            "timestamp": "21:45:00",
+            "level": "INFO",
+            "source": "Minecraft",
+            "text": "[21:45:00] [Minecraft/INFO]: Conflict folder telemetry mirrored!",
+        })
+        c_tel["updatedAt"] = time.time() + 1.0
+        (live_locks_conflict / "host-telemetry.json").write_text(json.dumps(c_tel), encoding="utf-8")
+        (pc1.ctx.sync_engine.locks_dir / f"session-{bob_epoch_19}.json").unlink(missing_ok=True)
+        pc1.ctx.sync_engine.clear_host_telemetry()
+        # Running conflict cleanup must preserve live active remote locks (1) and mirror its console!
+        pc1.ctx.sync_engine._cleanup_cloud_conflict_files()
+        assert live_locks_conflict.exists(), "Live remote locks (1) folder must not be deleted mid-session!"
+        st_19_c, res_19_c = pc1.request("GET", "/api/server/status", token=admin_token)
+        assert st_19_c == 200
+        c_log_texts = [e.get("text", "") for e in res_19_c.get("logs", [])]
+        assert any("Conflict folder telemetry mirrored!" in txt for txt in c_log_texts), (
+            f"Expected conflict-folder remote console mirroring on PC 1, got: {c_log_texts}"
+        )
+        shutil.rmtree(live_locks_conflict, ignore_errors=True)
+
         # Frontend assertion for remote console mirroring guard
         js_app = (Path(__file__).resolve().parent.parent / "public" / "app.js").read_text(encoding="utf-8")
         assert "Live console mirrored from" in js_app, "Frontend missing remote host console mirror notice!"

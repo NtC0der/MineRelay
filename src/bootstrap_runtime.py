@@ -3,14 +3,18 @@ import re
 import sys
 import json
 import shutil
+import hashlib
+import tarfile
 import zipfile
+import platform
+import threading
 import subprocess
 import urllib.request
 from pathlib import Path
 from typing import Optional, Callable, Dict, List, Any, Tuple
 
-ADOPTIUM_JRE_WIN_X64_API_TMPL = (
-    "https://api.adoptium.net/v3/binary/latest/{major}/ga/windows/x64/jre/hotspot/normal/eclipse"
+ADOPTIUM_JRE_API_TMPL = (
+    "https://api.adoptium.net/v3/binary/latest/{major}/ga/{os_name}/{arch}/jre/hotspot/normal/eclipse"
 )
 USER_AGENT = "MineRelay/2.0 (https://github.com/NtC0der/MineRelay; contact@minerelay.local)"
 
@@ -81,13 +85,17 @@ def ensure_portable_java(
         return existing
 
     target_major = 25 if min_major >= 22 else 21
-    api_url = ADOPTIUM_JRE_WIN_X64_API_TMPL.format(major=target_major)
+    os_name = "windows" if sys.platform.startswith("win") else ("mac" if sys.platform == "darwin" else "linux")
+    machine = platform.machine().lower()
+    arch = "aarch64" if machine in ("arm64", "aarch64") else "x64"
+    api_url = ADOPTIUM_JRE_API_TMPL.format(major=target_major, os_name=os_name, arch=arch)
     folder_name = f"jre{target_major}"
 
     bin_dir.mkdir(parents=True, exist_ok=True)
     jre_root = bin_dir / folder_name
-    jre_root.mkdir(parents=True, exist_ok=True)
-    zip_path = bin_dir / f"temurin{target_major}-jre.zip"
+    ext = ".zip" if os_name == "windows" else ".tar.gz"
+    archive_path = bin_dir / f"temurin{target_major}-jre.{os.getpid()}.{threading.get_ident()}{ext}"
+    staging_root = bin_dir / f".jre{target_major}_staging_{os.getpid()}_{threading.get_ident()}"
 
     if log_fn:
         log_fn(
@@ -100,7 +108,7 @@ def ensure_portable_java(
             total = int(resp.headers.get("Content-Length", 0))
             downloaded = 0
             last_pct = -1
-            with open(zip_path, "wb") as out:
+            with open(archive_path, "wb") as out:
                 while True:
                     chunk = resp.read(131072)
                     if not chunk:
@@ -117,23 +125,55 @@ def ensure_portable_java(
 
         if log_fn:
             log_fn(f"Extracting Portable Java {target_major} JRE...")
-        jre_resolved = jre_root.resolve()
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for member in zf.infolist():
-                target_path = (jre_root / member.filename).resolve()
-                if not (target_path == jre_resolved or target_path.is_relative_to(jre_resolved)):
-                    raise ValueError(f"Zip path traversal detected in JRE archive: {member.filename}")
-                zf.extract(member, jre_root)
+        if staging_root.exists():
+            shutil.rmtree(staging_root, ignore_errors=True)
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staging_resolved = staging_root.resolve()
+        if os_name == "windows":
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                for member in zf.infolist():
+                    target_path = (staging_root / member.filename).resolve()
+                    if not (target_path == staging_resolved or target_path.is_relative_to(staging_resolved)):
+                        raise ValueError(f"Zip path traversal detected in JRE archive: {member.filename}")
+                    zf.extract(member, staging_root)
+        else:
+            with tarfile.open(archive_path, "r:gz") as tf:
+                for member in tf.getmembers():
+                    target_path = (staging_root / member.name).resolve()
+                    if not (target_path == staging_resolved or target_path.is_relative_to(staging_resolved)):
+                        raise ValueError(f"Tar path traversal detected in JRE archive: {member.name}")
+                    if member.issym() or member.islnk():
+                        link_target = (target_path.parent / member.linkname).resolve()
+                        if not link_target.is_relative_to(staging_resolved):
+                            raise ValueError(f"Unsafe symlink in JRE archive: {member.name}")
+                tf.extractall(staging_root)
+
+        exe_name = "java.exe" if sys.platform.startswith("win") else "java"
+        staged_java = next(
+            (c for c in staging_root.rglob(exe_name) if c.parent.name == "bin"),
+            None,
+        )
+        if not staged_java:
+            raise RuntimeError(f"Downloaded Java {target_major} archive but could not locate bin/{exe_name} inside.")
+
+        if jre_root.exists():
+            shutil.rmtree(jre_root, ignore_errors=True)
+        os.replace(staging_root, jre_root)
     finally:
         try:
-            if zip_path.exists():
-                zip_path.unlink(missing_ok=True)
+            if archive_path.exists():
+                archive_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            if staging_root.exists():
+                shutil.rmtree(staging_root, ignore_errors=True)
         except OSError:
             pass
 
     found = find_portable_java(bin_dir, min_major=min_major)
     if not found:
-        raise RuntimeError(f"Downloaded Java {target_major} archive but could not locate bin/java.exe inside.")
+        raise RuntimeError(f"Downloaded Java {target_major} archive but could not locate bin/java inside.")
     if log_fn:
         log_fn(f"Portable Java {target_major} JRE ready at: {found}")
     return found
@@ -141,6 +181,7 @@ def ensure_portable_java(
 
 _VERSIONS_CACHE: Optional[Dict[str, Any]] = None
 _VERSIONS_CACHE_TS: float = 0.0
+_VERSIONS_CACHE_LOCK = threading.Lock()
 
 
 def fetch_live_minecraft_versions() -> Dict[str, Any]:
@@ -182,8 +223,12 @@ def fetch_live_minecraft_versions() -> Dict[str, Any]:
         return result
 
     now = _time.time()
-    if _VERSIONS_CACHE is not None and (now - _VERSIONS_CACHE_TS) < 600:
-        return _VERSIONS_CACHE
+    with _VERSIONS_CACHE_LOCK:
+        if _VERSIONS_CACHE is not None and (now - _VERSIONS_CACHE_TS) < 600:
+            return dict(_VERSIONS_CACHE)
+
+    mojang_ok = False
+    paper_ok = False
 
     # 1. Query Mojang official manifest
     try:
@@ -203,6 +248,7 @@ def fetch_live_minecraft_versions() -> Dict[str, Any]:
         ][:25]
         if releases:
             result["vanilla"] = releases
+            mojang_ok = True
     except Exception:
         pass
 
@@ -220,17 +266,24 @@ def fetch_live_minecraft_versions() -> Dict[str, Any]:
             for group_versions in versions_map.values():
                 if isinstance(group_versions, list):
                     for v in group_versions:
-                        if isinstance(v, str) and "-" not in v:
+                        if isinstance(v, str) and "-" not in v and v not in paper_list:
                             paper_list.append(v)
         elif isinstance(versions_map, list):
             paper_list = [str(v) for v in versions_map if "-" not in str(v)]
         if paper_list:
+            # Prefer newest-first ordering using Mojang release order when available
+            if mojang_ok and result["vanilla"]:
+                order_idx = {v: i for i, v in enumerate(result["vanilla"])}
+                paper_list.sort(key=lambda v: (0, order_idx[v]) if v in order_idx else (1, 0))
             result["paper"] = paper_list[:25]
+            paper_ok = True
     except Exception:
         pass
 
-    _VERSIONS_CACHE = result
-    _VERSIONS_CACHE_TS = now
+    if mojang_ok or paper_ok:
+        with _VERSIONS_CACHE_LOCK:
+            _VERSIONS_CACHE = dict(result)
+            _VERSIONS_CACHE_TS = now
     return result
 
 
@@ -333,41 +386,60 @@ def ensure_paperclip_mojang_cache(
         parts = ctx_line.split("\t")
         if len(parts) < 3:
             return
-        _sha256, mojang_url, raw_filename = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        exp_sha256, mojang_url, raw_filename = parts[0].strip().lower(), parts[1].strip(), parts[2].strip()
         filename = Path(raw_filename).name
         if not filename or filename in (".", ".."):
             filename = "mojang_vanilla.jar"
         cache_dir = runtime_dir / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         target_cache_jar = cache_dir / filename
-        if target_cache_jar.exists() and target_cache_jar.stat().st_size > 1_000_000:
+
+        def _sha256_matches(path: Path) -> bool:
+            if len(exp_sha256) != 64:
+                return True
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(1048576), b""):
+                    h.update(chunk)
+            return h.hexdigest().lower() == exp_sha256
+
+        if target_cache_jar.exists() and target_cache_jar.stat().st_size > 1_000_000 and _sha256_matches(target_cache_jar):
             return
 
         if log_fn:
             log_fn(f"Pre-caching Paperclip base jar ({filename}) for fast startup...")
-        tmp_cache = target_cache_jar.with_suffix(f".tmp.{os.getpid()}.jar")
-        req = urllib.request.Request(mojang_url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            last_pct = -1
-            with open(tmp_cache, "wb") as out:
-                while True:
-                    chunk = resp.read(131072)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        pct = int((downloaded / total) * 100)
-                        if pct // 25 > last_pct // 25 and log_fn:
-                            last_pct = pct
-                            log_fn(
-                                f"Downloading base {filename}: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
-                            )
-        os.replace(tmp_cache, target_cache_jar)
-        if log_fn:
-            log_fn(f"Cached {filename} ({round(target_cache_jar.stat().st_size / (1024*1024), 1)} MB)")
+        tmp_cache = target_cache_jar.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}.jar")
+        try:
+            req = urllib.request.Request(mojang_url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                total = int(resp.headers.get("Content-Length", 0))
+                downloaded = 0
+                last_pct = -1
+                with open(tmp_cache, "wb") as out:
+                    while True:
+                        chunk = resp.read(131072)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = int((downloaded / total) * 100)
+                            if pct // 25 > last_pct // 25 and log_fn:
+                                last_pct = pct
+                                log_fn(
+                                    f"Downloading base {filename}: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
+                                )
+            if not _sha256_matches(tmp_cache):
+                raise RuntimeError(f"Checksum mismatch for Paperclip base jar {filename}")
+            os.replace(tmp_cache, target_cache_jar)
+            if log_fn:
+                log_fn(f"Cached {filename} ({round(target_cache_jar.stat().st_size / (1024*1024), 1)} MB)")
+        finally:
+            try:
+                if tmp_cache.exists():
+                    tmp_cache.unlink(missing_ok=True)
+            except OSError:
+                pass
     except Exception:
         pass
 
@@ -409,11 +481,20 @@ def ensure_server_jar(
         log_fn(f"Resolving {software.upper()} {version} server.jar download URL...")
 
     download_url, resolved_sw, resolved_ver = resolve_papermc_or_mojang_url(software, version, log_fn=log_fn)
+    target_jar = get_versioned_jar_path(resolved_bin_dir, resolved_sw, resolved_ver)
+
+    if not force and target_jar.exists() and target_jar.stat().st_size > 1_000_000:
+        ensure_paperclip_mojang_cache(target_jar, runtime_dir, log_fn=log_fn)
+        try:
+            shutil.copy2(target_jar, runtime_dir / "server.jar")
+        except OSError:
+            pass
+        return target_jar
 
     if log_fn:
         log_fn(f"Downloading Minecraft {resolved_sw.upper()} {resolved_ver} server.jar...")
 
-    tmp_jar = versioned_jar.with_suffix(f".tmp.{os.getpid()}.jar")
+    tmp_jar = target_jar.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}.jar")
     req = urllib.request.Request(download_url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=120) as resp:
@@ -435,24 +516,24 @@ def ensure_server_jar(
                                 f"Downloading {resolved_sw.upper()} {resolved_ver} server.jar: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
                             )
 
-        os.replace(tmp_jar, versioned_jar)
+        os.replace(tmp_jar, target_jar)
     finally:
         try:
             if tmp_jar.exists():
                 tmp_jar.unlink(missing_ok=True)
         except OSError:
             pass
-    ensure_paperclip_mojang_cache(versioned_jar, runtime_dir, log_fn=log_fn)
+    ensure_paperclip_mojang_cache(target_jar, runtime_dir, log_fn=log_fn)
     try:
-        shutil.copy2(versioned_jar, runtime_dir / "server.jar")
+        shutil.copy2(target_jar, runtime_dir / "server.jar")
     except OSError:
         pass
 
     if log_fn:
         log_fn(
-            f"Installed {resolved_sw.upper()} {resolved_ver} ({round(versioned_jar.stat().st_size / (1024*1024), 1)} MB)"
+            f"Installed {resolved_sw.upper()} {resolved_ver} ({round(target_jar.stat().st_size / (1024*1024), 1)} MB)"
         )
-    return versioned_jar
+    return target_jar
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ else:
 if str(BUNDLE_DIR) not in sys.path:
     sys.path.insert(0, str(BUNDLE_DIR))
 
+from src.models import AUTO_SYNC_DEFAULT_MINUTES, AUTO_SYNC_MAX_MINUTES, _safe_bool
 from src.sync_engine import SyncEngine, HostLockConflictError
 from src.auth_service import AuthService, AuthError, PermissionDeniedError
 from src.tunnel_manager import TunnelManager
@@ -85,48 +86,122 @@ class AppContext:
     def _remote_lock_watcher_loop(self) -> None:
         """Polls shared host lock & remote telemetry state every 3s and pushes instant SSE updates to dashboards."""
         last_sig: Any = None
+        last_remote_epoch: str = ""
         seen_remote_log_ids: set = set()
+        last_remote_log_count: int = 0
+        last_remote_tail_id: str = ""
+
+        def _file_sig(path: Path) -> Any:
+            try:
+                if path.exists():
+                    st = path.stat()
+                    return (st.st_mtime_ns, st.st_size)
+            except OSError:
+                pass
+            return None
+
         while True:
             time.sleep(3.0)
             try:
                 with self.sse_mutex:
                     has_clients = len(self.sse_clients) > 0
-                if not has_clients:
-                    continue
                 lock = self.sync_engine.get_lock()
                 remote_tel = None
-                if lock.is_actively_locked() and not self.sync_engine.is_locked_by_current_machine(lock):
+                remote_epoch_changed = False
+                logs_reset = False
+                unseen_logs: List[Dict[str, Any]] = []
+                is_remote_active = lock.is_actively_locked() and not self.sync_engine.is_locked_by_current_machine(lock)
+
+                if is_remote_active:
+                    cur_epoch = lock.lock_epoch or f"legacy-{lock.machine_id}-{int(lock.started_at)}"
+                    if cur_epoch != last_remote_epoch:
+                        seen_remote_log_ids.clear()
+                        remote_epoch_changed = True
+                        last_remote_epoch = cur_epoch
+                        last_remote_log_count = 0
+                        last_remote_tail_id = ""
                     remote_tel = self.sync_engine.read_host_telemetry(expected_epoch=lock.lock_epoch)
                     if remote_tel and isinstance(remote_tel.get("logs"), list):
-                        for entry in remote_tel["logs"][-40:]:
+                        tel_logs = remote_tel["logs"][-120:]
+                        tel_ids = [
+                            str(e.get("id")) for e in tel_logs if isinstance(e, dict) and e.get("id")
+                        ]
+                        cur_tail_id = tel_ids[-1] if tel_ids else ""
+                        if not remote_epoch_changed and last_remote_tail_id and (
+                            last_remote_tail_id not in tel_ids or len(tel_logs) < last_remote_log_count
+                        ):
+                            logs_reset = True
+                            seen_remote_log_ids.clear()
+                        for entry in tel_logs:
                             eid = entry.get("id") if isinstance(entry, dict) else None
                             if eid and eid not in seen_remote_log_ids:
                                 seen_remote_log_ids.add(eid)
-                                self.broadcast_event("console_log", entry)
+                                unseen_logs.append(entry)
+                        last_remote_log_count = len(tel_logs)
+                        last_remote_tail_id = cur_tail_id
                         if len(seen_remote_log_ids) > 600:
-                            seen_remote_log_ids = {
-                                e.get("id") for e in remote_tel["logs"][-120:] if isinstance(e, dict) and e.get("id")
-                            }
+                            seen_remote_log_ids = set(tel_ids)
                 elif not lock.is_actively_locked():
                     seen_remote_log_ids.clear()
+                    last_remote_epoch = ""
+                    last_remote_log_count = 0
+                    last_remote_tail_id = ""
 
+                tel_auto = (remote_tel or {}).get("autoSync") if isinstance(remote_tel, dict) else None
                 sig = (
                     lock.is_locked,
                     lock.is_stale(),
                     lock.host_username,
+                    lock.host_user_id,
                     lock.machine_id,
+                    lock.machine_name,
                     lock.status,
                     lock.lock_epoch,
+                    lock.started_at,
+                    lock.server_ready_at,
                     tuple(lock.online_players),
+                    lock.max_players,
+                    lock.mc_version,
                     lock.public_address,
                     lock.tunnel_status,
                     lock.memory_used_mb,
+                    lock.memory_max_mb,
                     lock.cpu_percent,
                     lock.tps,
                     (remote_tel or {}).get("updatedAt") if remote_tel else None,
+                    (remote_tel or {}).get("status") if remote_tel else None,
+                    tuple((remote_tel or {}).get("onlinePlayers") or ()) if isinstance(remote_tel, dict) else (),
+                    (remote_tel or {}).get("publicAddress") if remote_tel else None,
+                    (remote_tel or {}).get("tunnelStatus") if remote_tel else None,
+                    (remote_tel or {}).get("lastError") if remote_tel else None,
+                    (tel_auto.get("inProgress"), tel_auto.get("lastSyncAt"), tel_auto.get("lastSyncStatus"))
+                    if isinstance(tel_auto, dict)
+                    else None,
+                    _file_sig(self.sync_engine.cluster_config_path),
+                    _file_sig(self.sync_engine.sync_manifest_path),
+                    self.mc_manager.local_status,
+                    self.tunnel_manager.status,
+                    self.tunnel_manager.public_address,
                 )
-                if last_sig is not None and sig != last_sig:
-                    self.broadcast_event("status_changed", self.mc_manager.get_status_summary())
+
+                if has_clients:
+                    should_emit_logs = (last_sig is not None) and (not remote_epoch_changed) and (not logs_reset)
+                    if should_emit_logs and 0 < len(unseen_logs) <= 25:
+                        for entry in unseen_logs:
+                            self.broadcast_event("console_log", entry)
+
+                    need_status_push = (
+                        (last_sig is not None and (sig != last_sig or remote_epoch_changed or logs_reset))
+                        or (should_emit_logs and len(unseen_logs) > 25)
+                    )
+                    if need_status_push:
+                        summary = self.mc_manager.get_status_summary()
+                        if remote_epoch_changed or logs_reset or len(unseen_logs) > 25:
+                            if remote_tel and isinstance(remote_tel.get("logs"), list):
+                                summary["logs"] = list(remote_tel["logs"][-120:])
+                            elif remote_epoch_changed or logs_reset:
+                                summary["logs"] = []
+                        self.broadcast_event("status_changed", summary)
                 last_sig = sig
             except Exception:
                 pass
@@ -166,8 +241,12 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
             return None
 
         def _require_int(self, val: Any, field_name: str) -> int:
-            if val is None or isinstance(val, bool):
+            if val is None or isinstance(val, (bool, float)):
                 raise ValueError(f"Field '{field_name}' must be an integer, got {type(val).__name__}.")
+            if isinstance(val, str):
+                s = val.strip()
+                if not s or not (s.isdigit() or (s[0] in "+-" and s[1:].isdigit())):
+                    raise ValueError(f"Field '{field_name}' must be an integer.")
             try:
                 return int(val)
             except (ValueError, TypeError):
@@ -193,7 +272,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
 
         def _send_json(self, status_code: int, data: Any) -> None:
             try:
-                body = json.dumps(data).encode("utf-8")
+                body = json.dumps(data, default=str).encode("utf-8")
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -238,6 +317,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         "cloudFolders": ctx.sync_engine.detect_cloud_folders(),
                         "syncDiagnostics": ctx.sync_engine.get_sync_diagnostics(),
                         "serverName": cfg.server_name if cfg else "Shared Minecraft Server",
+                        "autoSyncIntervalMinutes": cfg.auto_sync_interval_minutes if cfg else AUTO_SYNC_DEFAULT_MINUTES,
                     })
                     return
 
@@ -268,6 +348,30 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     return
 
                 # ---------------- ADMIN ONLY GET ROUTES ----------------
+                if path == "/api/admin/settings":
+                    ctx.auth_service.require_admin(token)
+                    cfg = ctx.sync_engine.load_cluster_config()
+                    if not cfg:
+                        raise ValueError("Cluster not initialized.")
+                    auto_sync_info = (
+                        ctx.mc_manager.get_auto_sync_status()
+                        if hasattr(ctx.mc_manager, "get_auto_sync_status")
+                        else {
+                            "enabled": cfg.auto_sync_interval_minutes > 0,
+                            "intervalMinutes": cfg.auto_sync_interval_minutes,
+                            "inProgress": False,
+                            "lastSyncAt": 0.0,
+                            "nextSyncAt": 0.0,
+                            "lastSyncStatus": "idle",
+                            "lastSyncError": "",
+                        }
+                    )
+                    self._send_json(200, {
+                        "cluster": cfg.to_dict(include_secrets=False),
+                        "autoSync": auto_sync_info,
+                    })
+                    return
+
                 if path == "/api/admin/accounts":
                     ctx.auth_service.require_admin(token)
                     cfg = ctx.sync_engine.load_cluster_config()
@@ -305,9 +409,10 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
 
                 if path == "/api/admin/backups/download":
                     ctx.auth_service.require_admin(token)
-                    name = Path(qs.get("name", [""])[0]).name
-                    if not name:
-                        raise ValueError("Backup name is required.")
+                    raw_name = Path(qs.get("name", [""])[0]).name
+                    name = "".join(c for c in raw_name if c.isalnum() or c in (".", "-", "_"))
+                    if not name or name != raw_name:
+                        raise ValueError("Invalid backup name.")
                     bk_path = ctx.sync_engine.backups_dir / name
                     if not bk_path.exists() or not bk_path.is_file():
                         raise FileNotFoundError(f"Backup '{name}' not found.")
@@ -449,6 +554,12 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
 
                 if path == "/api/server/restart":
                     user = ctx.auth_service.require_auth(token)
+                    if ctx.mc_manager.local_status == "idle":
+                        lock = ctx.sync_engine.get_lock()
+                        if lock.is_actively_locked() and not ctx.sync_engine.is_locked_by_current_machine(lock):
+                            raise HostLockConflictError(
+                                f"Cannot restart active remote server hosted by '{lock.host_username}' ({lock.machine_name})."
+                            )
                     summary = ctx.mc_manager.restart_hosting(user)
                     self._send_json(200, summary)
                     return
@@ -463,6 +574,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         username=username,
                         custom_passkey=custom_pk,
                     )
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
                     self._send_json(201, {
                         "account": member.to_public_dict(),
                         "generatedPasskey": raw_pk,
@@ -473,6 +585,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     ctx.auth_service.require_admin(token)
                     target_id = str(body.get("userId", ""))
                     acc, new_pk = ctx.auth_service.rotate_passkey(token or "", target_id)
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
                     self._send_json(200, {
                         "account": acc.to_public_dict(),
                         "generatedPasskey": new_pk,
@@ -484,6 +597,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     target_id = str(body.get("userId", ""))
                     new_username = str(body.get("username", ""))
                     acc = ctx.auth_service.rename_account(token or "", target_id, new_username)
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
                     self._send_json(200, {"account": acc.to_public_dict()})
                     return
 
@@ -501,6 +615,8 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
 
                 if path == "/api/admin/install-jar":
                     ctx.auth_service.require_admin(token)
+                    if ctx.mc_manager.local_status != "idle":
+                        raise ValueError("Cannot install or switch server JAR while this server is starting or running.")
                     software = str(body.get("software", "paper"))
                     version = str(body.get("version", "26.3"))
                     res = ctx.mc_manager.download_server_jar(software, version)
@@ -533,6 +649,8 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                 if path == "/api/admin/backups":
                     admin_user = ctx.auth_service.require_admin(token)
                     lock = ctx.sync_engine.get_lock()
+                    if ctx.mc_manager.local_status not in ("idle", "running"):
+                        raise ValueError(f"Cannot create backup while server is in '{ctx.mc_manager.local_status}' state.")
                     if ctx.mc_manager.local_status == "idle":
                         if lock.is_locked and not ctx.sync_engine.is_locked_by_current_machine(lock):
                             raise HostLockConflictError(
@@ -595,13 +713,17 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     ctx.auth_service.require_admin(token)
                     secret_key = str(body.get("secretKey", ""))
                     ctx.tunnel_manager.save_secret_key(secret_key)
-                    self._send_json(200, ctx.tunnel_manager.get_state())
+                    t_state = ctx.tunnel_manager.get_state()
+                    ctx.broadcast_event("tunnel_updated", t_state)
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
+                    self._send_json(200, t_state)
                     return
 
                 if path == "/api/admin/force-unlock":
                     ctx.auth_service.require_admin(token)
                     lock = ctx.sync_engine.force_unlock()
                     ctx.mc_manager._log("Emergency Force-Unlock executed by Admin.", "WARN", "SyncEngine")
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
                     self._send_json(200, {"unlocked": True, "lock": lock.to_dict()})
                     return
 
@@ -612,13 +734,13 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     level_type = body.get("levelType")
                     generate_structures = body.get("generateStructures")
                     raw_dis_end = body.get("disableEnd") if body.get("disableEnd") is not None else body.get("disable-end")
-                    disable_end = bool(raw_dis_end) if raw_dis_end is not None else None
-                    backup_existing = bool(body.get("backupExisting", True))
+                    disable_end = _safe_bool(raw_dis_end) if raw_dis_end is not None else None
+                    backup_existing = _safe_bool(body.get("backupExisting"), True)
                     res = ctx.mc_manager.generate_new_world(
                         mode=mode,
                         seed=seed,
                         level_type=str(level_type) if level_type is not None else None,
-                        generate_structures=bool(generate_structures) if generate_structures is not None else None,
+                        generate_structures=_safe_bool(generate_structures) if generate_structures is not None else None,
                         disable_end=disable_end,
                         backup_existing=backup_existing,
                         user=admin_user,
@@ -644,6 +766,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     if not isinstance(updates, dict):
                         raise ValueError("Properties must be an object.")
                     props = ctx.mc_manager.update_server_properties(updates)
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
                     self._send_json(200, {
                         "properties": props,
                         "world": ctx.mc_manager.get_world_info(),
@@ -656,78 +779,105 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     if not isinstance(updates, dict):
                         raise ValueError("Gamerules must be an object.")
                     gr = ctx.mc_manager.update_gamerules(updates)
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
                     self._send_json(200, {"gamerules": gr})
                     return
 
                 if path == "/api/admin/settings":
                     ctx.auth_service.require_admin(token)
-                    cfg = ctx.sync_engine.load_cluster_config()
-                    if not cfg:
-                        raise ValueError("Cluster not initialized.")
+                    auto_sync_changed = False
+                    with ctx.auth_service._config_mutex:
+                        cfg = ctx.sync_engine.load_cluster_config()
+                        if not cfg:
+                            raise ValueError("Cluster not initialized.")
 
-                    if "serverName" in body:
-                        cfg.server_name = str(body["serverName"]).strip() or cfg.server_name
-                    if "mcSoftware" in body:
-                        sw = str(body["mcSoftware"]).strip().lower()
-                        if sw not in ("paper", "vanilla"):
-                            raise ValueError("mcSoftware must be 'paper' or 'vanilla'.")
-                        cfg.mc_software = sw
-                    if "mcVersion" in body:
-                        ver = str(body["mcVersion"]).strip()
-                        if not ver:
-                            raise ValueError("mcVersion cannot be empty.")
-                        cfg.mc_version = ver
-                    new_mem_min = max(512, self._require_int(body["memoryMinMb"], "memoryMinMb")) if "memoryMinMb" in body else cfg.memory_min_mb
-                    new_mem_max = max(512, self._require_int(body["memoryMaxMb"], "memoryMaxMb")) if "memoryMaxMb" in body else cfg.memory_max_mb
-                    if new_mem_min > new_mem_max:
-                        if "memoryMaxMb" in body and "memoryMinMb" not in body:
-                            new_mem_min = new_mem_max
-                        else:
-                            new_mem_max = new_mem_min
-                    cfg.memory_min_mb = new_mem_min
-                    cfg.memory_max_mb = new_mem_max
-                    if "javaPath" in body:
-                        cfg.java_path = str(body["javaPath"]).strip() or "java"
-                    if "jvmFlags" in body:
-                        cfg.jvm_flags = str(body["jvmFlags"]).strip()
-                    if "serverPort" in body:
-                        port = self._require_int(body["serverPort"], "serverPort")
-                        if not (1 <= port <= 65535):
-                            raise ValueError("Server port must be between 1 and 65535.")
-                        cfg.server_port = port
-                        if ctx.mc_manager.local_status == "idle":
-                            try:
-                                ctx.mc_manager.update_server_properties({"server-port": str(port)})
-                            except Exception:
-                                pass
-                    if "tunnelEnabled" in body:
-                        cfg.tunnel_enabled = bool(body["tunnelEnabled"])
-                    if "tunnelProvider" in body:
-                        cfg.tunnel_provider = str(body["tunnelProvider"]).strip()
-                    if "publicJoinAddress" in body:
-                        cfg.public_join_address = str(body["publicJoinAddress"]).strip()
-                    if "gitSyncEnabled" in body:
-                        cfg.git_sync_enabled = bool(body["gitSyncEnabled"])
-                    if "autoBackupOnStop" in body:
-                        cfg.auto_backup_on_stop = bool(body["autoBackupOnStop"])
-                    if "maxBackups" in body:
-                        cfg.max_backups = max(1, self._require_int(body["maxBackups"], "maxBackups"))
-                    if "idleShutdownMinutes" in body:
-                        cfg.idle_shutdown_minutes = max(0, self._require_int(body["idleShutdownMinutes"], "idleShutdownMinutes"))
+                        if "serverName" in body:
+                            cfg.server_name = str(body["serverName"]).strip() or cfg.server_name
+                        if "mcSoftware" in body:
+                            sw = str(body["mcSoftware"]).strip().lower()
+                            if sw not in ("paper", "vanilla"):
+                                raise ValueError("mcSoftware must be 'paper' or 'vanilla'.")
+                            cfg.mc_software = sw
+                        if "mcVersion" in body:
+                            ver = str(body["mcVersion"]).strip()
+                            if not ver:
+                                raise ValueError("mcVersion cannot be empty.")
+                            cfg.mc_version = ver
+                        new_mem_min = max(512, self._require_int(body["memoryMinMb"], "memoryMinMb")) if "memoryMinMb" in body else cfg.memory_min_mb
+                        new_mem_max = max(512, self._require_int(body["memoryMaxMb"], "memoryMaxMb")) if "memoryMaxMb" in body else cfg.memory_max_mb
+                        if new_mem_min > new_mem_max:
+                            if "memoryMaxMb" in body and "memoryMinMb" not in body:
+                                new_mem_min = new_mem_max
+                            else:
+                                new_mem_max = new_mem_min
+                        cfg.memory_min_mb = new_mem_min
+                        cfg.memory_max_mb = new_mem_max
+                        if "javaPath" in body:
+                            cfg.java_path = str(body["javaPath"]).strip() or "java"
+                        if "jvmFlags" in body:
+                            cfg.jvm_flags = str(body["jvmFlags"]).strip()
+                        if "serverPort" in body:
+                            port = self._require_int(body["serverPort"], "serverPort")
+                            if not (1 <= port <= 65535):
+                                raise ValueError("Server port must be between 1 and 65535.")
+                            if port != cfg.server_port:
+                                if ctx.mc_manager.local_status == "idle":
+                                    lock = ctx.sync_engine.get_lock()
+                                    if lock.is_actively_locked() and not ctx.sync_engine.is_locked_by_current_machine(lock):
+                                        raise HostLockConflictError(
+                                            f"Cannot change serverPort while '{lock.host_username}' ({lock.machine_name}) is actively hosting."
+                                        )
+                                    ctx.mc_manager.update_server_properties({"server-port": str(port)})
+                                cfg.server_port = port
+                        if "tunnelEnabled" in body:
+                            cfg.tunnel_enabled = _safe_bool(body["tunnelEnabled"], cfg.tunnel_enabled)
+                        if "tunnelProvider" in body:
+                            cfg.tunnel_provider = str(body["tunnelProvider"]).strip()
+                        if "publicJoinAddress" in body:
+                            cfg.public_join_address = str(body["publicJoinAddress"]).strip()
+                        if "gitSyncEnabled" in body:
+                            cfg.git_sync_enabled = _safe_bool(body["gitSyncEnabled"], cfg.git_sync_enabled)
+                        if "autoBackupOnStop" in body:
+                            cfg.auto_backup_on_stop = _safe_bool(body["autoBackupOnStop"], cfg.auto_backup_on_stop)
+                        if "maxBackups" in body:
+                            cfg.max_backups = max(1, self._require_int(body["maxBackups"], "maxBackups"))
+                        if "idleShutdownMinutes" in body:
+                            idle_min = self._require_int(body["idleShutdownMinutes"], "idleShutdownMinutes")
+                            if idle_min < 0 or idle_min > AUTO_SYNC_MAX_MINUTES:
+                                raise ValueError(f"idleShutdownMinutes must be between 0 and {AUTO_SYNC_MAX_MINUTES}.")
+                            cfg.idle_shutdown_minutes = idle_min
+                        if "autoSyncIntervalMinutes" in body:
+                            sync_min = self._require_int(body["autoSyncIntervalMinutes"], "autoSyncIntervalMinutes")
+                            if sync_min < 0 or sync_min > AUTO_SYNC_MAX_MINUTES:
+                                raise ValueError(
+                                    f"autoSyncIntervalMinutes must be 0 (disabled) or between 1 and {AUTO_SYNC_MAX_MINUTES}."
+                                )
+                            auto_sync_changed = sync_min != cfg.auto_sync_interval_minutes
+                            cfg.auto_sync_interval_minutes = sync_min
 
-                    ctx.sync_engine.save_cluster_config(cfg)
+                        ctx.sync_engine.save_cluster_config(cfg)
 
                     if "machineName" in body and str(body["machineName"]).strip():
                         ctx.sync_engine.local_config.machine_name = str(body["machineName"]).strip()
                         ctx.sync_engine.save_local_config()
 
-                    # If active lock is held locally, update publicJoinAddress immediately
+                    # If active lock is held locally, update publicJoinAddress without erasing active tunnel address
                     if ctx.sync_engine.is_locked_by_current_machine() and "publicJoinAddress" in body:
-                        ctx.sync_engine.update_lock_state(public_address=cfg.public_join_address)
+                        effective_pub = cfg.public_join_address or ctx.tunnel_manager.public_address
+                        if cfg.public_join_address:
+                            with ctx.tunnel_manager._mutex:
+                                ctx.tunnel_manager.public_address = cfg.public_join_address
+                        if effective_pub:
+                            ctx.sync_engine.update_lock_state(public_address=effective_pub)
 
+                    if auto_sync_changed and hasattr(ctx.mc_manager, "notify_auto_sync_schedule_changed"):
+                        ctx.mc_manager.notify_auto_sync_schedule_changed()
+
+                    summary = ctx.mc_manager.get_status_summary()
+                    ctx.broadcast_event("status_changed", summary)
                     self._send_json(200, {
                         "cluster": cfg.to_dict(include_secrets=False),
-                        "status": ctx.mc_manager.get_status_summary(),
+                        "status": summary,
                     })
                     return
 
@@ -747,6 +897,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     target_id = unquote(path.split("/api/admin/accounts/", 1)[1])
                     ctx.auth_service.delete_member_account(token or "", target_id)
                     cfg = ctx.sync_engine.load_cluster_config()
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
                     self._send_json(200, {
                         "deleted": True,
                         "accounts": [a.to_public_dict() for a in (cfg.accounts if cfg else [])],
@@ -794,7 +945,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                 init_payload = json.dumps({
                     "event": "connected",
                     "data": init_summary,
-                })
+                }, default=str)
                 self.wfile.write(f"data: {init_payload}\n\n".encode("utf-8"))
                 self.wfile.flush()
 
@@ -804,7 +955,11 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         self.wfile.write(f"data: {msg}\n\n".encode("utf-8"))
                         self.wfile.flush()
                     except queue.Empty:
-                        ping_payload = json.dumps({"event": "heartbeat", "data": {"ts": time.time()}})
+                        with ctx.sse_mutex:
+                            still_registered = client_q in ctx.sse_clients
+                        if not still_registered:
+                            break
+                        ping_payload = json.dumps({"event": "heartbeat", "data": {"ts": time.time()}}, default=str)
                         self.wfile.write(f"data: {ping_payload}\n\n".encode("utf-8"))
                         self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError, OSError):
@@ -917,9 +1072,9 @@ if __name__ == "__main__":
                         continue
                     pname = (p.info.get("name") or "").lower()
                     cmdline = " ".join(p.info.get("cmdline") or []).lower()
-                    if ("python" in pname and "server.py" in cmdline) or ("minerelay" in pname):
+                    if ("python" in pname and ("server.py" in cmdline or "src.server" in cmdline)) or ("minerelay" in pname):
                         p.terminate()
-                        p.wait(timeout=3)
+                        p.wait(timeout=8)
                 except Exception:
                     pass
     except Exception:
@@ -927,26 +1082,30 @@ if __name__ == "__main__":
 
     srv = run_server(port=port_arg, open_browser=auto_open)
     _shutdown_done = False
+    _shutdown_lock = threading.Lock()
 
     def _graceful_shutdown(*_args: Any) -> None:
         global _shutdown_done
-        if _shutdown_done:
-            return
-        _shutdown_done = True
-        ctx: AppContext = getattr(srv, "app_context", None)  # type: ignore
-        if ctx:
-            if ctx.mc_manager.local_status != "idle":
-                print("\nSaving Minecraft world to Shared Folder and releasing host lock before exit...")
-                try:
-                    ctx.mc_manager.stop_hosting()
-                except Exception as e:
-                    print(f"Shutdown sync notice: {e}")
-            else:
-                try:
-                    ctx.mc_manager._stop_any_runtime_java_processes()
-                    ctx.tunnel_manager.stop_tunnel()
-                except Exception:
-                    pass
+        with _shutdown_lock:
+            if _shutdown_done:
+                return
+            _shutdown_done = True
+            ctx: AppContext = getattr(srv, "app_context", None)  # type: ignore
+            if ctx:
+                if ctx.mc_manager.local_status != "idle":
+                    print("\nSaving Minecraft world to Shared Folder and releasing host lock before exit...")
+                    try:
+                        ctx.mc_manager.stop_hosting()
+                    except Exception as e:
+                        print(f"Shutdown sync notice: {e}")
+                else:
+                    try:
+                        ctx.mc_manager._stop_any_runtime_java_processes()
+                        ctx.tunnel_manager.stop_tunnel()
+                        if ctx.sync_engine.is_locked_by_current_machine():
+                            ctx.sync_engine.release_lock()
+                    except Exception:
+                        pass
 
     atexit.register(_graceful_shutdown)
     for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):

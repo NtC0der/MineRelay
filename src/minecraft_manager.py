@@ -7,6 +7,7 @@ import time
 import socket
 import shutil
 import base64
+import binascii
 import hashlib
 import secrets
 import threading
@@ -50,8 +51,13 @@ class MinecraftManager:
 
         self._mutex = threading.RLock()
         self._lifecycle_lock = threading.RLock()
+        self._stdin_lock = threading.RLock()
+        self._metrics_lock = threading.Lock()
+        self._jar_dl_lock = threading.Lock()
+        self._world_info_lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
         self._psutil_proc: Optional[Any] = None
+        self._last_metrics_sample_at: float = 0.0
         self._save_complete_event = threading.Event()
         self._sim_running: bool = False
         self._sim_stop_event = threading.Event()
@@ -64,6 +70,9 @@ class MinecraftManager:
         self._last_player_active_at: float = 0.0
         self._last_tps_warn_at: float = 0.0
         self._last_telemetry_publish_at: float = 0.0
+        self._telemetry_flush_timer: Optional[threading.Timer] = None
+        self._telemetry_lock = threading.Lock()
+        self._log_seq: int = 0
         self.online_players: List[str] = []
         self.console_logs: List[Dict[str, Any]] = []
         self.tps: float = 20.0
@@ -71,6 +80,21 @@ class MinecraftManager:
         self.cpu_percent: float = 0.0
         self.runtime_mode: str = "none"  # 'java' | 'embedded' | 'none'
         self.last_error: str = ""
+        self._active_max_players: int = 20
+        self._active_server_port: int = 25565
+
+        self._world_info_cache: Optional[Dict[str, Any]] = None
+        self._world_info_cache_ts: float = 0.0
+        self._cached_tunnel_state: Optional[Dict[str, Any]] = None
+        self._cached_tunnel_state_ts: float = 0.0
+        self._cached_tel_cfg: Optional[Any] = None
+        self._cached_tel_cfg_ts: float = 0.0
+
+        self._auto_sync_wakeup = threading.Event()
+        self._auto_sync_in_progress: bool = False
+        self._last_auto_sync_at: float = 0.0
+        self._last_auto_sync_status: str = "idle"
+        self._last_auto_sync_error: str = ""
 
         self.jar_downloading: bool = False
         self.jar_download_progress: int = 0
@@ -84,12 +108,48 @@ class MinecraftManager:
         if os.environ.get("MINERELAY_TEST_MODE") != "1":
             self._recover_orphaned_session_on_boot()
             threading.Thread(target=self._idle_shutdown_watchdog_loop, daemon=True, name="IdleShutdownWatchdog").start()
+            threading.Thread(target=self._auto_sync_loop, daemon=True, name="PeriodicDriveAutoSync").start()
+
+    @staticmethod
+    def _safe_int_prop(props: Dict[str, str], key: str, default: int, min_val: Optional[int] = None, max_val: Optional[int] = None) -> int:
+        raw = props.get(key, "")
+        try:
+            val = int(str(raw).strip()) if str(raw).strip() else default
+        except (ValueError, TypeError):
+            val = default
+        if min_val is not None:
+            val = max(min_val, val)
+        if max_val is not None:
+            val = min(max_val, val)
+        return val
+
+    @staticmethod
+    def _is_proc_alive(proc_ref: Optional[Any]) -> bool:
+        if proc_ref is None:
+            return False
+        poll_fn = getattr(proc_ref, "poll", None)
+        if callable(poll_fn):
+            return poll_fn() is None
+        return True
+
+    def _write_stdin(self, proc_ref: Optional[subprocess.Popen], payload: str) -> bool:
+        if proc_ref is None or getattr(proc_ref, "stdin", None) is None:
+            return False
+        if not self._is_proc_alive(proc_ref):
+            return False
+        with self._stdin_lock:
+            try:
+                proc_ref.stdin.write(payload)
+                proc_ref.stdin.flush()
+                return True
+            except (OSError, ValueError):
+                return False
 
     def _idle_shutdown_watchdog_loop(self) -> None:
         while True:
             time.sleep(15.0)
             try:
-                if self.local_status != "running":
+                if self.local_status != "running" or not self._reached_running:
                     continue
                 cfg = self.sync_engine.load_cluster_config()
                 if not cfg or cfg.idle_shutdown_minutes <= 0:
@@ -99,7 +159,7 @@ class MinecraftManager:
                 if has_players:
                     self._last_player_active_at = time.time()
                     continue
-                ref_time = max(self.started_at, self._last_player_active_at)
+                ref_time = max(self.server_ready_at or self.started_at, self._last_player_active_at)
                 if ref_time > 0 and (time.time() - ref_time) >= (cfg.idle_shutdown_minutes * 60):
                     self._log(
                         f"Idle Auto-Shutdown: 0 players online for {cfg.idle_shutdown_minutes} minute(s). Automatically stopping and syncing world...",
@@ -109,6 +169,154 @@ class MinecraftManager:
                     self.stop_hosting(self.active_host_user)
             except Exception:
                 pass
+
+    def get_auto_sync_status(self, cfg: Optional[ClusterConfig] = None) -> Dict[str, Any]:
+        if cfg is None:
+            cfg = self.sync_engine.load_cluster_config()
+        raw_interval = getattr(cfg, "auto_sync_interval_minutes", 10) if cfg else 10
+        try:
+            interval_min = max(0, min(1440, int(raw_interval)))
+        except (ValueError, TypeError):
+            interval_min = 10
+        enabled = interval_min > 0
+        next_sync_at = 0.0
+        if enabled and self.local_status == "running" and self._reached_running:
+            base_ts = max(self.server_ready_at or self.started_at or 0.0, self._last_auto_sync_at)
+            if base_ts > 0:
+                next_sync_at = base_ts + (interval_min * 60.0)
+        last_status = "disabled" if not enabled else (self._last_auto_sync_status or "idle")
+        return {
+            "enabled": enabled,
+            "intervalMinutes": interval_min,
+            "inProgress": bool(self._auto_sync_in_progress),
+            "lastSyncAt": float(self._last_auto_sync_at or 0.0),
+            "nextSyncAt": float(next_sync_at or 0.0),
+            "lastSyncStatus": last_status,
+            "lastSyncError": self._last_auto_sync_error if enabled else "",
+        }
+
+    def notify_auto_sync_schedule_changed(self) -> None:
+        self._cached_tel_cfg_ts = 0.0
+        self._auto_sync_wakeup.set()
+        if self.local_status != "idle":
+            self._publish_host_telemetry_throttled(force=True)
+        self._emit("status_changed", self.get_status_summary())
+
+    def _auto_sync_loop(self) -> None:
+        while True:
+            wait_sec = 30.0
+            try:
+                cfg = self.sync_engine.load_cluster_config()
+                interval_min = max(0, min(1440, int(getattr(cfg, "auto_sync_interval_minutes", 10) or 0))) if cfg else 10
+                if interval_min > 0 and self.local_status == "running" and self._reached_running:
+                    base_ts = max(self.server_ready_at or self.started_at, self._last_auto_sync_at)
+                    due_in = (base_ts + interval_min * 60.0) - time.time() if base_ts > 0 else interval_min * 60.0
+                    if due_in <= 0:
+                        self.run_live_auto_sync_once(force=False)
+                        wait_sec = min(30.0, float(interval_min * 60.0))
+                    else:
+                        wait_sec = min(30.0, max(1.0, due_in))
+            except Exception:
+                wait_sec = 30.0
+            self._auto_sync_wakeup.wait(timeout=wait_sec)
+            self._auto_sync_wakeup.clear()
+
+    def run_live_auto_sync_once(self, force: bool = False) -> Dict[str, Any]:
+        """
+        Performs a safe live world snapshot sync to Shared Drive while the server is running:
+        save-off -> save-all flush -> stage/push snapshot (without releasing/modifying active lock) -> save-on in finally.
+        Serialized with _lifecycle_lock so it never collides with manual stop, restart, world reset, or backup.
+        """
+        cfg = self.sync_engine.load_cluster_config()
+        interval_min = max(0, min(1440, int(getattr(cfg, "auto_sync_interval_minutes", 10) or 0))) if cfg else 10
+        if not force and interval_min <= 0:
+            self._last_auto_sync_status = "disabled"
+            self._last_auto_sync_error = ""
+            return {"pushed": False, "skipped": True, "reason": "Periodic Drive auto-sync is disabled."}
+
+        with self._lifecycle_lock:
+            if self.local_status != "running" or not self._reached_running:
+                return {"pushed": False, "skipped": True, "reason": f"Server is not running (status={self.local_status})."}
+
+            epoch = self.sync_engine._active_lock_epoch
+            owns = (
+                self.sync_engine.owns_lock(epoch)
+                if hasattr(self.sync_engine, "owns_lock")
+                else (self.sync_engine._owns_active_lock and self.sync_engine.is_locked_by_current_machine())
+            )
+            if not owns:
+                self._last_auto_sync_status = "skipped"
+                self._last_auto_sync_error = "Active host lock is not owned by this machine."
+                return {"pushed": False, "skipped": True, "reason": self._last_auto_sync_error}
+
+            if not force and interval_min > 0:
+                base_ts = max(self.server_ready_at or self.started_at, self._last_auto_sync_at)
+                if base_ts > 0 and (time.time() - base_ts) < (interval_min * 60.0):
+                    return {"pushed": False, "skipped": True, "reason": "Auto-sync interval has not elapsed yet."}
+
+            self._auto_sync_in_progress = True
+            self._publish_host_telemetry_throttled(force=True)
+            self._emit("status_changed", self.get_status_summary())
+
+            proc_ref = self._proc
+            paused_autosave = False
+            host_uname = self.active_host_user.username if self.active_host_user else "AutoSync"
+            try:
+                if self._is_proc_alive(proc_ref) and getattr(proc_ref, "stdin", None):
+                    with self._stdin_lock:
+                        self._save_complete_event.clear()
+                        try:
+                            proc_ref.stdin.write("save-off\n")
+                            proc_ref.stdin.flush()
+                            paused_autosave = True
+                            proc_ref.stdin.write("save-all flush\n")
+                            proc_ref.stdin.flush()
+                        except (OSError, ValueError):
+                            pass
+                    if paused_autosave:
+                        saved_ok = self._save_complete_event.wait(timeout=12.0)
+                        if not saved_ok:
+                            self._log("Auto-sync save-all flush timed out after 12s; proceeding with staged snapshot.", "WARN", "SyncEngine")
+
+                if hasattr(self.sync_engine, "push_live_snapshot"):
+                    res = self.sync_engine.push_live_snapshot(
+                        lock_epoch=epoch,
+                        create_backup=False,
+                        host_username=host_uname,
+                    )
+                else:
+                    res = self.sync_engine.push_world_from_runtime(
+                        create_backup=False,
+                        backup_label="auto-sync",
+                        host_username=host_uname,
+                    )
+
+                if res.get("pushed"):
+                    self._last_auto_sync_at = time.time()
+                    self._last_auto_sync_status = "ok"
+                    self._last_auto_sync_error = ""
+                    self._get_cached_world_info(force_refresh=True)
+                    kb = round(float(res.get("sizeBytes", 0) or 0) / 1024.0, 1)
+                    self._log(
+                        f"Periodic Drive auto-sync complete ({res.get('fileCount', 0)} files, {kb} KB).",
+                        "INFO",
+                        "SyncEngine",
+                    )
+                else:
+                    self._last_auto_sync_status = "skipped"
+                    self._last_auto_sync_error = str(res.get("reason", "") or "")
+                return res
+            except Exception as e:
+                self._last_auto_sync_status = "error"
+                self._last_auto_sync_error = str(e)
+                self._log(f"Periodic Drive auto-sync failed: {e}", "WARN", "SyncEngine")
+                return {"pushed": False, "error": str(e)}
+            finally:
+                if paused_autosave and self._is_proc_alive(proc_ref) and getattr(proc_ref, "stdin", None):
+                    self._write_stdin(proc_ref, "save-on\n")
+                self._auto_sync_in_progress = False
+                self._publish_host_telemetry_throttled(force=True)
+                self._emit("status_changed", self.get_status_summary())
 
     @property
     def runtime_dir(self) -> Path:
@@ -135,51 +343,126 @@ class MinecraftManager:
             except Exception:
                 pass
 
+    def _get_cached_world_info(self, force_refresh: bool = False) -> Optional[Dict[str, Any]]:
+        with self._world_info_lock:
+            now = time.time()
+            if not force_refresh and self._world_info_cache is not None and (now - self._world_info_cache_ts) < 60.0:
+                return dict(self._world_info_cache)
+        try:
+            info = self.get_world_info()
+        except Exception:
+            with self._world_info_lock:
+                return dict(self._world_info_cache) if self._world_info_cache is not None else None
+        with self._world_info_lock:
+            self._world_info_cache = dict(info)
+            self._world_info_cache_ts = time.time()
+            return dict(self._world_info_cache)
+
     def _sample_local_process_metrics(self) -> None:
+        if self.local_status in ("idle", "syncing_pull"):
+            return
         if psutil is None or self.local_status not in ("running", "starting", "restarting"):
             return
-        try:
-            proc = self._proc
-            if proc is not None:
-                if self._psutil_proc is None or self._psutil_proc.pid != proc.pid:
-                    self._psutil_proc = psutil.Process(proc.pid)
-                    # Prime baseline CPU counter once on the cached Process instance
-                    self._psutil_proc.cpu_percent(interval=None)
-                rss_bytes = self._psutil_proc.memory_info().rss
-                cpu_val = self._psutil_proc.cpu_percent(interval=None)
-                for child in self._psutil_proc.children(recursive=True):
-                    try:
-                        rss_bytes += child.memory_info().rss
-                        cpu_val += child.cpu_percent(interval=None)
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-                        pass
-                self.memory_used_mb = int(rss_bytes / (1024 * 1024))
-                cpu_count = max(1, psutil.cpu_count() or 1)
-                self.cpu_percent = round(min(100.0, float(cpu_val) / cpu_count), 1)
-            elif self.runtime_mode == "embedded":
-                # Embedded test simulator updates self.memory_used_mb & self.cpu_percent directly
+        with self._metrics_lock:
+            now = time.time()
+            try:
+                proc = self._proc
+                if proc is not None:
+                    if (now - self._last_metrics_sample_at) < 1.2 and self._psutil_proc is not None and self._psutil_proc.pid == proc.pid:
+                        return
+                    if self._psutil_proc is None or self._psutil_proc.pid != proc.pid:
+                        self._psutil_proc = psutil.Process(proc.pid)
+                        # Prime baseline CPU counter once on the cached Process instance
+                        self._psutil_proc.cpu_percent(interval=None)
+                    rss_bytes = self._psutil_proc.memory_info().rss
+                    cpu_val = self._psutil_proc.cpu_percent(interval=None)
+                    for child in self._psutil_proc.children(recursive=True):
+                        try:
+                            rss_bytes += child.memory_info().rss
+                            cpu_val += child.cpu_percent(interval=None)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                            pass
+                    self.memory_used_mb = int(rss_bytes / (1024 * 1024))
+                    cpu_count = max(1, psutil.cpu_count() or 1)
+                    self.cpu_percent = round(min(100.0, float(cpu_val) / cpu_count), 1)
+                    self._last_metrics_sample_at = now
+                elif self.runtime_mode == "embedded":
+                    # Embedded test simulator updates self.memory_used_mb & self.cpu_percent directly
+                    pass
+                if self.local_status == "running" and self._last_tps_warn_at > 0 and (now - self._last_tps_warn_at) > 20.0:
+                    # Recover observed TPS back toward 20.0 once tick-lag warnings subside
+                    self.tps = round(min(20.0, self.tps + 0.5), 2)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                self._psutil_proc = None
+            except Exception:
                 pass
-            if self.local_status == "running" and self._last_tps_warn_at > 0 and (time.time() - self._last_tps_warn_at) > 20.0:
-                # Recover observed TPS back toward 20.0 once tick-lag warnings subside
-                self.tps = round(min(20.0, self.tps + 0.5), 2)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            self._psutil_proc = None
-        except Exception:
-            pass
 
     def _build_telemetry_snapshot(self) -> Dict[str, Any]:
         self._sample_local_process_metrics()
-        cfg = self.sync_engine.load_cluster_config()
+        now = time.time()
+        if self.local_status == "running" and self._cached_tel_cfg is not None and (now - self._cached_tel_cfg_ts) < 1.0:
+            cfg = self._cached_tel_cfg
+        else:
+            cfg = self.sync_engine.load_cluster_config()
+            self._cached_tel_cfg = cfg
+            self._cached_tel_cfg_ts = now
         with self._mutex:
             players_copy = list(self.online_players)
             logs_copy = list(self.console_logs[-120:])
+            max_p = self._active_max_players or 20
+        tunnel_state: Dict[str, Any] = {}
+        if self.local_status != "idle":
+            cur_tm_status = getattr(self.tunnel_manager, "status", None)
+            cur_tm_pub = getattr(self.tunnel_manager, "public_address", "") or (cfg.public_join_address if cfg else "")
+            cur_tm_claim = getattr(self.tunnel_manager, "claim_url", "")
+            if (
+                self.local_status == "running"
+                and self._cached_tunnel_state is not None
+                and (now - self._cached_tunnel_state_ts) < 1.0
+                and self._cached_tunnel_state.get("status") == cur_tm_status
+                and self._cached_tunnel_state.get("publicAddress") == cur_tm_pub
+                and self._cached_tunnel_state.get("claimUrl") == cur_tm_claim
+            ):
+                tunnel_state = dict(self._cached_tunnel_state)
+            else:
+                try:
+                    tunnel_state = dict(self.tunnel_manager.get_state())
+                    self._cached_tunnel_state = dict(tunnel_state)
+                    self._cached_tunnel_state_ts = now
+                except Exception:
+                    tunnel_state = {}
+        uptime_sec = (
+            int(max(0.0, now - self.server_ready_at))
+            if (self.local_status == "running" and self.server_ready_at > 0)
+            else 0
+        )
+        host_lan_ip = str(tunnel_state.get("lanIp") or "")
+        world_info = self._get_cached_world_info(force_refresh=False) if self.local_status != "idle" else None
         return {
+            "isActive": self.local_status != "idle",
+            "status": self.local_status,
+            "lastError": self.last_error,
             "tps": self.tps if self.local_status == "running" else 0.0,
-            "memoryUsedMb": self.memory_used_mb,
+            "memoryUsedMb": self.memory_used_mb if self.local_status != "idle" else 0,
             "memoryMaxMb": cfg.memory_max_mb if cfg else 4096,
-            "cpuPercent": self.cpu_percent,
-            "serverReadyAt": self.server_ready_at,
+            "cpuPercent": self.cpu_percent if self.local_status != "idle" else 0.0,
+            "uptimeSeconds": uptime_sec,
+            "serverReadyAt": self.server_ready_at if self.local_status == "running" else 0.0,
+            "hostClockNow": now,
             "onlinePlayers": players_copy,
+            "maxPlayers": max_p,
+            "mcVersion": f"{cfg.mc_software.capitalize()} {cfg.mc_version}" if cfg else "",
+            "mcSoftware": cfg.mc_software if cfg else "paper",
+            "rawMcVersion": cfg.mc_version if cfg else "26.3",
+            "serverName": cfg.server_name if cfg else "Shared Minecraft Server",
+            "publicAddress": str(tunnel_state.get("publicAddress") or ""),
+            "tunnelStatus": str(tunnel_state.get("status") or "stopped"),
+            "hostLanIp": host_lan_ip,
+            "tunnelLanIp": host_lan_ip,
+            "claimUrl": str(tunnel_state.get("claimUrl") or ""),
+            "tunnelLogs": list(tunnel_state.get("logs") or [])[-40:],
+            "worldInfo": world_info,
+            "autoSync": self.get_auto_sync_status(cfg=cfg),
             "logs": logs_copy,
         }
 
@@ -188,33 +471,75 @@ class MinecraftManager:
             return
         if os.environ.get("MINERELAY_TEST_MODE") == "1" and not force:
             return
-        now = time.time()
-        if not force and (now - self._last_telemetry_publish_at) < 2.0:
-            return
-        self._last_telemetry_publish_at = now
+        if force:
+            self._cached_tunnel_state = None
+            self._cached_tunnel_state_ts = 0.0
+            self._cached_tel_cfg = None
+            self._cached_tel_cfg_ts = 0.0
+        with self._telemetry_lock:
+            now = time.time()
+            elapsed = now - self._last_telemetry_publish_at
+            if not force and elapsed < 1.5:
+                if self._telemetry_flush_timer is None:
+                    delay = max(0.2, 1.6 - elapsed)
+                    t = threading.Timer(delay, self._flush_pending_telemetry)
+                    t.daemon = True
+                    self._telemetry_flush_timer = t
+                    t.start()
+                return
+            if self._telemetry_flush_timer is not None:
+                try:
+                    self._telemetry_flush_timer.cancel()
+                except Exception:
+                    pass
+                self._telemetry_flush_timer = None
+            self._last_telemetry_publish_at = now
         try:
             if not self.sync_engine._owns_active_lock:
                 return
-            lock = self.sync_engine.get_lock()
-            if not lock.is_locked or lock.machine_id != self.sync_engine.local_config.machine_id:
-                return
+            epoch = self.sync_engine._active_lock_epoch
+            lock_username = self.active_host_user.username if self.active_host_user else ""
+            max_p = self._active_max_players or 20
+            if not epoch:
+                lock = self.sync_engine.get_lock()
+                if not lock.is_locked or lock.machine_id != self.sync_engine.local_config.machine_id:
+                    return
+                epoch = lock.lock_epoch
+                lock_username = lock.host_username or lock_username
+                max_p = lock.max_players or max_p
             snap = self._build_telemetry_snapshot()
             snap["isActive"] = True
-            snap["lockEpoch"] = lock.lock_epoch
-            snap["machineId"] = lock.machine_id
-            snap["hostUsername"] = lock.host_username
+            snap["lockEpoch"] = epoch
+            snap["machineId"] = self.sync_engine.local_config.machine_id
+            snap["machineName"] = self.sync_engine.local_config.machine_name
+            snap["hostUsername"] = lock_username
             snap["status"] = self.local_status
-            snap["maxPlayers"] = lock.max_players
+            snap["maxPlayers"] = max_p
             self.sync_engine.write_host_telemetry(snap)
         except Exception:
             pass
+
+    def _cancel_telemetry_timer(self) -> None:
+        with self._telemetry_lock:
+            if self._telemetry_flush_timer is not None:
+                try:
+                    self._telemetry_flush_timer.cancel()
+                except Exception:
+                    pass
+                self._telemetry_flush_timer = None
+
+    def _flush_pending_telemetry(self) -> None:
+        with self._telemetry_lock:
+            self._telemetry_flush_timer = None
+        self._publish_host_telemetry_throttled(force=True)
 
     def _log(self, message: str, level: str = "INFO", source: str = "Server") -> None:
         ts = time.strftime("%H:%M:%S")
         formatted = f"[{ts}] [{source}/{level}]: {message}"
         with self._mutex:
+            self._log_seq += 1
             entry = {
-                "id": f"{int(time.time() * 1000)}-{len(self.console_logs)}",
+                "id": f"{int(time.time() * 1000)}-{self._log_seq}",
                 "timestamp": ts,
                 "level": level,
                 "source": source,
@@ -411,6 +736,34 @@ class MinecraftManager:
                 pass
         return len(procs)
 
+    def _push_world_compat(
+        self,
+        create_backup: bool = True,
+        backup_label: str = "auto",
+        host_username: str = "",
+        require_lock_epoch: str = "",
+        stage_copy_before_zip: bool = False,
+    ) -> Dict[str, Any]:
+        """Calls SyncEngine.push_world_from_runtime with enhanced flags if supported."""
+        import inspect
+        fn = self.sync_engine.push_world_from_runtime
+        kwargs: Dict[str, Any] = {
+            "create_backup": create_backup,
+            "backup_label": backup_label,
+            "host_username": host_username,
+        }
+        try:
+            params = inspect.signature(fn).parameters
+            if "require_lock_epoch" in params and require_lock_epoch:
+                kwargs["require_lock_epoch"] = require_lock_epoch
+            if "strict_files" in params:
+                kwargs["strict_files"] = True
+            if "stage_copy_before_zip" in params and stage_copy_before_zip:
+                kwargs["stage_copy_before_zip"] = True
+        except Exception:
+            pass
+        return fn(**kwargs)
+
     def _recover_orphaned_session_on_boot(self) -> None:
         """
         If MineRelay was closed while a local Java server was still running or while this machine
@@ -426,7 +779,7 @@ class MinecraftManager:
             was_running_session = (
                 lock.is_locked
                 and lock.machine_id == self.sync_engine.local_config.machine_id
-                and lock.status in ("running", "stopping", "syncing_push", "restarting")
+                and lock.status in ("running", "stopping", "syncing_push", "restarting", "sync_failed")
             )
             if orphans > 0 or was_running_session:
                 self._log(
@@ -440,13 +793,19 @@ class MinecraftManager:
                 )
                 push_res: Dict[str, Any] = {}
                 try:
-                    push_res = self.sync_engine.push_world_from_runtime(
+                    push_res = self._push_world_compat(
                         create_backup=True,
                         backup_label="recovery",
                         host_username=lock.host_username or "recovery",
                     )
                 except Exception as e:
-                    self._log(f"Recovery push failed: {e}", "ERROR", "SyncEngine")
+                    self.last_error = f"Recovery push failed: {e}"
+                    self._log(self.last_error, "ERROR", "SyncEngine")
+                    if lock.is_locked and lock.machine_id == self.sync_engine.local_config.machine_id:
+                        try:
+                            self.sync_engine.update_lock_state(status="sync_failed")
+                        except Exception:
+                            pass
                     return
                 self.sync_engine.release_lock(
                     expected_snapshot_seq=int(push_res.get("snapshotSeq", 0) or 0),
@@ -485,6 +844,10 @@ class MinecraftManager:
             self._reached_running = False
             self.server_ready_at = 0.0
             self._last_tps_warn_at = 0.0
+            self._last_auto_sync_at = 0.0
+            self._last_auto_sync_status = "idle"
+            self._last_auto_sync_error = ""
+            self._world_info_cache = None
 
             # Step 1: Acquire distributed lock (raises HostLockConflictError if another member is hosting)
             self.sync_engine.acquire_lock(
@@ -521,18 +884,13 @@ class MinecraftManager:
                 else:
                     self._log(str(pull_res.get("reason", "Initialized runtime directory.")), "INFO", "SyncEngine")
 
-                # Update user host_count in ClusterConfig
-                for acc in cfg.accounts:
-                    if acc.id == user.id:
-                        acc.host_count += 1
-                        acc.last_active_at = time.time()
-                        break
-                self.sync_engine.save_cluster_config(cfg)
-
-                # Step 3: Start Zero-Port-Forwarding Tunnel
+                # Step 3: Check port availability & Start Zero-Port-Forwarding Tunnel
                 props = self.get_server_properties()
-                port = int(props.get("server-port", cfg.server_port or 25565))
-                max_players = int(props.get("max-players", 20))
+                port = self._safe_int_prop(props, "server-port", cfg.server_port or 25565, 1, 65535)
+                max_players = self._safe_int_prop(props, "max-players", 20, 1, 10000)
+                self._active_max_players = max_players
+                self._active_server_port = port
+                self._get_cached_world_info(force_refresh=True)
 
                 # Double-check port availability on this machine
                 if os.environ.get("MINERELAY_TEST_MODE") != "1" and self._is_port_in_use(port):
@@ -568,7 +926,7 @@ class MinecraftManager:
                     try:
                         if not java_info["installed"]:
                             self._log(
-                                f"Java {req_java}+ required for Minecraft {cfg.mc_version}; auto-downloading Portable Java 25 Runtime...",
+                                f"Java {req_java}+ required for Minecraft {cfg.mc_version}; auto-downloading Portable Java {req_java} Runtime...",
                                 "INFO",
                                 "Installer",
                             )
@@ -595,36 +953,46 @@ class MinecraftManager:
                     except Exception as boot_err:
                         self._log(f"Auto-download notice: {boot_err}", "WARN", "Installer")
 
+                if not (java_info["installed"] and has_jar) and os.environ.get("MINERELAY_TEST_MODE") != "1":
+                    raise RuntimeError(
+                        f"Java {req_java}+ and a valid {cfg.mc_software.upper()} {cfg.mc_version} server.jar are required to host (auto-download did not complete)."
+                    )
+
+                # Update user host_count in ClusterConfig only after preflight checks pass
+                fresh_cfg = self.sync_engine.load_cluster_config() or cfg
+                for acc in fresh_cfg.accounts:
+                    if acc.id == user.id:
+                        acc.host_count += 1
+                        acc.last_active_at = time.time()
+                        break
+                self.sync_engine.save_cluster_config(fresh_cfg)
+
                 if java_info["installed"] and has_jar:
                     ensure_paperclip_mojang_cache(
                         target_jar,
                         self.runtime_dir,
                         log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
                     )
-                    self._spawn_java_minecraft(cfg, java_info["command"], target_jar, max_players)
-                elif os.environ.get("MINERELAY_TEST_MODE") == "1":
-                    self._spawn_embedded_minecraft_runtime(cfg, has_jar, java_info["installed"], max_players)
+                    self._spawn_java_minecraft(fresh_cfg, java_info["command"], target_jar, max_players, port)
                 else:
-                    raise RuntimeError(
-                        f"Java {req_java}+ and a valid {cfg.mc_software.upper()} {cfg.mc_version} server.jar are required to host (auto-download did not complete)."
-                    )
+                    self._spawn_embedded_minecraft_runtime(fresh_cfg, has_jar, java_info["installed"], max_players)
 
                 return self.get_status_summary()
 
             except Exception as e:
-                self.last_error = str(e)
-                self.local_status = "idle"
-                self.active_host_user = None
-                self.server_ready_at = 0.0
-                self.tunnel_manager.stop_tunnel()
-                try:
-                    self.sync_engine.release_lock(user)
-                except Exception:
-                    pass
-                self._emit("status_changed", self.get_status_summary())
+                self._log(f"Start hosting failed: {e}", "ERROR", "Launcher")
+                self._publish_host_telemetry_throttled(force=True)
+                self._cleanup_after_failed_start(user, reason=str(e))
                 raise e
 
-    def _spawn_java_minecraft(self, cfg: Any, java_cmd: str, jar_path: Path, max_players: int) -> None:
+    def _spawn_java_minecraft(
+        self,
+        cfg: Any,
+        java_cmd: str,
+        jar_path: Path,
+        max_players: int,
+        server_port: int = 25565,
+    ) -> None:
         self.runtime_mode = "java"
         self.sync_engine._ensure_default_runtime_files()
         flags = [f for f in cfg.jvm_flags.split(" ") if f.strip()]
@@ -660,12 +1028,12 @@ class MinecraftManager:
         )
         threading.Thread(
             target=self._monitor_java_process,
-            args=(self._proc, max_players),
+            args=(self._proc, max_players, server_port),
             daemon=True,
             name="MinecraftProcessMonitor",
         ).start()
 
-    def _monitor_java_process(self, proc: subprocess.Popen, max_players: int) -> None:
+    def _monitor_java_process(self, proc: subprocess.Popen, max_players: int, server_port: int = 25565) -> None:
         ansi_regex = re.compile(r"\x1B(?:\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1b\\)|[@-Z\\-_])")
         done_regex = re.compile(r'Done \([0-9.]+s\)! For help, type "help"')
         prefix = r"^(?:\[[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\])*:\s*)?"
@@ -712,6 +1080,7 @@ class MinecraftManager:
                         self._last_player_active_at = time.time()
                         self.tps = 20.0
                         self._sample_local_process_metrics()
+                        self._get_cached_world_info(force_refresh=True)
                         with self._mutex:
                             players_copy = list(self.online_players)
                         self.sync_engine.update_lock_state(status="running", max_players=max_players, online_players=players_copy)
@@ -719,10 +1088,11 @@ class MinecraftManager:
                         self._emit("status_changed", self.get_status_summary())
                         self._emit("players_updated", self.get_players_data())
                         self._apply_saved_gamerules_to_live_server(proc)
+                        self._auto_sync_wakeup.set()
 
                     if not self._reached_running:
                         if "FAILED TO BIND TO PORT" in line or "Address already in use" in line:
-                            fatal_error = "Port 25565 was already in use by another process."
+                            fatal_error = f"Port {server_port} was already in use by another process."
                         elif "DirectoryLock" in line or "locked a portion of the file" in line:
                             fatal_error = "World folder was locked by a lingering Java process."
                         elif "Newer version of world" in line or "Downgrading is not supported" in line:
@@ -791,7 +1161,17 @@ class MinecraftManager:
                 self._proc = None
                 if self.local_status not in ("stopping", "syncing_push", "restarting", "idle"):
                     if self._reached_running:
-                        self._log("Java Minecraft process exited. Syncing world and releasing lock...", "WARN", "Launcher")
+                        exit_code = proc.poll()
+                        if exit_code not in (0, None):
+                            self.last_error = f"Minecraft server crashed or exited unexpectedly (exit code {exit_code})."
+                            self._log(
+                                f"Java Minecraft process crashed (exit code {exit_code}). Syncing world and releasing lock...",
+                                "ERROR",
+                                "Launcher",
+                            )
+                        else:
+                            self._log("Java Minecraft process exited. Syncing world and releasing lock...", "WARN", "Launcher")
+                        self._publish_host_telemetry_throttled(force=True)
                         self._finalize_stop_and_sync(self.active_host_user)
                     else:
                         err_msg = fatal_error or "Server process exited during startup before reaching Ready state."
@@ -800,6 +1180,7 @@ class MinecraftManager:
                             "ERROR",
                             "Launcher",
                         )
+                        self._publish_host_telemetry_throttled(force=True)
                         self._cleanup_after_failed_start(self.active_host_user, reason=err_msg)
 
     def _spawn_embedded_minecraft_runtime(
@@ -811,6 +1192,7 @@ class MinecraftManager:
     ) -> None:
         self.runtime_mode = "embedded"
         self._reached_running = True
+        self._active_max_players = max_players
         self._sim_stop_event.clear()
         self._sim_running = True
 
@@ -854,13 +1236,17 @@ class MinecraftManager:
         self._log('Done (1.24s)! For help, type "help"', "INFO", "ServerMain")
 
         self.local_status = "running"
-        self.server_ready_at = time.time()
+        now = time.time()
+        self.server_ready_at = now
+        self._last_player_active_at = now
         self.tps = 20.0
         self.memory_used_mb = min(1024, cfg.memory_min_mb)
         self.cpu_percent = 8.4
+        self._get_cached_world_info(force_refresh=True)
         self.sync_engine.update_lock_state(status="running", max_players=max_players)
         self._publish_host_telemetry_throttled(force=True)
         self._emit("status_changed", self.get_status_summary())
+        self._auto_sync_wakeup.set()
 
         def _telemetry_loop() -> None:
             tick = 0
@@ -879,52 +1265,60 @@ class MinecraftManager:
         """Flushes chunks to disk with `save-all flush`, sends `stop`, and waits cleanly before terminating."""
         self._psutil_proc = None
         try:
-            if proc_ref.stdin:
+            if self._is_proc_alive(proc_ref) and getattr(proc_ref, "stdin", None):
                 self._save_complete_event.clear()
-                proc_ref.stdin.write("save-all flush\n")
-                proc_ref.stdin.flush()
-                self._save_complete_event.wait(timeout=8.0)
-                proc_ref.stdin.write("stop\n")
-                proc_ref.stdin.flush()
+                if self._write_stdin(proc_ref, "save-all flush\n"):
+                    self._save_complete_event.wait(timeout=12.0)
+                self._write_stdin(proc_ref, "stop\n")
             proc_ref.wait(timeout=wait_timeout)
         except Exception:
             self._terminate_process_tree(proc_ref, wait_timeout=5.0)
         finally:
-            for pipe in (proc_ref.stdin, proc_ref.stdout):
-                if pipe is not None:
-                    try:
-                        pipe.close()
-                    except Exception:
-                        pass
+            # Close only stdin here; _monitor_java_process closes stdout cleanly after EOF
+            if getattr(proc_ref, "stdin", None) is not None:
+                try:
+                    proc_ref.stdin.close()
+                except Exception:
+                    pass
 
     def flush_and_backup_live_world(self, label: str, host_username: str) -> Dict[str, Any]:
         """Safely flushes and pauses chunk writes before packaging a backup while running."""
         with self._lifecycle_lock:
+            if self.local_status == "idle":
+                lock = self.sync_engine.get_lock()
+                if lock.is_actively_locked() and not self.sync_engine.is_locked_by_current_machine(lock):
+                    raise HostLockConflictError(
+                        f"Cannot create snapshot while '{lock.host_username}' ({lock.machine_name}) holds the host lock."
+                    )
             proc_ref = self._proc
             paused_autosave = False
-            if self.local_status == "running" and proc_ref is not None and proc_ref.stdin:
-                try:
+            is_live_running = self.local_status == "running"
+            if is_live_running and self._is_proc_alive(proc_ref) and getattr(proc_ref, "stdin", None):
+                with self._stdin_lock:
                     self._save_complete_event.clear()
-                    proc_ref.stdin.write("save-off\n")
-                    proc_ref.stdin.write("save-all flush\n")
-                    proc_ref.stdin.flush()
-                    self._save_complete_event.wait(timeout=6.0)
-                    paused_autosave = True
-                except Exception:
-                    pass
+                    try:
+                        proc_ref.stdin.write("save-off\n")
+                        proc_ref.stdin.flush()
+                        paused_autosave = True
+                        proc_ref.stdin.write("save-all flush\n")
+                        proc_ref.stdin.flush()
+                    except (OSError, ValueError):
+                        pass
+                if paused_autosave:
+                    saved_ok = self._save_complete_event.wait(timeout=12.0)
+                    if not saved_ok:
+                        self._log("Live backup save-all flush timed out after 12s; proceeding with staged snapshot.", "WARN", "SyncEngine")
             try:
-                return self.sync_engine.push_world_from_runtime(
+                return self._push_world_compat(
                     create_backup=True,
                     backup_label=label,
                     host_username=host_username,
+                    require_lock_epoch=self.sync_engine._active_lock_epoch if is_live_running else "",
+                    stage_copy_before_zip=is_live_running,
                 )
             finally:
-                if paused_autosave and proc_ref is not None and proc_ref.stdin:
-                    try:
-                        proc_ref.stdin.write("save-on\n")
-                        proc_ref.stdin.flush()
-                    except Exception:
-                        pass
+                if paused_autosave and self._is_proc_alive(proc_ref) and getattr(proc_ref, "stdin", None):
+                    self._write_stdin(proc_ref, "save-on\n")
 
     def stop_hosting(self, user: Optional[UserAccount] = None) -> Dict[str, Any]:
         """
@@ -935,9 +1329,14 @@ class MinecraftManager:
             effective_user = user or self.active_host_user
             lock = self.sync_engine.get_lock()
             cfg = self.sync_engine.load_cluster_config()
-            port = cfg.server_port if cfg else 25565
+            port = self._active_server_port or (cfg.server_port if cfg else 25565)
 
             if self.local_status == "idle":
+                if lock.is_locked and lock.machine_id != self.sync_engine.local_config.machine_id and not lock.is_stale():
+                    raise HostLockConflictError(
+                        f"Cannot stop active remote server hosted by {lock.host_username} on {lock.machine_name} from another PC "
+                        "(have them click Stop Server so world saves upload cleanly, or use Admin Force Unlock if their PC crashed)."
+                    )
                 orphans_stopped = self._stop_any_runtime_java_processes(server_port=port)
                 push_res: Dict[str, Any] = {}
                 if orphans_stopped > 0:
@@ -947,7 +1346,7 @@ class MinecraftManager:
                         "Launcher",
                     )
                     try:
-                        push_res = self.sync_engine.push_world_from_runtime(
+                        push_res = self._push_world_compat(
                             create_backup=cfg.auto_backup_on_stop if cfg else True,
                             backup_label=effective_user.username if effective_user else "host",
                             host_username=effective_user.username if effective_user else "recovery",
@@ -955,22 +1354,16 @@ class MinecraftManager:
                     except Exception as e:
                         self._log(f"Warning pushing orphaned world: {e}", "WARN", "SyncEngine")
                 if lock.is_locked:
-                    if lock.machine_id == self.sync_engine.local_config.machine_id or lock.is_stale():
-                        self.sync_engine.release_lock(
-                            effective_user,
-                            expected_snapshot_seq=int(push_res.get("snapshotSeq", 0) or 0) if orphans_stopped > 0 else 0,
-                            expected_snapshot_hash=str(push_res.get("sha256", "") or "") if orphans_stopped > 0 else "",
-                        )
-                        self.tunnel_manager.stop_tunnel()
-                        uname = effective_user.username if effective_user else "System"
-                        self._log(f"Host lock released by {uname}.", "INFO", "SyncEngine")
-                        self._emit("status_changed", self.get_status_summary())
-                        return self.get_status_summary()
-                    else:
-                        raise HostLockConflictError(
-                            f"Cannot stop active remote server hosted by {lock.host_username} on {lock.machine_name} from another PC "
-                            "(have them click Stop Server so world saves upload cleanly, or use Admin Force Unlock if their PC crashed)."
-                        )
+                    self.sync_engine.release_lock(
+                        effective_user,
+                        expected_snapshot_seq=int(push_res.get("snapshotSeq", 0) or 0) if orphans_stopped > 0 else 0,
+                        expected_snapshot_hash=str(push_res.get("sha256", "") or "") if orphans_stopped > 0 else "",
+                    )
+                    self.tunnel_manager.stop_tunnel()
+                    uname = effective_user.username if effective_user else "System"
+                    self._log(f"Host lock released by {uname}.", "INFO", "SyncEngine")
+                    self._emit("status_changed", self.get_status_summary())
+                    return self.get_status_summary()
                 self.tunnel_manager.stop_tunnel()
                 self._emit("status_changed", self.get_status_summary())
                 return self.get_status_summary()
@@ -981,6 +1374,7 @@ class MinecraftManager:
             self._emit("status_changed", self.get_status_summary())
             uname = effective_user.username if effective_user else "System"
             self._log(f"Stopping server requested by {uname}...", "INFO", "Server")
+            self._publish_host_telemetry_throttled(force=True)
 
             if self._proc is not None:
                 proc_ref = self._proc
@@ -1004,6 +1398,7 @@ class MinecraftManager:
 
     def _cleanup_after_failed_start(self, user: Optional[UserAccount], reason: str = "") -> Dict[str, Any]:
         """Releases the lock and stops the tunnel WITHOUT overwriting latest-server.zip when startup fails or is aborted early."""
+        self._cancel_telemetry_timer()
         if reason:
             self.last_error = reason
         self.tunnel_manager.stop_tunnel()
@@ -1015,18 +1410,22 @@ class MinecraftManager:
         self.runtime_mode = "none"
         self._reached_running = False
         self.active_host_user = None
+        self._active_max_players = 20
+        self._auto_sync_in_progress = False
         with self._mutex:
             self.online_players = []
         self.started_at = 0.0
         self.server_ready_at = 0.0
         self.memory_used_mb = 0
         self.cpu_percent = 0.0
+        self.tps = 20.0
         self._psutil_proc = None
         self._emit("status_changed", self.get_status_summary())
         self._emit("players_updated", self.get_players_data())
         return self.get_status_summary()
 
     def _finalize_stop_and_sync(self, user: Optional[UserAccount]) -> Dict[str, Any]:
+        self._cancel_telemetry_timer()
         self.local_status = "syncing_push"
         with self._mutex:
             self.online_players = []
@@ -1039,14 +1438,16 @@ class MinecraftManager:
         create_backup = cfg.auto_backup_on_stop if cfg else True
 
         self._log("Packaging and syncing world files to Shared Sync Folder...", "INFO", "SyncEngine")
+        self._publish_host_telemetry_throttled(force=True)
         push_res: Dict[str, Any] = {}
         push_err: Optional[Exception] = None
         for attempt in range(2):
             try:
-                push_res = self.sync_engine.push_world_from_runtime(
+                push_res = self._push_world_compat(
                     create_backup=create_backup,
                     backup_label=user.username if user else "host",
                     host_username=user.username if user else "",
+                    require_lock_epoch=self.sync_engine._active_lock_epoch,
                 )
                 push_err = None
                 break
@@ -1061,6 +1462,7 @@ class MinecraftManager:
                 "INFO",
                 "SyncEngine",
             )
+            self._cancel_telemetry_timer()
             try:
                 self.sync_engine.release_lock(
                     user,
@@ -1074,11 +1476,14 @@ class MinecraftManager:
             self.last_error = err_msg
             self._log(err_msg, "ERROR", "SyncEngine")
             self.sync_engine.update_lock_state(status="sync_failed")
+            self._publish_host_telemetry_throttled(force=True)
 
         self.local_status = "idle"
         self.runtime_mode = "none"
         self._reached_running = False
         self.active_host_user = None
+        self._active_max_players = 20
+        self._auto_sync_in_progress = False
         with self._mutex:
             self.online_players = []
         self.started_at = 0.0
@@ -1105,17 +1510,29 @@ class MinecraftManager:
             cfg = self.sync_engine.load_cluster_config()
             if not cfg:
                 raise RuntimeError("Cluster configuration is not initialized.")
-            port = cfg.server_port or 25565
+            props = self.get_server_properties()
+            port = self._safe_int_prop(props, "server-port", cfg.server_port or 25565, 1, 65535)
+            max_players = self._safe_int_prop(props, "max-players", 20, 1, 10000)
+            self._active_server_port = port
+            self._active_max_players = max_players
 
             self.local_status = "restarting"
             self._reached_running = False
             self.server_ready_at = 0.0
+            self.memory_used_mb = 0
+            self.cpu_percent = 0.0
+            self.tps = 0.0
+            self._psutil_proc = None
+            self._last_auto_sync_at = 0.0
+            self._last_auto_sync_status = "idle"
+            self._last_auto_sync_error = ""
             with self._mutex:
                 self.online_players = []
             self.sync_engine.update_lock_state(status="restarting", online_players=[])
             self._emit("status_changed", self.get_status_summary())
             self._emit("players_updated", self.get_players_data())
             self._log(f"Restarting server requested by {effective_user.username}...", "INFO", "Server")
+            self._publish_host_telemetry_throttled(force=True)
 
             if self._proc is not None:
                 proc_ref = self._proc
@@ -1128,44 +1545,105 @@ class MinecraftManager:
                 self._sim_running = False
                 self._sim_stop_event.set()
 
+            push_res: Dict[str, Any] = {}
             try:
-                self.sync_engine.push_world_from_runtime(
+                push_res = self._push_world_compat(
                     create_backup=cfg.auto_backup_on_stop if cfg else True,
                     backup_label=f"{effective_user.username}-restart",
                     host_username=effective_user.username,
+                    require_lock_epoch=self.sync_engine._active_lock_epoch,
                 )
             except Exception as e:
                 self._log(f"Warning saving restart backup: {e}", "WARN", "SyncEngine")
 
-            props = self.get_server_properties()
-            max_players = int(props.get("max-players", 20))
-            self.local_status = "starting"
-            self.started_at = time.time()
-            self.sync_engine.update_lock_state(status="starting", max_players=max_players, online_players=[])
-            self._emit("status_changed", self.get_status_summary())
-
-            java_info = self.check_java_installed(cfg.java_path, cfg.mc_version)
-            target_jar = get_versioned_jar_path(self.bin_dir, cfg.mc_software, cfg.mc_version)
-            has_jar = target_jar.exists() and target_jar.stat().st_size > 1_000_000
-
-            if java_info["installed"] and has_jar and os.environ.get("MINERELAY_TEST_MODE") != "1":
-                ensure_paperclip_mojang_cache(
-                    target_jar,
-                    self.runtime_dir,
-                    log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
+            try:
+                self.local_status = "starting"
+                self.started_at = time.time()
+                self.sync_engine.update_lock_state(
+                    status="starting",
+                    mc_version=f"{cfg.mc_software.capitalize()} {cfg.mc_version}",
+                    max_players=max_players,
+                    online_players=[],
                 )
-                self._spawn_java_minecraft(cfg, java_info["command"], target_jar, max_players)
-            elif os.environ.get("MINERELAY_TEST_MODE") == "1":
-                self._spawn_embedded_minecraft_runtime(cfg, has_jar, java_info["installed"], max_players)
-            else:
-                raise RuntimeError("Java runtime or versioned server.jar missing for restart.")
+                self._emit("status_changed", self.get_status_summary())
 
-            return self.get_status_summary()
+                req_java = required_java_major_for_mc(cfg.mc_version)
+                java_info = self.check_java_installed(cfg.java_path, cfg.mc_version)
+                target_jar = get_versioned_jar_path(self.bin_dir, cfg.mc_software, cfg.mc_version)
+                has_jar = target_jar.exists() and target_jar.stat().st_size > 1_000_000
+
+                if (not java_info["installed"] or not has_jar) and os.environ.get("MINERELAY_TEST_MODE") != "1":
+                    try:
+                        if not java_info["installed"]:
+                            ensure_portable_java(
+                                self.bin_dir,
+                                min_major=req_java,
+                                log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
+                            )
+                            java_info = self.check_java_installed(cfg.java_path, cfg.mc_version, force_refresh=True)
+                        if not has_jar:
+                            target_jar = ensure_server_jar(
+                                self.runtime_dir,
+                                cfg.mc_software,
+                                cfg.mc_version,
+                                log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
+                                bin_dir=self.bin_dir,
+                            )
+                            has_jar = target_jar.exists() and target_jar.stat().st_size > 1_000_000
+                    except Exception as boot_err:
+                        self._log(f"Auto-download notice during restart: {boot_err}", "WARN", "Installer")
+
+                if java_info["installed"] and has_jar and os.environ.get("MINERELAY_TEST_MODE") != "1":
+                    ensure_paperclip_mojang_cache(
+                        target_jar,
+                        self.runtime_dir,
+                        log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
+                    )
+                    self._spawn_java_minecraft(cfg, java_info["command"], target_jar, max_players, port)
+                elif os.environ.get("MINERELAY_TEST_MODE") == "1":
+                    self._spawn_embedded_minecraft_runtime(cfg, has_jar, java_info["installed"], max_players)
+                else:
+                    raise RuntimeError(
+                        f"Java {req_java}+ and a valid {cfg.mc_software.upper()} {cfg.mc_version} server.jar are required to restart."
+                    )
+
+                return self.get_status_summary()
+            except Exception as e:
+                self._log(f"Restart failed: {e}", "ERROR", "Launcher")
+                self._cancel_telemetry_timer()
+                self.last_error = str(e)
+                self.tunnel_manager.stop_tunnel()
+                try:
+                    self.sync_engine.release_lock(
+                        effective_user,
+                        expected_snapshot_seq=int(push_res.get("snapshotSeq", 0) or 0),
+                        expected_snapshot_hash=str(push_res.get("sha256", "") or ""),
+                    )
+                except Exception:
+                    self.sync_engine.force_unlock()
+                self.local_status = "idle"
+                self.runtime_mode = "none"
+                self._reached_running = False
+                self.active_host_user = None
+                self._active_max_players = 20
+                self._auto_sync_in_progress = False
+                with self._mutex:
+                    self.online_players = []
+                self.started_at = 0.0
+                self.server_ready_at = 0.0
+                self.memory_used_mb = 0
+                self.cpu_percent = 0.0
+                self._psutil_proc = None
+                self._emit("status_changed", self.get_status_summary())
+                self._emit("players_updated", self.get_players_data())
+                raise
 
     def clear_console_logs(self) -> Dict[str, Any]:
         with self._mutex:
             self.console_logs = []
         self._log("Console log history cleared by Admin.", "INFO", "Server")
+        if self.local_status != "idle":
+            self._publish_host_telemetry_throttled(force=True)
         return {"ok": True, "cleared": True, "logs": self.console_logs}
 
     # -------------------------------------------------------------------------
@@ -1197,6 +1675,7 @@ class MinecraftManager:
             with self._mutex:
                 if p not in self.online_players:
                     self.online_players.append(p)
+                self._last_player_active_at = time.time()
                 curr_players = list(self.online_players)
             self._log(f"{p} joined the game", "INFO", "Server")
             self.sync_engine.update_lock_state(online_players=curr_players)
@@ -1209,6 +1688,7 @@ class MinecraftManager:
             with self._mutex:
                 if p in self.online_players:
                     self.online_players.remove(p)
+                self._last_player_active_at = time.time()
                 curr_players = list(self.online_players)
             self._log(f"{p} left the game", "INFO", "Server")
             self.sync_engine.update_lock_state(online_players=curr_players)
@@ -1217,13 +1697,10 @@ class MinecraftManager:
             return {"sent": True, "command": clean}
 
         if self._proc is not None and self._proc.stdin:
-            try:
-                self._proc.stdin.write(clean + "\n")
-                self._proc.stdin.flush()
-                return {"sent": True, "command": clean}
-            except (OSError, ValueError) as err:
-                self._log(f"Failed to write to server stdin: {err}", "ERROR", "Server")
-                raise RuntimeError(f"Failed to send command to server: {err}")
+            if not self._write_stdin(self._proc, clean + "\n"):
+                self._log("Failed to write to server stdin (process may be stopping)", "ERROR", "Server")
+                raise RuntimeError("Failed to send command to server: stdin unavailable")
+            return {"sent": True, "command": clean}
 
         # Embedded interactive command processor
         if cmd_name == "help":
@@ -1235,8 +1712,9 @@ class MinecraftManager:
         elif cmd_name == "list":
             with self._mutex:
                 players_copy = list(self.online_players)
+                max_p = self._active_max_players or 20
             self._log(
-                f"There are {len(players_copy)} of a max of 20 players online: {', '.join(players_copy) or 'none'}",
+                f"There are {len(players_copy)} of a max of {max_p} players online: {', '.join(players_copy) or 'none'}",
                 "INFO",
                 "Server",
             )
@@ -1246,6 +1724,7 @@ class MinecraftManager:
         elif cmd_name == "save-all":
             self._log("Saving the game (this may take a moment!)", "INFO", "Server")
             self._log("Saved the game", "INFO", "Server")
+            self._save_complete_event.set()
         elif cmd_name == "op" and args:
             self.player_action("op", args[0])
         elif cmd_name == "deop" and args:
@@ -1262,7 +1741,11 @@ class MinecraftManager:
         return {"sent": True, "command": clean}
 
     def _ensure_idle_mutable_sync(self) -> None:
-        """Guards idle config/file edits against active remote hosting and pulls verified cloud state first."""
+        """Guards idle config/file edits against active remote hosting and transient lifecycle states."""
+        if self.local_status in ("syncing_pull", "stopping", "syncing_push", "restarting"):
+            raise RuntimeError(
+                f"Cannot modify server files while server is '{self.local_status}'. Wait for the transition to complete."
+            )
         if self.local_status != "idle":
             return
         lock = self.sync_engine.get_lock()
@@ -1541,8 +2024,9 @@ class MinecraftManager:
             )
         return migrated_players
 
-    def update_server_properties(self, updates: Dict[str, Any]) -> Dict[str, str]:
-        self._ensure_idle_mutable_sync()
+    def update_server_properties(self, updates: Dict[str, Any], _allow_during_transition: bool = False) -> Dict[str, str]:
+        if not _allow_during_transition:
+            self._ensure_idle_mutable_sync()
         props = self.get_server_properties()
         old_online_mode = props.get("online-mode", "true").lower() != "false"
         for k, v in updates.items():
@@ -1577,17 +2061,21 @@ class MinecraftManager:
             level_name = self._sanitize_level_name(props.get("level-name", "world"))
             self._migrate_playerdata_on_online_mode_change(level_name, new_online_mode)
 
+        self._active_max_players = self._safe_int_prop(props, "max-players", 20, 1, 1000)
+        self._active_server_port = self._safe_int_prop(props, "server-port", 25565, 1, 65535)
+        self._get_cached_world_info(force_refresh=True)
+
         # If server is running locally, also apply live-reloadable settings immediately
-        if self.local_status == "running" and self._proc and self._proc.stdin:
-            try:
-                if "difficulty" in updates:
-                    self._proc.stdin.write(f"difficulty {props.get('difficulty', 'normal')}\n")
-                if "white-list" in updates:
-                    wl_cmd = "whitelist on\n" if props.get("white-list") == "true" else "whitelist off\n"
-                    self._proc.stdin.write(wl_cmd)
-                self._proc.stdin.flush()
-            except (OSError, ValueError):
-                pass
+        if self.local_status == "running" and self._proc is not None:
+            cmds: List[str] = []
+            if "difficulty" in updates:
+                cmds.append(f"difficulty {props.get('difficulty', 'normal')}\n")
+            if "white-list" in updates:
+                wl_cmd = "whitelist on\n" if props.get("white-list") == "true" else "whitelist off\n"
+                cmds.append(wl_cmd)
+            if cmds:
+                self._write_stdin(self._proc, "".join(cmds))
+            self._publish_host_telemetry_throttled(force=True)
 
         self._push_idle_config_safely()
         return props
@@ -1662,7 +2150,9 @@ class MinecraftManager:
         - Stops the local server if running, deletes old world directories, updates server.properties,
           syncs the clean state to the Shared Cloud Folder, and automatically restarts if it was running.
         """
-        with self._mutex:
+        with self._lifecycle_lock:
+            if self.local_status in ("syncing_pull", "stopping", "syncing_push", "restarting"):
+                raise RuntimeError(f"Cannot change world map while server is '{self.local_status}'.")
             lock = self.sync_engine.get_lock()
             if lock.is_actively_locked() and not self.sync_engine.is_locked_by_current_machine(lock):
                 raise HostLockConflictError(
@@ -1689,30 +2179,28 @@ class MinecraftManager:
             props = self.get_server_properties()
             level_name = self._sanitize_level_name(props.get("level-name", "world"))
             cfg = self.sync_engine.load_cluster_config()
-            port = cfg.server_port if cfg else 25565
+            port = self._safe_int_prop(props, "server-port", cfg.server_port if cfg else 25565, 1, 65535)
 
             if was_running_locally:
                 self.local_status = "restarting"
                 self._reached_running = False
-                self.online_players = []
+                self.server_ready_at = 0.0
+                self.memory_used_mb = 0
+                self.cpu_percent = 0.0
+                self.tps = 0.0
+                self._last_metrics_sample_at = 0.0
+                with self._mutex:
+                    self.online_players = []
+                    proc_ref = self._proc
+                    self._proc = None
                 self.sync_engine.update_lock_state(status="restarting", online_players=[])
+                self._publish_host_telemetry_throttled(force=True)
                 self._emit("status_changed", self.get_status_summary())
                 self._emit("players_updated", self.get_players_data())
                 self._log("Stopping current world to generate new map...", "INFO", "Server")
 
-                if self._proc is not None:
-                    proc_ref = self._proc
-                    self._proc = None
-                    try:
-                        if proc_ref.stdin:
-                            proc_ref.stdin.write("save-all\n")
-                            proc_ref.stdin.flush()
-                            time.sleep(0.3)
-                            proc_ref.stdin.write("stop\n")
-                            proc_ref.stdin.flush()
-                        proc_ref.wait(timeout=12)
-                    except Exception:
-                        self._terminate_process_tree(proc_ref, wait_timeout=4.0)
+                if proc_ref is not None:
+                    self._stop_java_process_gracefully(proc_ref, wait_timeout=35.0)
 
                 self._stop_any_runtime_java_processes(server_port=port)
 
@@ -1724,9 +2212,11 @@ class MinecraftManager:
             backup_file: Optional[str] = None
             if backup_existing and (self.runtime_dir / level_name).exists():
                 try:
-                    bk_res = self.sync_engine.push_world_from_runtime(
+                    bk_res = self._push_world_compat(
                         create_backup=True,
                         backup_label="pre-world-reset",
+                        host_username=(user.username if user else ""),
+                        stage_copy_before_zip=False,
                     )
                     backup_file = bk_res.get("backupFile")
                     if backup_file:
@@ -1773,13 +2263,16 @@ class MinecraftManager:
                 prop_updates["disable-end"] = bool(disable_end)
                 prop_updates["allow-end"] = not bool(disable_end)
 
-            updated_props = self.update_server_properties(prop_updates)
+            updated_props = self.update_server_properties(prop_updates, _allow_during_transition=True)
+            self._get_cached_world_info(force_refresh=True)
 
             # Push clean runtime snapshot (with old world removed and new seed written) to Shared Sync Folder
             try:
-                self.sync_engine.push_world_from_runtime(
+                self._push_world_compat(
                     create_backup=False,
                     backup_label=(user.username if user else "admin"),
+                    host_username=(user.username if user else ""),
+                    require_lock_epoch=(lock.lock_epoch if was_running_locally else ""),
                 )
             except Exception as e:
                 self._log(f"Warning syncing new world configuration: {e}", "WARN", "SyncEngine")
@@ -1794,26 +2287,56 @@ class MinecraftManager:
 
             # If server was running locally, start it back up immediately so the new world generates right away
             if was_running_locally and cfg:
-                effective_user = user or self.active_host_user
-                max_players = int(updated_props.get("max-players", 20))
+                max_players = self._safe_int_prop(updated_props, "max-players", 20, 1, 1000)
+                self._active_max_players = max_players
+                self._active_server_port = port
                 self.local_status = "starting"
                 self.started_at = time.time()
+                self._last_player_active_at = self.started_at
                 self.sync_engine.update_lock_state(status="starting", max_players=max_players, online_players=[])
+                self._publish_host_telemetry_throttled(force=True)
                 self._emit("status_changed", self.get_status_summary())
 
                 java_info = self.check_java_installed(cfg.java_path, cfg.mc_version)
                 target_jar = get_versioned_jar_path(self.bin_dir, cfg.mc_software, cfg.mc_version)
                 has_jar = target_jar.exists() and target_jar.stat().st_size > 1_000_000
 
-                if java_info["installed"] and has_jar and os.environ.get("MINERELAY_TEST_MODE") != "1":
-                    ensure_paperclip_mojang_cache(
-                        target_jar,
-                        self.runtime_dir,
-                        log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
+                try:
+                    if os.environ.get("MINERELAY_TEST_MODE") == "1":
+                        self._spawn_embedded_minecraft_runtime(cfg, has_jar, java_info["installed"], max_players)
+                    else:
+                        if not java_info["installed"]:
+                            ensure_portable_java(
+                                self.bin_dir,
+                                min_major=required_java_major_for_mc(cfg.mc_version),
+                                log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
+                            )
+                            self._java_cache.clear()
+                            java_info = self.check_java_installed(cfg.java_path, cfg.mc_version)
+                        if not has_jar:
+                            target_jar = ensure_server_jar(
+                                self.runtime_dir,
+                                cfg.mc_software,
+                                cfg.mc_version,
+                                log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
+                                bin_dir=self.bin_dir,
+                            )
+                            has_jar = target_jar.exists() and target_jar.stat().st_size > 1_000_000
+                        if not java_info["installed"] or not has_jar:
+                            raise RuntimeError(
+                                "Java runtime or server.jar missing; cannot restart server after world reset."
+                            )
+                        ensure_paperclip_mojang_cache(
+                            target_jar,
+                            self.runtime_dir,
+                            log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
+                        )
+                        self._spawn_java_minecraft(cfg, java_info["command"], target_jar, max_players)
+                except Exception as restart_err:
+                    self._cleanup_after_failed_start(
+                        f"Failed to restart server after world reset: {restart_err}"
                     )
-                    self._spawn_java_minecraft(cfg, java_info["command"], target_jar, max_players)
-                else:
-                    self._spawn_embedded_minecraft_runtime(cfg, has_jar, java_info["installed"], max_players)
+                    raise
 
             return {
                 "reset": True,
@@ -1823,7 +2346,7 @@ class MinecraftManager:
                 "removedDirs": removed_dirs,
                 "backupFile": backup_file,
                 "restarted": was_running_locally,
-                "world": self.get_world_info(),
+                "world": self._get_cached_world_info(force_refresh=True) or self.get_world_info(),
                 "properties": updated_props,
                 "status": self.get_status_summary(),
             }
@@ -1884,13 +2407,9 @@ class MinecraftManager:
                 else:
                     continue
             current[clean_rule] = val_norm
-            if self.local_status == "running" and self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"gamerule {clean_rule} {cmd_val}\n")
-                    self._proc.stdin.flush()
+            if self.local_status == "running" and self._proc is not None:
+                if self._write_stdin(self._proc, f"gamerule {clean_rule} {cmd_val}\n"):
                     applied_live.append(f"{clean_rule}={cmd_val}")
-                except (OSError, ValueError):
-                    pass
 
         cfg.gamerules = current
         self.sync_engine.save_cluster_config(cfg)
@@ -1905,16 +2424,15 @@ class MinecraftManager:
             cfg = self.sync_engine.load_cluster_config()
             if not cfg or not cfg.gamerules or not proc.stdin:
                 return
+            cmds: List[str] = []
             for rule, val in cfg.gamerules.items():
                 clean_rule = re.sub(r"[^a-zA-Z0-9_]", "", str(rule).strip())
                 if not clean_rule:
                     continue
-                default_val = self.DEFAULT_GAMERULES.get(clean_rule)
-                if val == default_val:
-                    continue
                 cmd_val = ("true" if val else "false") if isinstance(val, bool) else str(val)
-                proc.stdin.write(f"gamerule {clean_rule} {cmd_val}\n")
-            proc.stdin.flush()
+                cmds.append(f"gamerule {clean_rule} {cmd_val}\n")
+            if cmds:
+                self._write_stdin(proc, "".join(cmds))
         except Exception:
             pass
 
@@ -1988,10 +2506,16 @@ class MinecraftManager:
                         item["uuid"] = self._compute_offline_uuid(str(item["name"]))
                         modified = True
             if modified:
-                try:
-                    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                except OSError:
-                    pass
+                can_write = True
+                if self.local_status == "idle":
+                    lock = self.sync_engine.get_lock()
+                    if lock.is_actively_locked() and not self.sync_engine.is_locked_by_current_machine(lock):
+                        can_write = False
+                if can_write:
+                    try:
+                        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                    except OSError:
+                        pass
             return data
         except Exception:
             return []
@@ -2003,15 +2527,29 @@ class MinecraftManager:
         self._push_idle_config_safely()
 
     def get_players_data(self) -> Dict[str, Any]:
-        lock = self.sync_engine.get_lock()
         with self._mutex:
-            online = (
-                list(self.online_players)
-                if self.local_status == "running"
-                else (list(lock.online_players) if lock.is_actively_locked() else [])
-            )
+            local_running = self.local_status == "running"
+            local_online = list(self.online_players) if local_running else None
+            local_max = self._active_max_players
+        if local_online is not None:
+            online = local_online
+            max_p = local_max or 20
+        else:
+            lock = self.sync_engine.get_lock()
+            is_local_host = self.sync_engine.is_locked_by_current_machine(lock)
+            if (not is_local_host) and self.local_status == "idle" and lock.is_actively_locked():
+                remote_tel = self.sync_engine.read_host_telemetry(expected_epoch=lock.lock_epoch)
+                if remote_tel and isinstance(remote_tel.get("onlinePlayers"), list):
+                    online = [str(p) for p in remote_tel["onlinePlayers"] if p]
+                else:
+                    online = list(lock.online_players)
+                max_p = int((remote_tel.get("maxPlayers") if remote_tel and remote_tel.get("maxPlayers") else lock.max_players) or 20)
+            else:
+                online = list(lock.online_players) if lock.is_actively_locked() else []
+                max_p = lock.max_players or 20
         return {
             "online": online,
+            "max": max_p,
             "ops": self._read_player_json("ops.json"),
             "whitelist": self._read_player_json("whitelist.json"),
             "banned": self._read_player_json("banned-players.json"),
@@ -2023,31 +2561,34 @@ class MinecraftManager:
             raise ValueError("Player username is required.")
         clean_reason = (reason or "").replace("\r", " ").replace("\n", " ").strip()
 
-        player_uuid = self._resolve_player_uuid(clean_user)
+        if self.local_status == "idle":
+            lock = self.sync_engine.get_lock()
+            if lock.is_actively_locked() and not self.sync_engine.is_locked_by_current_machine(lock):
+                raise HostLockConflictError(
+                    f"Cannot modify or control player '{clean_user}' while '{lock.host_username}' is hosting on '{lock.machine_name}'."
+                )
+
+        live_only_actions = ("kick", "gamemode", "heal", "tp_spawn", "xp_level", "clear_inventory", "whisper")
+        if action in live_only_actions and self.local_status not in ("running", "starting"):
+            raise RuntimeError("Server must be running locally to execute live player commands.")
+
+        player_uuid = self._resolve_player_uuid(clean_user) if action in ("op", "whitelist_add", "ban") else ""
 
         if action == "op":
             ops = self._read_player_json("ops.json")
             if not any(o.get("name", "").lower() == clean_user.lower() for o in ops):
                 ops.append({"uuid": player_uuid, "name": clean_user, "level": 4, "bypassesPlayerLimit": False})
                 self._write_player_json("ops.json", ops)
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"op {clean_user}\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self.local_status == "running" and self._proc is not None:
+                self._write_stdin(self._proc, f"op {clean_user}\n")
             self._log(f"Made {clean_user} a server operator", "INFO", "Server")
             self._emit("players_updated", self.get_players_data())
 
         elif action == "deop":
             ops = [o for o in self._read_player_json("ops.json") if o.get("name", "").lower() != clean_user.lower()]
             self._write_player_json("ops.json", ops)
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"deop {clean_user}\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self.local_status == "running" and self._proc is not None:
+                self._write_stdin(self._proc, f"deop {clean_user}\n")
             self._log(f"Made {clean_user} no longer a server operator", "INFO", "Server")
             self._emit("players_updated", self.get_players_data())
 
@@ -2056,26 +2597,16 @@ class MinecraftManager:
             if not any(w.get("name", "").lower() == clean_user.lower() for w in wl):
                 wl.append({"uuid": player_uuid, "name": clean_user})
                 self._write_player_json("whitelist.json", wl)
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"whitelist add {clean_user}\n")
-                    self._proc.stdin.write("whitelist reload\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self.local_status == "running" and self._proc is not None:
+                self._write_stdin(self._proc, f"whitelist add {clean_user}\nwhitelist reload\n")
             self._log(f"Added {clean_user} to the whitelist", "INFO", "Server")
             self._emit("players_updated", self.get_players_data())
 
         elif action == "whitelist_remove":
             wl = [w for w in self._read_player_json("whitelist.json") if w.get("name", "").lower() != clean_user.lower()]
             self._write_player_json("whitelist.json", wl)
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"whitelist remove {clean_user}\n")
-                    self._proc.stdin.write("whitelist reload\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self.local_status == "running" and self._proc is not None:
+                self._write_stdin(self._proc, f"whitelist remove {clean_user}\nwhitelist reload\n")
             self._log(f"Removed {clean_user} from the whitelist", "INFO", "Server")
             self._emit("players_updated", self.get_players_data())
 
@@ -2091,19 +2622,16 @@ class MinecraftManager:
                     "reason": clean_reason,
                 })
                 self._write_player_json("banned-players.json", banned)
-            with self._mutex:
-                to_remove = [p for p in self.online_players if p.lower() == clean_user.lower()]
-                for p in to_remove:
-                    self.online_players.remove(p)
-                curr_players = list(self.online_players)
-            self.sync_engine.update_lock_state(online_players=curr_players)
-            if self._proc and self._proc.stdin:
-                try:
+            if self.local_status in ("running", "starting"):
+                with self._mutex:
+                    to_remove = [p for p in self.online_players if p.lower() == clean_user.lower()]
+                    for p in to_remove:
+                        self.online_players.remove(p)
+                    curr_players = list(self.online_players)
+                self.sync_engine.update_lock_state(online_players=curr_players)
+                if self._proc is not None:
                     ban_cmd = f"ban {clean_user} {clean_reason}\n" if clean_reason else f"ban {clean_user}\n"
-                    self._proc.stdin.write(ban_cmd)
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+                    self._write_stdin(self._proc, ban_cmd)
             self._log(f"Banned player {clean_user}: {clean_reason}", "INFO", "Server")
             self._emit("status_changed", self.get_status_summary())
             self._emit("players_updated", self.get_players_data())
@@ -2111,12 +2639,8 @@ class MinecraftManager:
         elif action == "pardon":
             banned = [b for b in self._read_player_json("banned-players.json") if b.get("name", "").lower() != clean_user.lower()]
             self._write_player_json("banned-players.json", banned)
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"pardon {clean_user}\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self.local_status == "running" and self._proc is not None:
+                self._write_stdin(self._proc, f"pardon {clean_user}\n")
             self._log(f"Unbanned player {clean_user}", "INFO", "Server")
             self._emit("players_updated", self.get_players_data())
 
@@ -2127,73 +2651,51 @@ class MinecraftManager:
                     self.online_players.remove(p)
                 curr_players = list(self.online_players)
             self.sync_engine.update_lock_state(online_players=curr_players)
-            if self._proc and self._proc.stdin:
-                try:
-                    kick_cmd = f"kick {clean_user} {clean_reason}\n" if clean_reason else f"kick {clean_user}\n"
-                    self._proc.stdin.write(kick_cmd)
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self._proc is not None:
+                kick_cmd = f"kick {clean_user} {clean_reason}\n" if clean_reason else f"kick {clean_user}\n"
+                self._write_stdin(self._proc, kick_cmd)
             self._log(f"Kicked {clean_user} from the game", "INFO", "Server")
             self._emit("status_changed", self.get_status_summary())
             self._emit("players_updated", self.get_players_data())
 
         elif action == "gamemode":
             mode = clean_reason.lower() if clean_reason.lower() in ("survival", "creative", "adventure", "spectator") else "survival"
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"gamemode {mode} {clean_user}\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self._proc is not None:
+                self._write_stdin(self._proc, f"gamemode {mode} {clean_user}\n")
             self._log(f"Set {clean_user}'s gamemode to {mode}", "INFO", "Server")
 
         elif action == "heal":
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"effect give {clean_user} minecraft:instant_health 1 10 true\n")
-                    self._proc.stdin.write(f"effect give {clean_user} minecraft:saturation 5 10 true\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self._proc is not None:
+                self._write_stdin(
+                    self._proc,
+                    f"effect give {clean_user} minecraft:instant_health 1 10 true\n"
+                    f"effect give {clean_user} minecraft:saturation 5 10 true\n",
+                )
             self._log(f"Healed and fed {clean_user}", "INFO", "Server")
 
         elif action == "tp_spawn":
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"execute in minecraft:overworld run tp {clean_user} 0 100 0\n")
-                    self._proc.stdin.write(f"effect give {clean_user} minecraft:slow_falling 15 1 true\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self._proc is not None:
+                self._write_stdin(
+                    self._proc,
+                    f"execute in minecraft:overworld run tp {clean_user} 0 100 0\n"
+                    f"effect give {clean_user} minecraft:slow_falling 15 1 true\n",
+                )
             self._log(f"Teleported {clean_user} to world spawn", "INFO", "Server")
 
         elif action == "xp_level":
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"xp add {clean_user} 5 levels\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self._proc is not None:
+                self._write_stdin(self._proc, f"xp add {clean_user} 5 levels\n")
             self._log(f"Gave 5 XP levels to {clean_user}", "INFO", "Server")
 
         elif action == "clear_inventory":
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"clear {clean_user}\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self._proc is not None:
+                self._write_stdin(self._proc, f"clear {clean_user}\n")
             self._log(f"Cleared inventory of {clean_user}", "INFO", "Server")
 
         elif action == "whisper":
             msg = clean_reason or "Hello from Admin!"
-            if self._proc and self._proc.stdin:
-                try:
-                    self._proc.stdin.write(f"tell {clean_user} [Admin] {msg}\n")
-                    self._proc.stdin.flush()
-                except (OSError, ValueError):
-                    pass
+            if self._proc is not None:
+                self._write_stdin(self._proc, f"tell {clean_user} [Admin] {msg}\n")
             self._log(f"Whispered to {clean_user}: {msg}", "INFO", "Server")
 
         else:
@@ -2210,14 +2712,14 @@ class MinecraftManager:
 
     def download_server_jar(self, software: str, version: str) -> Dict[str, Any]:
         """Downloads official PaperMC or Vanilla Minecraft server.jar into data/bin/jars/."""
-        if self.jar_downloading:
-            return {"downloading": True, "progress": self.jar_download_progress, "status": self.jar_download_status}
-
         software = software.lower().strip()
         version = version.strip()
-        self.jar_downloading = True
-        self.jar_download_progress = 10
-        self.jar_download_status = f"Resolving {software.upper()} {version} download URL..."
+        with self._jar_dl_lock:
+            if self.jar_downloading:
+                return {"downloading": True, "progress": self.jar_download_progress, "status": self.jar_download_status}
+            self.jar_downloading = True
+            self.jar_download_progress = 10
+            self.jar_download_status = f"Resolving {software.upper()} {version} download URL..."
 
         def _worker() -> None:
             try:
@@ -2230,6 +2732,7 @@ class MinecraftManager:
                         min_major=req_java,
                         log_fn=lambda msg: self._log(msg, "INFO", "Installer"),
                     )
+                    self._java_cache.clear()
 
                 jar_path = ensure_server_jar(
                     self.runtime_dir,
@@ -2244,17 +2747,19 @@ class MinecraftManager:
                     f"Installed {software.upper()} {version} ({round(jar_path.stat().st_size / (1024*1024), 1)} MB)"
                 )
 
-                cfg = self.sync_engine.load_cluster_config()
-                if cfg:
-                    cfg.mc_software = software
-                    cfg.mc_version = version
-                    self.sync_engine.save_cluster_config(cfg)
+                with self._jar_dl_lock:
+                    cfg = self.sync_engine.load_cluster_config()
+                    if cfg:
+                        cfg.mc_software = software
+                        cfg.mc_version = version
+                        self.sync_engine.save_cluster_config(cfg)
 
             except Exception as e:
                 self.jar_download_status = f"Download failed: {e}"
                 self._log(self.jar_download_status, "ERROR", "Installer")
             finally:
-                self.jar_downloading = False
+                with self._jar_dl_lock:
+                    self.jar_downloading = False
                 self._emit("status_changed", self.get_status_summary())
 
         threading.Thread(target=_worker, daemon=True, name="JarDownloader").start()
@@ -2388,7 +2893,10 @@ class MinecraftManager:
         target_dir = self._safe_resolve_runtime_path(rel_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
         target_file = target_dir / safe_name
-        raw_bytes = base64.b64decode(base64_data)
+        try:
+            raw_bytes = base64.b64decode(base64_data, validate=True)
+        except (binascii.Error, ValueError) as e:
+            raise ValueError(f"Invalid base64 upload payload: {e}")
         target_file.write_bytes(raw_bytes)
         self._push_idle_config_safely()
         return {
@@ -2654,78 +3162,182 @@ class MinecraftManager:
         with self._mutex:
             local_running = self.local_status == "running"
             local_players = list(self.online_players) if local_running else None
+            local_max = self._active_max_players
+        if local_players is not None:
+            return {
+                "online": local_players,
+                "count": len(local_players),
+                "max": local_max or self.sync_engine.get_lock().max_players or 20,
+            }
         lock = self.sync_engine.get_lock()
-        online_list = local_players if local_players is not None else (
-            list(lock.online_players) if lock.is_actively_locked() else []
-        )
+        is_local_host = self.sync_engine.is_locked_by_current_machine(lock)
+        if not is_local_host and lock.is_actively_locked():
+            remote_tel = self.sync_engine.read_host_telemetry(expected_epoch=lock.lock_epoch)
+            if remote_tel and isinstance(remote_tel.get("onlinePlayers"), list):
+                online_list = [str(p) for p in remote_tel["onlinePlayers"] if p]
+            else:
+                online_list = list(lock.online_players)
+            max_p = int((remote_tel.get("maxPlayers") if remote_tel and remote_tel.get("maxPlayers") else lock.max_players) or 20)
+        else:
+            online_list = list(lock.online_players) if lock.is_actively_locked() else []
+            max_p = lock.max_players or 20
         return {
             "online": online_list,
             "count": len(online_list),
-            "max": lock.max_players or 20,
+            "max": max_p,
         }
 
     def get_status_summary(self) -> Dict[str, Any]:
         cfg = self.sync_engine.load_cluster_config()
         lock = self.sync_engine.get_lock()
         is_local_host = self.sync_engine.is_locked_by_current_machine(lock)
+        remote_hosting = (not is_local_host) and (self.local_status == "idle") and lock.is_actively_locked()
+        remote_tel: Optional[Dict[str, Any]] = None
+        if remote_hosting:
+            remote_tel = self.sync_engine.read_host_telemetry(expected_epoch=lock.lock_epoch)
+
         with self._mutex:
             if is_local_host and self.local_status == "running":
                 lock.online_players = list(self.online_players)
-            online_list = (
-                list(self.online_players)
-                if self.local_status == "running"
-                else list(lock.online_players)
-            )
+            if self.local_status == "running":
+                online_list = list(self.online_players)
+            elif remote_hosting and remote_tel and isinstance(remote_tel.get("onlinePlayers"), list):
+                online_list = [str(p) for p in remote_tel["onlinePlayers"] if p]
+            else:
+                online_list = list(lock.online_players) if lock.is_actively_locked() else []
+
         mc_ver = cfg.mc_version if cfg else "26.3"
         java_info = self.check_java_installed(cfg.java_path if cfg else "java", mc_ver)
         active_jar = self.get_active_jar_path()
         has_jar = active_jar.exists() and active_jar.stat().st_size > 1_000_000
 
-        remote_hosting = (not is_local_host) and (self.local_status == "idle") and lock.is_actively_locked()
-        remote_tel: Optional[Dict[str, Any]] = None
+        cluster_dict = cfg.to_dict(include_secrets=False) if cfg else None
+        lock_dict = lock.to_dict()
+
         if remote_hosting:
-            remote_tel = self.sync_engine.read_host_telemetry(expected_epoch=lock.lock_epoch)
-            ref_start = (
-                float(remote_tel.get("serverReadyAt") or 0.0) if remote_tel else 0.0
-            ) or lock.server_ready_at or lock.started_at
-            uptime_sec = int(max(0.0, time.time() - ref_start)) if ref_start else 0
+            effective_status = str((remote_tel.get("status") if remote_tel and remote_tel.get("status") else lock.status) or "idle")
+            effective_runtime_mode = str((remote_tel.get("runtimeMode") if remote_tel and remote_tel.get("runtimeMode") else self.runtime_mode) or self.runtime_mode)
+            effective_last_error = str((remote_tel.get("lastError") if remote_tel and remote_tel.get("lastError") else "") or self.last_error or "")
+            tel_max_players = int((remote_tel.get("maxPlayers") if remote_tel and remote_tel.get("maxPlayers") else lock.max_players) or 20)
+
+            uptime_sec = 0
+            if effective_status == "running":
+                if remote_tel and remote_tel.get("uptimeSeconds") is not None:
+                    base_up = float(remote_tel.get("uptimeSeconds") or 0.0)
+                    tel_upd = float(remote_tel.get("updatedAt") or 0.0)
+                    age = (time.time() - tel_upd) if tel_upd > 0 else 0.0
+                    uptime_sec = int(max(0.0, base_up + age)) if 0.0 <= age <= 30.0 else int(max(0.0, base_up))
+                else:
+                    ref_start = (
+                        float(remote_tel.get("serverReadyAt") or 0.0) if remote_tel else 0.0
+                    ) or lock.server_ready_at or lock.started_at
+                    uptime_sec = int(max(0.0, time.time() - ref_start)) if ref_start else 0
+
             tel_tps = float((remote_tel.get("tps") if remote_tel and remote_tel.get("tps") is not None else lock.tps) or 0.0)
-            if lock.status == "running" and tel_tps <= 0.0:
+            if effective_status == "running" and tel_tps <= 0.0:
                 tel_tps = 20.0
+            elif effective_status != "running":
+                tel_tps = 0.0
             tel_mem_used = int((remote_tel.get("memoryUsedMb") if remote_tel and remote_tel.get("memoryUsedMb") is not None else lock.memory_used_mb) or 0)
             tel_mem_max = int((remote_tel.get("memoryMaxMb") if remote_tel and remote_tel.get("memoryMaxMb") else lock.memory_max_mb) or (cfg.memory_max_mb if cfg else 4096))
             tel_cpu = round(float((remote_tel.get("cpuPercent") if remote_tel and remote_tel.get("cpuPercent") is not None else lock.cpu_percent) or 0.0), 1)
+
             tunnel_state = dict(self.tunnel_manager.get_state())
-            tunnel_state["status"] = lock.tunnel_status or tunnel_state.get("status", "stopped")
-            if lock.public_address:
-                tunnel_state["publicAddress"] = lock.public_address
+            tunnel_state["status"] = str(
+                (remote_tel.get("tunnelStatus") if remote_tel and remote_tel.get("tunnelStatus") else lock.tunnel_status)
+                or "stopped"
+            )
+            tunnel_state["publicAddress"] = str(
+                (remote_tel.get("publicAddress") if remote_tel else "") or lock.public_address or ""
+            )
+            tunnel_state["claimUrl"] = ""
+            tunnel_state["logs"] = (
+                list(remote_tel["tunnelLogs"][-40:])
+                if remote_tel and isinstance(remote_tel.get("tunnelLogs"), list)
+                else []
+            )
+            remote_lan_ip = (
+                str(remote_tel.get("hostLanIp") or remote_tel.get("tunnelLanIp") or "")
+                if remote_tel
+                else ""
+            )
+            tunnel_state["lanIp"] = remote_lan_ip
+            tunnel_state["hostLanIp"] = remote_lan_ip
+            tunnel_state["error"] = str(remote_tel.get("tunnelError") or "") if remote_tel else ""
+
+            world_info = (
+                remote_tel.get("worldInfo")
+                if remote_tel and isinstance(remote_tel.get("worldInfo"), dict)
+                else self._get_cached_world_info()
+            )
+            auto_sync_info = (
+                remote_tel.get("autoSync")
+                if remote_tel and isinstance(remote_tel.get("autoSync"), dict)
+                else self.get_auto_sync_status(cfg=cfg)
+            )
+            if cluster_dict and remote_tel:
+                if remote_tel.get("rawMcVersion"):
+                    cluster_dict["mcVersion"] = str(remote_tel["rawMcVersion"])
+                if remote_tel.get("mcSoftware"):
+                    cluster_dict["mcSoftware"] = str(remote_tel["mcSoftware"])
+                if remote_tel.get("serverName"):
+                    cluster_dict["serverName"] = str(remote_tel["serverName"])
+
+            lock_dict["status"] = effective_status
+            lock_dict["onlinePlayers"] = online_list
+            lock_dict["maxPlayers"] = tel_max_players
+            lock_dict["tps"] = tel_tps
+            lock_dict["memoryUsedMb"] = tel_mem_used
+            lock_dict["memoryMaxMb"] = tel_mem_max
+            lock_dict["cpuPercent"] = tel_cpu
+            lock_dict["tunnelStatus"] = tunnel_state["status"]
+            lock_dict["publicAddress"] = tunnel_state.get("publicAddress", "")
+            lock_dict["hostLanIp"] = remote_lan_ip
         else:
             self._sample_local_process_metrics()
-            ref_start = self.server_ready_at or lock.server_ready_at or (lock.started_at if lock.is_actively_locked() else self.started_at)
-            uptime_sec = int(max(0.0, time.time() - ref_start)) if (self.local_status != "idle" or lock.is_actively_locked()) and ref_start else 0
+            effective_runtime_mode = self.runtime_mode
+            effective_last_error = self.last_error
+            ref_start = self.server_ready_at or lock.server_ready_at
+            uptime_sec = int(max(0.0, time.time() - ref_start)) if (self.local_status == "running" and ref_start) else 0
             tel_tps = self.tps if self.local_status == "running" else 0.0
-            tel_mem_used = self.memory_used_mb if self.local_status != "idle" else 0
+            tel_mem_used = self.memory_used_mb if self.local_status in ("running", "starting", "stopping", "restarting") else 0
             tel_mem_max = cfg.memory_max_mb if cfg else 4096
-            tel_cpu = self.cpu_percent if self.local_status != "idle" else 0.0
-            tunnel_state = self.tunnel_manager.get_state()
+            tel_cpu = self.cpu_percent if self.local_status in ("running", "starting", "stopping", "restarting") else 0.0
+            tel_max_players = self._active_max_players or (lock.max_players if lock.is_actively_locked() else 20) or 20
+            tunnel_state = dict(self.tunnel_manager.get_state())
+            local_lan_ip = str(tunnel_state.get("lanIp") or "")
+            tunnel_state["hostLanIp"] = local_lan_ip
+            world_info = self._get_cached_world_info()
+            auto_sync_info = self.get_auto_sync_status(cfg=cfg)
 
-        lock_dict = lock.to_dict()
-        if self.local_status != "idle":
-            lock_dict["isLocked"] = True
-            lock_dict["isActivelyLocked"] = True
-            lock_dict["machineId"] = self.sync_engine.local_config.machine_id
-            lock_dict["machineName"] = self.sync_engine.local_config.machine_name
-            lock_dict["status"] = self.local_status
-            if self.active_host_user:
-                lock_dict["hostUsername"] = self.active_host_user.username
-                lock_dict["hostUserId"] = self.active_host_user.id
+            if self.local_status != "idle":
+                lock_dict["isLocked"] = True
+                lock_dict["isActivelyLocked"] = True
+                lock_dict["machineId"] = self.sync_engine.local_config.machine_id
+                lock_dict["machineName"] = self.sync_engine.local_config.machine_name
+                lock_dict["status"] = self.local_status
+                lock_dict["onlinePlayers"] = online_list
+                lock_dict["maxPlayers"] = tel_max_players
+                lock_dict["tps"] = tel_tps
+                lock_dict["memoryUsedMb"] = tel_mem_used
+                lock_dict["memoryMaxMb"] = tel_mem_max
+                lock_dict["cpuPercent"] = tel_cpu
+                lock_dict["tunnelStatus"] = tunnel_state.get("status", "stopped")
+                lock_dict["publicAddress"] = tunnel_state.get("publicAddress", "")
+                lock_dict["hostLanIp"] = local_lan_ip
+                if self.server_ready_at:
+                    lock_dict["serverReadyAt"] = self.server_ready_at
+                if self.active_host_user:
+                    lock_dict["hostUsername"] = self.active_host_user.username
+                    lock_dict["hostUserId"] = self.active_host_user.id
 
         return {
             "localStatus": self.local_status,
-            "runtimeMode": self.runtime_mode,
-            "lastError": self.last_error,
+            "runtimeMode": effective_runtime_mode,
+            "lastError": effective_last_error,
             "isLocalMachineHosting": is_local_host or (self.local_status != "idle"),
             "onlinePlayers": online_list,
+            "maxPlayers": tel_max_players,
             "lock": lock_dict,
             "tunnel": tunnel_state,
             "telemetry": {
@@ -2735,6 +3347,8 @@ class MinecraftManager:
                 "cpuPercent": tel_cpu,
                 "uptimeSeconds": uptime_sec,
             },
+            "world": world_info,
+            "autoSync": auto_sync_info,
             "environment": {
                 "javaInstalled": java_info["installed"],
                 "javaVersion": java_info["version"],
@@ -2752,5 +3366,5 @@ class MinecraftManager:
                 "sharedSyncDir": str(self.sync_engine.shared_dir),
                 "syncDiagnostics": self.sync_engine.get_sync_diagnostics(),
             },
-            "cluster": cfg.to_dict(include_secrets=False) if cfg else None,
+            "cluster": cluster_dict,
         }
