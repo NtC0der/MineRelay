@@ -41,6 +41,7 @@ class SyncEngine:
         self.telemetry_provider: Optional[Callable[[], Dict[str, Any]]] = None
         self._lock_mutex = threading.RLock()
         self._sync_mutex = threading.RLock()
+        self._cluster_merge_lock = threading.RLock()
         self._browse_lock = threading.Lock()
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
@@ -409,71 +410,129 @@ class SyncEngine:
         return lock.is_actively_locked(t_now)
 
     def _merge_cluster_config_conflict(self, conflict_path: Path) -> None:
-        """Merges accounts and newer settings from a cloud conflict config file before cleanup."""
+        """Merges accounts, deletion tombstones, and newer settings from a cloud conflict config file before cleanup."""
         try:
-            cdata = self._read_json_safe(conflict_path)
-            if not isinstance(cdata, dict) or not cdata:
-                return
-            ccfg = ClusterConfig.from_dict(cdata)
-            mcfg = self.load_cluster_config()
-            if mcfg is None:
-                if ccfg.accounts:
-                    self.save_cluster_config(ccfg)
-                return
+            with self._cluster_merge_lock:
+                cdata = self._read_json_safe(conflict_path)
+                if not isinstance(cdata, dict) or not cdata:
+                    return
+                ccfg = ClusterConfig.from_dict(cdata)
+                mdata = self._read_json_safe(self.cluster_config_path)
+                mcfg = self.load_cluster_config(_reconcile_conflicts=False)
 
-            try:
-                c_mtime = conflict_path.stat().st_mtime
-            except OSError:
-                c_mtime = 0.0
-            try:
-                m_mtime = self.cluster_config_path.stat().st_mtime if self.cluster_config_path.exists() else 0.0
-            except OSError:
-                m_mtime = 0.0
-
-            changed = False
-            # If the conflict file is newer than or equal to the main file, adopt its non-account cluster settings
-            if c_mtime >= m_mtime and c_mtime > 0.0:
-                for attr in (
-                    "server_name",
-                    "mc_software",
-                    "mc_version",
-                    "memory_min_mb",
-                    "memory_max_mb",
-                    "java_path",
-                    "jvm_flags",
-                    "server_port",
-                    "tunnel_enabled",
-                    "tunnel_provider",
-                    "public_join_address",
-                    "git_sync_enabled",
-                    "auto_backup_on_stop",
-                    "max_backups",
-                    "idle_shutdown_minutes",
-                    "auto_sync_interval_minutes",
-                    "gamerules",
+                now = time.time()
+                merged_deleted: Dict[str, float] = {}
+                for raw_map in (
+                    getattr(mcfg, "deleted_accounts", None) if mcfg is not None else None,
+                    mdata.get("deletedAccounts") if isinstance(mdata, dict) else None,
+                    getattr(ccfg, "deleted_accounts", None),
+                    cdata.get("deletedAccounts"),
                 ):
-                    if hasattr(ccfg, attr) and hasattr(mcfg, attr):
-                        c_val = getattr(ccfg, attr)
-                        m_val = getattr(mcfg, attr)
-                        if c_val != m_val:
-                            setattr(mcfg, attr, c_val)
-                            changed = True
+                    if isinstance(raw_map, dict):
+                        for k, v in raw_map.items():
+                            acc_id = str(k).strip()
+                            if not acc_id:
+                                continue
+                            try:
+                                ts = float(v or 0.0)
+                            except (TypeError, ValueError):
+                                ts = 0.0
+                            if ts > merged_deleted.get(acc_id, -1.0):
+                                merged_deleted[acc_id] = ts
+                if len(merged_deleted) > 200:
+                    cutoff = now - (30 * 86400.0)
+                    merged_deleted = {k: v for k, v in merged_deleted.items() if v >= cutoff}
 
-            by_id = {a.id: a for a in mcfg.accounts}
-            for acc in ccfg.accounts:
-                existing = by_id.get(acc.id)
-                if existing is None:
-                    mcfg.accounts.append(acc)
+                if mcfg is None:
+                    ccfg.accounts = [
+                        acc for acc in ccfg.accounts
+                        if merged_deleted.get(acc.id, -1.0) < float(acc.created_at or 0.0)
+                    ]
+                    if hasattr(ccfg, "deleted_accounts"):
+                        ccfg.deleted_accounts = merged_deleted
+                    if ccfg.accounts:
+                        self.save_cluster_config(ccfg)
+                    return
+
+                try:
+                    c_mtime = conflict_path.stat().st_mtime
+                except OSError:
+                    c_mtime = 0.0
+                try:
+                    m_mtime = self.cluster_config_path.stat().st_mtime if self.cluster_config_path.exists() else 0.0
+                except OSError:
+                    m_mtime = 0.0
+
+                c_is_newer = c_mtime >= m_mtime and c_mtime > 0.0
+                changed = False
+
+                # Purge any account in main config that was tombstoned at or after its creation
+                kept_accounts: List[UserAccount] = []
+                for acc in mcfg.accounts:
+                    del_ts = merged_deleted.get(acc.id, -1.0)
+                    if del_ts >= float(acc.created_at or 0.0):
+                        changed = True
+                    else:
+                        kept_accounts.append(acc)
+                if changed:
+                    mcfg.accounts = kept_accounts
+
+                # If the conflict file is newer than or equal to the main file, adopt its non-account cluster settings
+                if c_is_newer:
+                    for attr in (
+                        "server_name",
+                        "mc_software",
+                        "mc_version",
+                        "memory_min_mb",
+                        "memory_max_mb",
+                        "java_path",
+                        "jvm_flags",
+                        "server_port",
+                        "tunnel_enabled",
+                        "tunnel_provider",
+                        "public_join_address",
+                        "git_sync_enabled",
+                        "auto_backup_on_stop",
+                        "max_backups",
+                        "idle_shutdown_minutes",
+                        "auto_sync_interval_minutes",
+                        "gamerules",
+                    ):
+                        if hasattr(ccfg, attr) and hasattr(mcfg, attr):
+                            c_val = getattr(ccfg, attr)
+                            m_val = getattr(mcfg, attr)
+                            if c_val != m_val:
+                                setattr(mcfg, attr, c_val)
+                                changed = True
+
+                by_id = {a.id: a for a in mcfg.accounts}
+                for acc in ccfg.accounts:
+                    if merged_deleted.get(acc.id, -1.0) >= float(acc.created_at or 0.0):
+                        continue
+                    existing = by_id.get(acc.id)
+                    if existing is None:
+                        mcfg.accounts.append(acc)
+                        by_id[acc.id] = acc
+                        changed = True
+                    else:
+                        if acc.last_active_at > existing.last_active_at:
+                            existing.last_active_at = acc.last_active_at
+                            changed = True
+                        if acc.host_count > existing.host_count:
+                            existing.host_count = acc.host_count
+                            changed = True
+                        if c_is_newer:
+                            for acc_attr in ("username", "role", "passkey_hash", "passkey_salt", "passkey_hint"):
+                                new_v = getattr(acc, acc_attr)
+                                if new_v != getattr(existing, acc_attr):
+                                    setattr(existing, acc_attr, new_v)
+                                    changed = True
+
+                if hasattr(mcfg, "deleted_accounts") and getattr(mcfg, "deleted_accounts", None) != merged_deleted:
+                    mcfg.deleted_accounts = merged_deleted
                     changed = True
-                else:
-                    if acc.last_active_at > existing.last_active_at:
-                        existing.last_active_at = acc.last_active_at
-                        changed = True
-                    if acc.host_count > existing.host_count:
-                        existing.host_count = acc.host_count
-                        changed = True
-            if changed:
-                self.save_cluster_config(mcfg)
+                if changed:
+                    self.save_cluster_config(mcfg)
         except Exception:
             pass
 
@@ -621,7 +680,10 @@ class SyncEngine:
         for folder in (self.shared_dir, self.snapshots_dir):
             if not folder.exists():
                 continue
-            for item in list(folder.iterdir()):
+            for item in sorted(
+                folder.iterdir(),
+                key=lambda p: (0 if p.name.lower().startswith("sync-manifest") else 1, p.name.lower()),
+            ):
                 if not item.is_file():
                     continue
                 if ".tmp." in item.name:
@@ -681,7 +743,21 @@ class SyncEngine:
                                 if cand_src is None and bk_name and (self.backups_dir / bk_name).exists():
                                     if self._sha256_file(self.backups_dir / bk_name).lower() == cm_hash:
                                         cand_src = self.backups_dir / bk_name
+                                promoted_zip = False
+                                if cand_src is None and cm_hash and self.snapshots_dir.exists():
+                                    snap_conflict_re = re.compile(r"^latest-server\s*\(\d+\)\.zip$", re.IGNORECASE)
+                                    for zcand in self.snapshots_dir.iterdir():
+                                        if zcand.is_file() and snap_conflict_re.match(zcand.name):
+                                            try:
+                                                if self._sha256_file(zcand).lower() == cm_hash:
+                                                    cand_src = zcand
+                                                    promoted_zip = True
+                                                    break
+                                            except OSError:
+                                                continue
                                 if cand_src is not None:
+                                    if promoted_zip:
+                                        self._copy_file_preserving_cloud_id(cand_src, self.latest_snapshot_path)
                                     self._write_json_atomic(self.sync_manifest_path, cm, in_place_if_exists=True)
                                     manifest = cm
                                 elif transfer_active or (now - item.stat().st_mtime) < 120:
@@ -1165,25 +1241,31 @@ class SyncEngine:
         cfg = self.load_cluster_config()
         return cfg is not None and len(cfg.accounts) > 0
 
-    def load_cluster_config(self) -> Optional[ClusterConfig]:
+    def load_cluster_config(self, _reconcile_conflicts: bool = True) -> Optional[ClusterConfig]:
+        conflict_pattern = re.compile(r"^cluster-config\s*\(\d+\)\.json$", re.IGNORECASE)
+        conflict_files: List[Path] = []
+        if _reconcile_conflicts:
+            try:
+                with os.scandir(self.shared_dir) as it:
+                    for entry in it:
+                        if entry.name.lower().startswith("cluster-config") and conflict_pattern.match(entry.name):
+                            if entry.is_file(follow_symlinks=False):
+                                conflict_files.append(Path(entry.path))
+            except OSError:
+                pass
+
         data = self._read_json_safe(self.cluster_config_path)
         if not data:
             # Fallback to newest valid Google Drive conflict copy if main cluster-config.json is missing/corrupt
-            conflict_pattern = re.compile(r"^cluster-config\s*\(\d+\)\.json$", re.IGNORECASE)
             candidates: List[Tuple[float, Dict[str, Any]]] = []
-            try:
-                if self.shared_dir.exists():
-                    for item in self.shared_dir.iterdir():
-                        if item.is_file() and conflict_pattern.match(item.name):
-                            cdata = self._read_json_safe(item)
-                            if isinstance(cdata, dict) and cdata.get("accounts"):
-                                try:
-                                    cmtime = item.stat().st_mtime
-                                except OSError:
-                                    cmtime = 0.0
-                                candidates.append((cmtime, cdata))
-            except OSError:
-                pass
+            for item in conflict_files:
+                cdata = self._read_json_safe(item)
+                if isinstance(cdata, dict) and cdata.get("accounts"):
+                    try:
+                        cmtime = item.stat().st_mtime
+                    except OSError:
+                        cmtime = 0.0
+                    candidates.append((cmtime, cdata))
             if candidates:
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 data = candidates[0][1]
@@ -1193,6 +1275,21 @@ class SyncEngine:
                     pass
             else:
                 return None
+
+        if _reconcile_conflicts and conflict_files and not self._has_active_cloud_transfer():
+            with self._cluster_merge_lock:
+                for cpath in conflict_files:
+                    if cpath.exists():
+                        self._merge_cluster_config_conflict(cpath)
+                        try:
+                            if self.cluster_config_path.exists():
+                                cpath.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            refreshed = self._read_json_safe(self.cluster_config_path)
+            if isinstance(refreshed, dict) and refreshed:
+                data = refreshed
+
         cfg = ClusterConfig.from_dict(data)
         migrated = False
         for acc in cfg.accounts:
@@ -1607,6 +1704,16 @@ class SyncEngine:
                 else ""
             )
             lock_epoch = reuse_epoch or f"{int(now * 1000)}-{secrets.token_hex(4)}"
+            carry_seq, carry_hash, _ = self.get_expected_snapshot_state()
+            if current.expected_snapshot_seq > carry_seq:
+                carry_seq = current.expected_snapshot_seq
+                carry_hash = current.expected_snapshot_hash or carry_hash
+            manifest = self._read_sync_manifest()
+            if manifest:
+                m_seq = int(manifest.get("snapshotSeq", 0) or 0)
+                m_hash = str(manifest.get("sha256", "") or "")
+                if m_seq > carry_seq:
+                    carry_seq, carry_hash = m_seq, m_hash
 
             new_lock = HostLock(
                 is_locked=True,
@@ -1623,6 +1730,8 @@ class SyncEngine:
                 mc_version=mc_version,
                 online_players=[],
                 lock_epoch=lock_epoch,
+                expected_snapshot_seq=carry_seq,
+                expected_snapshot_hash=carry_hash,
             )
             self.save_lock(new_lock)
 
@@ -1723,6 +1832,38 @@ class SyncEngine:
         except Exception:
             return None
 
+    def _has_released_tombstone(self, lock_epoch: str) -> bool:
+        if not lock_epoch:
+            return False
+        if lock_epoch in self._known_released_epochs:
+            return True
+        if os.path.exists(self.locks_dir / f"released-{lock_epoch}.json"):
+            self._known_released_epochs.add(lock_epoch)
+            return True
+        locks_conflict_re = re.compile(r"^locks\s*\(\d+\)$", re.IGNORECASE)
+        prefix = f"released-{lock_epoch}"
+        try:
+            with os.scandir(self.shared_dir) as it:
+                for entry in it:
+                    if not (entry.name == "locks" or locks_conflict_re.match(entry.name)):
+                        continue
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        with os.scandir(entry.path) as lit:
+                            for lentry in lit:
+                                lname = lentry.name
+                                if lname.startswith(prefix) and lname.endswith(".json") and lentry.is_file(follow_symlinks=False):
+                                    norm_epoch = self._strip_conflict_suffix(lname[len("released-"):-len(".json")])
+                                    if norm_epoch == lock_epoch:
+                                        self._known_released_epochs.add(lock_epoch)
+                                        return True
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return False
+
     def update_lock_state(
         self,
         status: Optional[str] = None,
@@ -1744,8 +1885,7 @@ class SyncEngine:
                 and self._owns_active_lock
                 and self._active_lock_epoch
                 and self._cached_own_lock is not None
-                and self._active_lock_epoch not in self._known_released_epochs
-                and not os.path.exists(self.locks_dir / f"released-{self._active_lock_epoch}.json")
+                and not self._has_released_tombstone(self._active_lock_epoch)
             ):
                 try:
                     if os.stat(self.host_lock_path).st_mtime == self._cached_own_lock_mtime:
@@ -1754,9 +1894,23 @@ class SyncEngine:
                     current = None
             if current is None:
                 current = self.get_lock()
-            if not current.is_locked or current.machine_id != self.local_config.machine_id:
-                return None
-            if self._active_lock_epoch and current.lock_epoch and current.lock_epoch != self._active_lock_epoch:
+            if (
+                not current.is_locked
+                or current.machine_id != self.local_config.machine_id
+                or (self._active_lock_epoch and current.lock_epoch and current.lock_epoch != self._active_lock_epoch)
+            ):
+                was_owning = self._owns_active_lock
+                expected_ep = self._active_lock_epoch
+                self._owns_active_lock = False
+                self._active_lock_epoch = ""
+                self._cached_own_lock = None
+                self._cached_own_lock_mtime = 0.0
+                self._stop_heartbeat_loop()
+                if was_owning:
+                    self._emit("lock_lost", {
+                        "expectedEpoch": expected_ep,
+                        "currentLock": current.to_dict(),
+                    })
                 return None
             now = time.time()
             current.last_heartbeat = now
@@ -1949,6 +2103,29 @@ class SyncEngine:
     # World & Server Files Snapshot Sync (Shared Cloud Folder <-> Local Runtime)
     # -------------------------------------------------------------------------
 
+    def _has_snapshot_conflicts(self) -> bool:
+        snap_folder_re = re.compile(r"^snapshots\s*\(\d+\)$", re.IGNORECASE)
+        snap_file_re = re.compile(r"^(sync-manifest|latest-server)\s*\(\d+\)\.(json|zip)$", re.IGNORECASE)
+        try:
+            with os.scandir(self.shared_dir) as it:
+                for entry in it:
+                    ename = entry.name
+                    if ename.lower().startswith("snapshots") and snap_folder_re.match(ename):
+                        if entry.is_dir(follow_symlinks=False):
+                            return True
+                    elif snap_file_re.match(ename) and entry.is_file(follow_symlinks=False):
+                        return True
+        except OSError:
+            pass
+        try:
+            with os.scandir(self.snapshots_dir) as it:
+                for entry in it:
+                    if snap_file_re.match(entry.name) and entry.is_file(follow_symlinks=False):
+                        return True
+        except OSError:
+            pass
+        return False
+
     def ensure_runtime_synced_when_idle(self, strict: bool = False) -> None:
         """
         Ensures that before an idle machine reads or edits config files (like server.properties),
@@ -1956,6 +2133,9 @@ class SyncEngine:
         it pulls that snapshot first so we never clobber a newer world save!
         """
         with self._sync_mutex:
+            self.git_pull_if_enabled()
+            if self._has_snapshot_conflicts():
+                self._cleanup_cloud_conflict_files()
             manifest = self._read_sync_manifest()
             expected_seq, expected_hash, _ = self.get_expected_snapshot_state()
             if not self.latest_snapshot_path.exists() and not manifest and expected_seq == 0:
@@ -1985,7 +2165,13 @@ class SyncEngine:
                 else:
                     snap_changed = bool(manifest)
 
-                manifest_changed = bool(manifest and manifest_seq > 0 and manifest_seq != self._last_synced_manifest_seq)
+                manifest_changed = bool(
+                    manifest
+                    and (
+                        (manifest_seq > 0 and manifest_seq != self._last_synced_manifest_seq)
+                        or (manifest_hash and manifest_hash != self._last_synced_snapshot_hash)
+                    )
+                )
                 if missing_runtime or snap_changed or manifest_changed:
                     self.pull_world_to_runtime(strict=strict)
             except OSError:
@@ -2572,25 +2758,41 @@ class SyncEngine:
         safe_name = Path(backup_name).name
         if not safe_name or safe_name in (".", ".."):
             return False
-        target = self.backups_dir / safe_name
-        if target.exists() and target.is_file():
-            manifest = self._read_sync_manifest()
-            if manifest and Path(str(manifest.get("backupFile", "") or "")).name == safe_name:
-                exp_hash = str(manifest.get("sha256", "") or "").lower()
-                snap_ok = (
-                    self.latest_snapshot_path.exists()
-                    and exp_hash
-                    and self._sha256_file(self.latest_snapshot_path).lower() == exp_hash
+        lock = self.get_lock()
+        if lock.is_actively_locked() and not self.is_locked_by_current_machine(lock):
+            raise HostLockConflictError(
+                f"Cannot delete backup '{safe_name}' while '{lock.host_username}' is hosting on '{lock.machine_name}'."
+            )
+        acquired = self._sync_mutex.acquire(timeout=5.0)
+        if not acquired:
+            raise RuntimeError("Another snapshot sync or backup operation is in progress. Try again in a moment.")
+        try:
+            lock = self.get_lock()
+            if lock.is_actively_locked() and not self.is_locked_by_current_machine(lock):
+                raise HostLockConflictError(
+                    f"Cannot delete backup '{safe_name}' while '{lock.host_username}' is hosting on '{lock.machine_name}'."
                 )
-                if not snap_ok:
-                    raise RuntimeError(
-                        f"Cannot delete '{safe_name}' while it is the active fallback for the latest cloud snapshot."
+            target = self.backups_dir / safe_name
+            if target.exists() and target.is_file():
+                manifest = self._read_sync_manifest()
+                if manifest and Path(str(manifest.get("backupFile", "") or "")).name == safe_name:
+                    exp_hash = str(manifest.get("sha256", "") or "").lower()
+                    snap_ok = (
+                        self.latest_snapshot_path.exists()
+                        and exp_hash
+                        and self._sha256_file(self.latest_snapshot_path).lower() == exp_hash
                     )
-                manifest["backupFile"] = ""
-                self._write_json_atomic(self.sync_manifest_path, manifest, in_place_if_exists=True)
-            target.unlink()
-            return True
-        return False
+                    if not snap_ok:
+                        raise RuntimeError(
+                            f"Cannot delete '{safe_name}' while it is the active fallback for the latest cloud snapshot."
+                        )
+                    manifest["backupFile"] = ""
+                    self._write_json_atomic(self.sync_manifest_path, manifest, in_place_if_exists=True)
+                target.unlink()
+                return True
+            return False
+        finally:
+            self._sync_mutex.release()
 
     def _prune_old_backups(self, protect_name: str = "") -> None:
         cfg = self.load_cluster_config()

@@ -275,6 +275,8 @@ class AuthService:
                 last_active_at=0.0,
             )
             config.accounts.append(member)
+            if isinstance(config.deleted_accounts, dict):
+                config.deleted_accounts.pop(member.id, None)
             self.sync_engine.save_cluster_config(config)
             return member, raw_passkey
 
@@ -307,6 +309,18 @@ class AuthService:
 
             target.username = clean_name
             self.sync_engine.save_cluster_config(config)
+            try:
+                with self.sync_engine._lock_mutex:
+                    lock = self.sync_engine.get_lock()
+                    if (
+                        lock.is_actively_locked()
+                        and self.sync_engine.is_locked_by_current_machine(lock)
+                        and lock.host_user_id == target_user_id
+                    ):
+                        lock.host_username = clean_name
+                        self.sync_engine.save_lock(lock, fsync=True, include_session=True)
+            except Exception:
+                pass
             return target
 
     def rotate_passkey(self, admin_token: str, target_user_id: str) -> Tuple[UserAccount, str]:
@@ -370,6 +384,15 @@ class AuthService:
                 raise ValueError("Cannot delete the primary Admin account.")
 
             config.accounts = [a for a in config.accounts if a.id != target_user_id]
+            if not isinstance(config.deleted_accounts, dict):
+                config.deleted_accounts = {}
+            now = time.time()
+            config.deleted_accounts[target_user_id] = now
+            if len(config.deleted_accounts) > 200:
+                cutoff = now - (30 * 86400)
+                config.deleted_accounts = {
+                    k: ts for k, ts in config.deleted_accounts.items() if ts >= cutoff or k == target_user_id
+                }
             self.sync_engine.save_cluster_config(config)
 
         # Invalidate any active sessions for the revoked member

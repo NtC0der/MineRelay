@@ -15,6 +15,12 @@ const state = {
   activeTabId: "tab-overview",
   availableVersions: null,
   isRemoteHosting: false,
+  isLocalHosting: false,
+  lastKnownSnapshotSeq: null,
+  lastKnownLockKey: "",
+  lastLocalStatus: "idle",
+  lastAutoSyncVal: null,
+  autoSyncDirty: false,
   currentFileDir: "",
   fileSearchQuery: "",
   filesRequestSeq: 0,
@@ -22,6 +28,9 @@ const state = {
   editingFilePath: "",
   editingFileSavedContent: "",
   lastOnlinePlayersKey: null,
+  lastOpsKey: null,
+  lastWhitelistKey: null,
+  lastBannedKey: null,
   lastMirrorEpoch: "",
   consoleFilter: "ALL",
   consoleSearch: "",
@@ -436,6 +445,12 @@ function leaveDashboard() {
   state.status = null;
   state.availableVersions = null;
   state.isRemoteHosting = false;
+  state.isLocalHosting = false;
+  state.lastKnownSnapshotSeq = null;
+  state.lastKnownLockKey = "";
+  state.lastLocalStatus = "idle";
+  state.lastAutoSyncVal = null;
+  state.autoSyncDirty = false;
   state.activeTabId = "tab-overview";
   state.currentFileDir = "";
   state.fileSearchQuery = "";
@@ -444,6 +459,9 @@ function leaveDashboard() {
   state.editingFilePath = "";
   state.editingFileSavedContent = "";
   state.lastOnlinePlayersKey = null;
+  state.lastOpsKey = null;
+  state.lastWhitelistKey = null;
+  state.lastBannedKey = null;
   state.lastMirrorEpoch = "";
   state.consoleFilter = "ALL";
   state.consoleSearch = "";
@@ -564,6 +582,58 @@ function applyRemoteLockStateToSummary(newLock) {
   }
 }
 
+function handleClusterSnapshotOrLockTransition(summary) {
+  if (!summary) return;
+  const env = summary.environment || {};
+  const lock = summary.lock || {};
+  const snapSeq = env.syncDiagnostics && env.syncDiagnostics.syncManifest
+    ? env.syncDiagnostics.syncManifest.snapshotSeq ?? null
+    : null;
+  const lockKey = [
+    Boolean(lock.isLocked),
+    Boolean(lock.isActivelyLocked),
+    lock.machineId || "",
+    lock.lockEpoch || "",
+    lock.status || "",
+  ].join("|");
+  const curLocal = summary.localStatus || "idle";
+
+  const snapshotChanged = state.lastKnownSnapshotSeq !== null && snapSeq !== null && snapSeq !== state.lastKnownSnapshotSeq;
+  const lockChanged = state.lastKnownLockKey !== "" && lockKey !== state.lastKnownLockKey;
+  const returnedIdle = state.lastLocalStatus !== "idle" && curLocal === "idle";
+
+  state.lastKnownSnapshotSeq = snapSeq;
+  state.lastKnownLockKey = lockKey;
+  state.lastLocalStatus = curLocal;
+
+  if (snapshotChanged || lockChanged || returnedIdle) {
+    state.fileCache = {};
+    if (state.account && state.account.role === "admin") {
+      if (state.activeTabId === "tab-files") {
+        loadAdminFiles(state.currentFileDir, state.fileSearchQuery);
+        loadAdminBackups();
+        const plgQ = document.getElementById("input-plugin-search")?.value.trim() || "";
+        loadAdminPlugins(plgQ);
+      } else if (state.activeTabId === "tab-players") {
+        loadAdminPlayers();
+      } else if (state.activeTabId === "tab-config") {
+        const tabCfg = document.getElementById("tab-config");
+        if (!tabCfg || !tabCfg.contains(document.activeElement)) {
+          loadAdminProperties(false);
+          loadAdminGamerules();
+        }
+      } else if (state.activeTabId === "tab-accounts") {
+        loadAdminAccounts();
+      } else if (state.activeTabId === "tab-network") {
+        const netCard = document.getElementById("tab-network");
+        if (!netCard || !netCard.contains(document.activeElement)) {
+          loadAdminProperties(false);
+        }
+      }
+    }
+  }
+}
+
 function handleConsoleEpochTransition(incoming) {
   const lock = (incoming && incoming.lock) || {};
   const env = (incoming && incoming.environment) || {};
@@ -639,6 +709,7 @@ function connectEventStream() {
         state.status = incoming;
         handleConsoleEpochTransition(incoming);
         renderStatusSummary(incoming);
+        handleClusterSnapshotOrLockTransition(incoming);
         if (Array.isArray(incoming.logs)) {
           renderAllConsoleLogs(incoming.logs, { isSnapshot: true });
         }
@@ -659,6 +730,26 @@ function connectEventStream() {
         }
       } else if (payload.event === "players_updated") {
         if (payload.data) {
+          if (state.status && Array.isArray(payload.data.online)) {
+            state.status.onlinePlayers = [...payload.data.online];
+            if (typeof payload.data.max === "number") {
+              state.status.maxPlayers = payload.data.max;
+            }
+            const lock = state.status.lock || {};
+            const cluster = state.status.cluster || {};
+            const maxP = payload.data.max || lock.maxPlayers || cluster.maxPlayers || 20;
+            const mpEl = document.getElementById("metric-players");
+            const mplEl = document.getElementById("metric-players-list");
+            if (mpEl) mpEl.textContent = `${payload.data.online.length} / ${maxP}`;
+            if (mplEl) {
+              mplEl.textContent = payload.data.online.length > 0
+                ? payload.data.online.join(", ")
+                : (state.status.localStatus === "running" || lock.status === "running"
+                    ? "No players currently online"
+                    : "Server offline");
+            }
+            updateMotdPreview();
+          }
           renderPlayersTab(payload.data);
         }
       } else if (payload.event === "lock_updated") {
@@ -667,6 +758,7 @@ function connectEventStream() {
           applyRemoteLockStateToSummary(payload.data);
           handleConsoleEpochTransition(state.status);
           renderStatusSummary(state.status);
+          handleClusterSnapshotOrLockTransition(state.status);
         }
       } else if (payload.event === "heartbeat") {
         if (state.pendingAction) return;
@@ -674,6 +766,7 @@ function connectEventStream() {
           applyRemoteLockStateToSummary(payload.data.lock);
           handleConsoleEpochTransition(state.status);
           renderStatusSummary(state.status);
+          handleClusterSnapshotOrLockTransition(state.status);
         }
       } else if (payload.event === "tunnel_updated") {
         if (state.status) {
@@ -706,6 +799,7 @@ async function refreshServerStatus() {
     }
     handleConsoleEpochTransition(summary);
     renderStatusSummary(summary);
+    handleClusterSnapshotOrLockTransition(summary);
     if (Array.isArray(summary.logs)) {
       renderAllConsoleLogs(summary.logs, { isSnapshot: true });
     }
@@ -728,8 +822,39 @@ async function refreshServerStatus() {
 // Rendering Server Status & Distributed Host Lock Banner
 // ============================================================================
 
-function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}) {
+function setGuardElementLock(el, shouldLock, attrKey, reasonTitle) {
+  if (!el) return;
+  if (shouldLock) {
+    if (el.dataset.confirmArmed === "1") {
+      el.dataset.confirmArmed = "";
+      if (el.dataset.defaultLabel) el.textContent = el.dataset.defaultLabel;
+      el.classList.remove("btn-confirm-armed");
+    }
+    el.dataset[attrKey] = "1";
+    el.disabled = true;
+    el.title = reasonTitle;
+  } else if (el.dataset[attrKey] === "1") {
+    delete el.dataset[attrKey];
+    const stillLocked = el.dataset.remoteLocked === "1" || el.dataset.localBusyLocked === "1" || el.dataset.noLockLocked === "1";
+    if (!stillLocked) {
+      el.disabled = false;
+      if (
+        el.title === "Locked while another PC is actively hosting" ||
+        el.title === "Stop the local server first before modifying this setting" ||
+        el.title === "Wait for the server to finish starting before running live player actions" ||
+        el.title === "No active host lock to release" ||
+        el.title === "Use 'Stop & Sync World' above instead of Force-Unlock while this PC is hosting"
+      ) {
+        el.title = "";
+      }
+    }
+  }
+}
+
+function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}, localStatus = (state.status && state.status.localStatus) || "idle") {
   state.isRemoteHosting = Boolean(isRemoteHosting);
+  const isLocalActive = Boolean(localStatus && localStatus !== "idle");
+  state.isLocalHosting = isLocalActive;
   const isAdmin = Boolean(state.account && state.account.role === "admin");
 
   const banner = document.getElementById("remote-admin-banner");
@@ -738,34 +863,60 @@ function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}) {
     if (isAdmin && isRemoteHosting) {
       bannerText.innerHTML =
         `🔒 <strong>${escapeHtml(lock.hostUsername || "Another member")}</strong> (<code>${escapeHtml(lock.machineName || "remote PC")}</code>) currently holds the active host lock (` +
-        `<strong>${escapeHtml(String(lock.status || "running").toUpperCase())}</strong>). Live server, world, file, plugin, and player mutations are locked to prevent sync conflicts. ` +
-        `Emergency Force-Unlock remains available in <strong>Zero-Port-Forward &amp; Sync</strong> if their PC crashed.`;
+        `<strong>${escapeHtml(String(lock.status || "running").toUpperCase())}</strong>). Live world, file, plugin, startup JVM, and player mutations are locked to prevent sync conflicts. ` +
+        `Cluster settings like <strong>Drive Auto-Sync Interval</strong>, <strong>Idle Auto-Stop</strong>, <strong>Server Name</strong>, <strong>Public Join Address</strong>, and local <strong>Sync Folder / Force-Unlock</strong> remain available.`;
+    } else if (isAdmin && isLocalActive) {
+      const hostTag = lock.hostUsername ? `hosted by <strong>${escapeHtml(lock.hostUsername)}</strong>` : "active";
+      bannerText.innerHTML =
+        `⚡ Server is currently running on this PC (${hostTag} • <strong>${escapeHtml(String(localStatus).toUpperCase())}</strong>). ` +
+        `Disk file/plugin/JAR edits, backup restore/delete, <code>online-mode</code>, and startup JVM/port settings are locked until stopped. ` +
+        `Live <strong>Console</strong>, <strong>Gamerules</strong>, <strong>Player actions</strong>, <strong>Sync settings</strong>, and <strong>Snapshots</strong> remain active.`;
     }
-    banner.classList.toggle("hidden", !isAdmin || !isRemoteHosting || state.activeTabId === "tab-overview");
+    banner.classList.toggle("hidden", !isAdmin || (!isRemoteHosting && !isLocalActive) || state.activeTabId === "tab-overview");
   }
 
   if (!isAdmin) return;
 
-  const lockSelectors = [
+  const remoteReason = "Locked while another PC is actively hosting";
+  const localReason = "Stop the local server first before modifying this setting";
+
+  // Scenario A: Remote Host Lock (keep Auto-Sync, Idle Auto-Stop, Server Name, Public Address, Local Sync Dir, Playit Binary Download, JAR Download, and Force-Unlock enabled!)
+  const remoteOnlySelectors = [
     "#btn-download-jar",
+    "#cfg-mc-software",
+    "#cfg-mc-version",
+    "#cfg-mem-min",
+    "#cfg-mem-max",
+    "#cfg-java-path",
+    "#cfg-server-port",
+    "#cfg-jvm-flags",
+    "#world-seed-input",
+    "#btn-roll-seed",
+    ".seed-preset-chip",
+    "#world-level-type",
+    "#world-gen-structures",
+    "#world-backup-existing",
+    "#world-disable-end",
     "#btn-world-reset-random",
     "#btn-world-reset-custom",
     "#btn-world-confirm-yes",
-    "#form-jvm-settings button[type='submit']",
+    "#form-server-properties input",
+    "#form-server-properties select",
     "#form-server-properties button[type='submit']",
+    "#form-gamerules input",
     "#form-gamerules button[type='submit']",
-    "#form-add-op button[type='submit']",
-    "#form-add-whitelist button[type='submit']",
-    "#form-add-ban button[type='submit']",
+    "#form-add-op input",
+    "#form-add-op button",
+    "#form-add-whitelist input",
+    "#form-add-whitelist button",
+    "#form-add-ban input",
+    "#form-add-ban button",
+    "#form-create-backup input",
     "#form-create-backup button[type='submit']",
     "#input-file-upload",
     "#btn-save-file",
-    "#btn-save-public-address",
+    "#net-playit-secret",
     "#btn-save-playit-secret",
-    "#btn-install-playit",
-    "#btn-net-browse-sync",
-    "#btn-net-save-sync",
-    "#btn-save-sync-toggles",
     "#ops-list-container button",
     "#whitelist-container button",
     "#banned-container button",
@@ -775,23 +926,86 @@ function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}) {
     "#backups-list-container .btn-del-bk",
     "#files-list-container .btn-del-file",
   ];
-  lockSelectors.forEach((sel) => {
+  remoteOnlySelectors.forEach((sel) => {
     document.querySelectorAll(sel).forEach((el) => {
-      if (isRemoteHosting) {
-        if (!el.disabled) {
-          el.dataset.remoteLocked = "1";
-          el.disabled = true;
-          el.title = "Locked while another PC is actively hosting";
-        }
-      } else if (el.dataset.remoteLocked === "1") {
-        delete el.dataset.remoteLocked;
-        el.disabled = false;
-        if (el.title === "Locked while another PC is actively hosting") {
-          el.title = "";
-        }
-      }
+      setGuardElementLock(el, isRemoteHosting, "remoteLocked", remoteReason);
     });
   });
+
+  // Scenario B: Local Host Running/Transitioning on THIS PC (lock disk/JVM/restore/sync-dir/online-mode/JAR, keep live controls usable)
+  const localBusySelectors = [
+    "#btn-download-jar",
+    "#cfg-mc-software",
+    "#cfg-mc-version",
+    "#cfg-mem-min",
+    "#cfg-mem-max",
+    "#cfg-java-path",
+    "#cfg-server-port",
+    "#cfg-jvm-flags",
+    "#prop-online-mode",
+    "#btn-net-browse-sync",
+    "#btn-net-save-sync",
+    ".btn-use-mirror-sync",
+    "#input-file-upload",
+    "#btn-save-file",
+    "#files-list-container .btn-del-file",
+    "#installed-plugins-container button",
+    "#plugin-catalog-container button",
+    "#backups-list-container .btn-restore-bk",
+    "#backups-list-container .btn-del-bk",
+  ];
+  localBusySelectors.forEach((sel) => {
+    document.querySelectorAll(sel).forEach((el) => {
+      setGuardElementLock(el, isLocalActive, "localBusyLocked", localReason);
+    });
+  });
+
+  // Also guard live controls during transient start/stop/sync phases on this PC
+  const isLocalTransition = isLocalActive && localStatus !== "running";
+  const transientSelectors = [
+    "#form-create-backup button[type='submit']",
+    "#form-gamerules button[type='submit']",
+    "#form-server-properties button[type='submit']",
+    "#btn-world-reset-random",
+    "#btn-world-reset-custom",
+    "#btn-world-confirm-yes",
+    "#online-players-container button",
+    "#online-players-container select",
+  ];
+  transientSelectors.forEach((sel) => {
+    document.querySelectorAll(sel).forEach((el) => {
+      setGuardElementLock(el, isLocalTransition, "localBusyLocked", "Wait for the server to finish starting before running live player actions");
+    });
+  });
+
+  // Visual state for upload label & read-only file editor textarea
+  const uploadDisabled = isRemoteHosting || isLocalActive;
+  const uploadLbl = document.getElementById("btn-upload-file-label");
+  if (uploadLbl) {
+    uploadLbl.classList.toggle("btn-disabled", uploadDisabled);
+    uploadLbl.title = isRemoteHosting ? remoteReason : isLocalActive ? localReason : "";
+  }
+  const editorTextarea = document.getElementById("file-editor-textarea");
+  if (editorTextarea) {
+    editorTextarea.readOnly = uploadDisabled;
+    editorTextarea.title = isRemoteHosting ? remoteReason : isLocalActive ? localReason : "";
+  }
+  if (isRemoteHosting) {
+    const worldConfirmBox = document.getElementById("world-reset-confirm-box");
+    if (worldConfirmBox) worldConfirmBox.classList.add("hidden");
+  }
+
+  // Force-Unlock button: only enabled when a remote/stale lock is held and THIS PC is idle
+  const btnForceUnlock = document.getElementById("btn-force-unlock");
+  if (btnForceUnlock) {
+    if (isLocalActive) {
+      setGuardElementLock(btnForceUnlock, true, "noLockLocked", "Use 'Stop & Sync World' above instead of Force-Unlock while this PC is hosting");
+    } else if (!lock || !lock.isLocked) {
+      setGuardElementLock(btnForceUnlock, true, "noLockLocked", "No active host lock to release");
+    } else {
+      setGuardElementLock(btnForceUnlock, false, "noLockLocked", "");
+    }
+  }
 }
 
 function renderAutoSyncBadge(autoSync, cluster, isHosting) {
@@ -873,11 +1087,17 @@ function renderStatusSummary(summary) {
           ? lock.status
           : "idle";
     const st = state.pendingAction || rawSt;
+    const isSameUserHost = !lock.hostUserId || !state.account || lock.hostUserId === state.account.id;
+    const activeHostLabel = lock.hostUsername || (state.account && state.account.username) || "Member";
 
     if (st === "running") {
       dot.className = "status-dot status-running";
-      headline.textContent = `Hosting Active on Your PC (${env.machineName})`;
-      detail.textContent = `You (${lock.hostUsername || state.account.username}) are currently hosting the server (${activeSoftware} ${activeVersion}). When you finish playing, click "Stop & Sync World" so other members can host.`;
+      headline.textContent = isSameUserHost
+        ? `Hosting Active on Your PC (${env.machineName})`
+        : `Hosting Active on This PC (${env.machineName}) — Hosted by ${activeHostLabel}`;
+      detail.textContent = isSameUserHost
+        ? `You (${activeHostLabel}) are currently hosting the server (${activeSoftware} ${activeVersion}). When you finish playing, click "Stop & Sync World" so other members can host.`
+        : `Member account '${activeHostLabel}' is currently hosting the server on this PC (${activeSoftware} ${activeVersion}). As Admin, you can still use Live Console, Gamerules, Snapshots, or Stop/Restart below.`;
       btnStart.classList.add("hidden");
       btnStop.classList.remove("hidden");
       btnStop.textContent = "⏹ Stop & Sync World";
@@ -901,7 +1121,9 @@ function renderStatusSummary(summary) {
       }
     } else if (st === "syncing_pull" || st === "starting") {
       dot.className = "status-dot status-busy";
-      headline.textContent = "Pulling World Snapshot & Starting Server...";
+      headline.textContent = isSameUserHost
+        ? "Pulling World Snapshot & Starting Server..."
+        : `Starting Server on This PC (Initiated by ${activeHostLabel})...`;
       detail.textContent =
         "Starting Java Minecraft server and zero-port-forward tunnel. Wait a few seconds for the indicator to turn GREEN before joining.";
       if (btnRestart) btnRestart.classList.add("hidden");
@@ -928,7 +1150,7 @@ function renderStatusSummary(summary) {
       btnStop.disabled = true;
     } else {
       dot.className = "status-dot status-busy";
-      headline.textContent = `Host Lock Held by ${lock.hostUsername || "Your PC"} (${env.machineName})`;
+      headline.textContent = `Host Lock Held by ${lock.hostUsername || "This PC"} (${env.machineName})`;
       detail.textContent =
         "A lock from a previous session on this device is active. Click below to stop any background process, sync the world, and release the lock.";
       btnStart.classList.add("hidden");
@@ -1118,7 +1340,7 @@ function renderStatusSummary(summary) {
   const consoleFooter = document.getElementById("member-console-footer");
   if (cmdForm) cmdForm.classList.toggle("hidden", !isAdmin || isRemoteHosting);
   if (quickCmds) quickCmds.classList.toggle("hidden", !isAdmin || isRemoteHosting);
-  if (clearConsoleBtn) clearConsoleBtn.classList.toggle("hidden", !isAdmin || isRemoteHosting);
+  if (clearConsoleBtn) clearConsoleBtn.classList.toggle("hidden", !isAdmin);
   if (consoleFooter) {
     consoleFooter.classList.toggle("hidden", isAdmin && !isRemoteHosting);
     consoleFooter.textContent = isRemoteHosting
@@ -1126,7 +1348,7 @@ function renderStatusSummary(summary) {
       : "Console command execution is restricted to the Admin account.";
   }
 
-  applyRemoteAdminLockGuards(isRemoteHosting, lock);
+  applyRemoteAdminLockGuards(isRemoteHosting, lock, summary.localStatus || "idle");
   updateMotdPreview();
 
   // Admin Config & Network Tab Status Boxes
@@ -1154,7 +1376,11 @@ function renderAdminEnvBoxes(summary) {
   }
 
   if (cluster.autoSyncIntervalMinutes !== undefined) {
-    syncAutoSyncInputs(cluster.autoSyncIntervalMinutes);
+    const srvAutoVal = Number(cluster.autoSyncIntervalMinutes);
+    if (!state.autoSyncDirty && srvAutoVal !== state.lastAutoSyncVal) {
+      state.lastAutoSyncVal = srvAutoVal;
+      syncAutoSyncInputs(srvAutoVal);
+    }
   }
 
   const syncDiagBox = document.getElementById("sync-diagnostics-card");
@@ -1164,6 +1390,19 @@ function renderAdminEnvBoxes(summary) {
     const intervalMin = autoSync.intervalMinutes !== undefined
       ? Number(autoSync.intervalMinutes)
       : Number(cluster.autoSyncIntervalMinutes !== undefined ? cluster.autoSyncIntervalMinutes : 10);
+    let autoSyncSummary = "";
+    if (intervalMin <= 0 || autoSync.enabled === false) {
+      autoSyncSummary = "Disabled (syncs on server stop only)";
+    } else if (autoSync.inProgress) {
+      autoSyncSummary = `⏳ Syncing live world snapshot now... (every ${intervalMin}m)`;
+    } else {
+      const lastPart = autoSync.lastSyncAt
+        ? `Last: ${formatTimeAgo(autoSync.lastSyncAt)} (${escapeHtml(autoSync.lastSyncStatus || "ok")})`
+        : `Last: ${escapeHtml(autoSync.lastSyncStatus || "idle")}`;
+      const nextPart = autoSync.nextSyncAt ? ` • Next: ${formatTimeUntil(autoSync.nextSyncAt)}` : "";
+      autoSyncSummary = `Every ${intervalMin}m • ${lastPart}${nextPart}`;
+    }
+
     const diagSig = JSON.stringify([
       d.providerDetected,
       d.clusterConfigExists,
@@ -1190,18 +1429,6 @@ function renderAdminEnvBoxes(summary) {
       const manifestLine = d.syncManifest
         ? `<div><strong>Latest Verified World:</strong> Snapshot #${escapeHtml(d.syncManifest.snapshotSeq)} by ${escapeHtml(d.syncManifest.hostUsername || "Host")} (${formatTimeAgo(d.syncManifest.updatedAt)})</div>`
         : "";
-      let autoSyncSummary = "";
-      if (intervalMin <= 0 || autoSync.enabled === false) {
-        autoSyncSummary = "Disabled (syncs on server stop only)";
-      } else if (autoSync.inProgress) {
-        autoSyncSummary = `⏳ Syncing live world snapshot now... (every ${intervalMin}m)`;
-      } else {
-        const lastPart = autoSync.lastSyncAt
-          ? `Last: ${formatTimeAgo(autoSync.lastSyncAt)} (${escapeHtml(autoSync.lastSyncStatus || "ok")})`
-          : `Last: ${escapeHtml(autoSync.lastSyncStatus || "idle")}`;
-        const nextPart = autoSync.nextSyncAt ? ` • Next: ${formatTimeUntil(autoSync.nextSyncAt)}` : "";
-        autoSyncSummary = `Every ${intervalMin}m • ${lastPart}${nextPart}`;
-      }
       const autoSyncErrLine = autoSync.lastSyncStatus === "error" && autoSync.lastSyncError
         ? `<div class="alert-box alert-warning" style="margin-top:0.25rem; padding:0.4rem 0.65rem;">⚠️ Last auto-sync error: ${escapeHtml(autoSync.lastSyncError)}</div>`
         : "";
@@ -1220,7 +1447,7 @@ function renderAdminEnvBoxes(summary) {
           <div><strong>Cluster Config Synced:</strong> ${d.clusterConfigExists ? "✅ cluster-config.json Ready" : "⚠️ Not initialized"}</div>
           <div><strong>Latest World Snapshot:</strong> ${d.latestSnapshotExists ? `✅ latest-server.zip (${formatBytes(d.latestSnapshotSizeBytes)} • ${formatTimeAgo(d.latestSnapshotModifiedAt)})` : "ℹ️ Created on first server stop"}</div>
           ${manifestLine}
-          <div><strong>Periodic Drive Auto-Sync:</strong> ${autoSyncSummary}</div>
+          <div><strong>Periodic Drive Auto-Sync:</strong> <span id="sync-diag-autosync-row">${autoSyncSummary}</span></div>
           <div><strong>Rolling World Backups:</strong> ${d.backupCount || 0} archives in shared folder</div>
           ${autoSyncErrLine}
           ${transferLine}
@@ -1246,6 +1473,12 @@ function renderAdminEnvBoxes(summary) {
           }
         });
       }
+      applyRemoteAdminLockGuards(isRemoteHosting, lock, summary.localStatus || "idle");
+    } else {
+      const autoRow = document.getElementById("sync-diag-autosync-row");
+      if (autoRow) {
+        autoRow.innerHTML = autoSyncSummary;
+      }
     }
   }
 
@@ -1269,12 +1502,20 @@ function renderAdminEnvBoxes(summary) {
     const lanLabel = isRemoteHosting && tunnel.hostLanIp
       ? `Active Host LAN IP: <code>${escapeHtml(tunnel.hostLanIp)}:${escapeHtml(cluster.serverPort || 25565)}</code>`
       : `This PC LAN IP: <code>${escapeHtml(tunnel.lanIp || "127.0.0.1")}:${escapeHtml(cluster.serverPort || 25565)}</code>`;
+    const mirroredAddrLine = isRemoteHosting && tunnel.publicAddress
+      ? `<div><strong>Mirrored Public Address:</strong> <code>${escapeHtml(tunnel.publicAddress)}</code></div>`
+      : "";
+    const mirroredErrLine = isRemoteHosting && tunnel.error
+      ? `<div style="color:var(--accent-danger);"><strong>Host Tunnel Notice:</strong> ${escapeHtml(tunnel.error)}</div>`
+      : "";
     tunnelBox.innerHTML = `
       <div style="display:flex; flex-direction:column; gap:0.35rem; font-size:0.84rem;">
         <div><strong>Tunnel Status:</strong> <span class="badge badge-outline">${escapeHtml((tunnel.status || "stopped").toUpperCase())}</span></div>
+        ${mirroredAddrLine}
         <div><strong>playit.gg Agent Binary (This PC):</strong> ${tunnel.binaryInstalled ? `✅ Installed (${escapeHtml(tunnel.binaryPath)})` : `ℹ️ Using Shared Relay / Click below to auto-download playit.exe`}</div>
         <div><strong>Shared Secret (playit.toml):</strong> ${tunnel.hasSharedSecret ? `✅ Synced in Shared Folder` : `Not set yet`}</div>
         <div><strong>${isRemoteHosting && tunnel.hostLanIp ? "Host LAN Address" : "Local LAN Fallback"}:</strong> ${lanLabel}</div>
+        ${mirroredErrLine}
       </div>
     `;
   }
@@ -1415,11 +1656,21 @@ async function loadAdminAccounts() {
     const data = await apiFetch("/api/admin/accounts");
     const tbody = document.getElementById("accounts-tbody");
     tbody.innerHTML = "";
+    const activeLock = state.status && state.status.lock;
     (data.accounts || []).forEach((acc) => {
       const tr = document.createElement("tr");
       const isPrimaryAdmin = acc.role === "admin";
+      const isAccActiveHost = Boolean(
+        activeLock &&
+        activeLock.isActivelyLocked &&
+        ((activeLock.hostUserId && activeLock.hostUserId === acc.id) ||
+          (activeLock.hostUsername && activeLock.hostUsername.toLowerCase() === acc.username.toLowerCase()))
+      );
+      const activeHostTag = isAccActiveHost
+        ? ` <span class="badge badge-admin" title="Currently hosting on ${escapeHtml(activeLock.machineName || "host PC")}">HOSTING NOW</span>`
+        : "";
       tr.innerHTML = `
-        <td><strong>${escapeHtml(acc.username)}</strong></td>
+        <td><strong>${escapeHtml(acc.username)}</strong>${activeHostTag}</td>
         <td>
           <span class="badge ${isPrimaryAdmin ? "badge-admin" : "badge-member"}">
             ${isPrimaryAdmin ? "👑 Admin" : "Member Host"}
@@ -1476,20 +1727,26 @@ async function loadAdminAccounts() {
                 nameCell.innerHTML = origHtml;
                 return;
               }
-              try {
-                const res = await apiFetch("/api/admin/accounts/rename", {
-                  method: "POST",
-                  body: JSON.stringify({ userId: acc.id, username: trimmed }),
-                });
-                showToast(`Renamed account to '${res.account.username}'.`, "success");
-                if (state.account && state.account.id === acc.id) {
-                  state.account.username = res.account.username;
-                  document.getElementById("user-name-label").textContent = res.account.username;
+              const saveBtn = form.querySelector("button[type='submit']");
+              await runWithButtonBusy(saveBtn, "Saving...", async () => {
+                try {
+                  const res = await apiFetch("/api/admin/accounts/rename", {
+                    method: "POST",
+                    body: JSON.stringify({ userId: acc.id, username: trimmed }),
+                  });
+                  const extraNote = isAccActiveHost
+                    ? " Active host label will reflect the new name on next host start."
+                    : "";
+                  showToast(`Renamed account to '${res.account.username}'.${extraNote}`, "success");
+                  if (state.account && state.account.id === acc.id) {
+                    state.account.username = res.account.username;
+                    document.getElementById("user-name-label").textContent = res.account.username;
+                  }
+                  loadAdminAccounts();
+                } catch (err) {
+                  showToast(err.message, "error");
                 }
-                loadAdminAccounts();
-              } catch (err) {
-                showToast(err.message, "error");
-              }
+              });
             });
           }
         });
@@ -1497,30 +1754,38 @@ async function loadAdminAccounts() {
       const rotBtn = tr.querySelector(".btn-rotate-pk");
       if (rotBtn) {
         rotBtn.addEventListener("click", async () => {
-          try {
-            const res = await apiFetch("/api/admin/accounts/rotate", {
-              method: "POST",
-              body: JSON.stringify({ userId: acc.id }),
-            });
-            showPasskeyModal(
-              `New Passkey for ${acc.username}`,
-              res.generatedPasskey,
-              `The previous passkey for ${acc.username} has been invalidated. Share this new passkey with them:`
-            );
-            loadAdminAccounts();
-          } catch (err) {
-            showToast(err.message, "error");
-          }
+          await runWithButtonBusy(rotBtn, "Rotating...", async () => {
+            try {
+              const res = await apiFetch("/api/admin/accounts/rotate", {
+                method: "POST",
+                body: JSON.stringify({ userId: acc.id }),
+              });
+              showPasskeyModal(
+                `New Passkey for ${acc.username}`,
+                res.generatedPasskey,
+                `The previous passkey for ${acc.username} has been invalidated. Share this new passkey with them:`
+              );
+              loadAdminAccounts();
+            } catch (err) {
+              showToast(err.message, "error");
+            }
+          });
         });
       }
       const delBtn = tr.querySelector(".btn-delete-acc");
       if (delBtn) {
-        armTwoStepConfirm(delBtn, "Confirm Revoke?", async () => {
+        const confirmLbl = isAccActiveHost ? "Host Active! Revoke?" : "Confirm Revoke?";
+        armTwoStepConfirm(delBtn, confirmLbl, async () => {
           try {
             await apiFetch(`/api/admin/accounts/${encodeURIComponent(acc.id)}`, {
               method: "DELETE",
             });
-            showToast(`Revoked member account '${acc.username}'.`, "success");
+            showToast(
+              isAccActiveHost
+                ? `Revoked active host account '${acc.username}'. Their session was invalidated.`
+                : `Revoked member account '${acc.username}'.`,
+              isAccActiveHost ? "info" : "success"
+            );
             loadAdminAccounts();
           } catch (err) {
             showToast(err.message, "error");
@@ -1605,9 +1870,15 @@ function renderWorldGeneratorInfo(worldInfo, props = {}, forceSeedSync = false) 
   if (structChk) {
     structChk.checked = genStructures;
   }
+  const disEndVal = Boolean(w.disableEnd !== undefined ? w.disableEnd : (props["disable-end"] === "true" || props["allow-end"] === "false"));
   const disEndChk = document.getElementById("world-disable-end");
-  if (disEndChk) {
-    disEndChk.checked = Boolean(w.disableEnd !== undefined ? w.disableEnd : (props["disable-end"] === "true" || props["allow-end"] === "false"));
+  if (disEndChk && document.activeElement !== disEndChk) {
+    disEndChk.checked = disEndVal;
+  }
+  const propEndChk = document.getElementById("prop-disable-end");
+  const propsFormEl = document.getElementById("form-server-properties");
+  if (propEndChk && document.activeElement !== propEndChk && (!propsFormEl || !propsFormEl.contains(document.activeElement))) {
+    propEndChk.checked = disEndVal;
   }
   const seedInput = document.getElementById("world-seed-input");
   if (seedInput && document.activeElement !== seedInput && (forceSeedSync || (activeSeed && !seedInput.value.trim()))) {
@@ -1679,7 +1950,10 @@ async function loadAdminProperties(includeVersions = true) {
     document.getElementById("net-sync-dir").value = env.sharedSyncDir || "";
     document.getElementById("net-auto-backup").checked = c.autoBackupOnStop !== false;
     document.getElementById("net-git-sync").checked = !!c.gitSyncEnabled;
-    syncAutoSyncInputs(c.autoSyncIntervalMinutes !== undefined ? c.autoSyncIntervalMinutes : 10);
+    const autoSyncMinVal = c.autoSyncIntervalMinutes !== undefined ? c.autoSyncIntervalMinutes : 10;
+    state.autoSyncDirty = false;
+    state.lastAutoSyncVal = Number(autoSyncMinVal);
+    syncAutoSyncInputs(autoSyncMinVal);
 
     // server.properties visual form
     document.getElementById("prop-motd").value = p["motd"] || "";
@@ -1705,7 +1979,7 @@ async function loadAdminProperties(includeVersions = true) {
 
     renderWorldGeneratorInfo(propsRes.world, p, true);
     updateMotdPreview();
-    applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
+    applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
   } catch (err) {
     showToast(err.message, "error");
   }
@@ -1832,62 +2106,77 @@ function renderPlayersTab(data) {
   // OPs
   const opsEl = document.getElementById("ops-list-container");
   if (opsEl && data.ops) {
-    opsEl.innerHTML = "";
-    data.ops.forEach((op) => {
-      const row = document.createElement("div");
-      row.className = "list-row";
-      const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(op.name)}/24`;
-      row.innerHTML = `
-        <span style="display:flex;align-items:center;gap:0.45rem;">
-          <img class="player-avatar" src="${avatarUrl}" alt="" onerror="this.style.display='none'" />
-          ⭐ <strong>${escapeHtml(op.name)}</strong> <small style="color:var(--text-muted)">(Level ${escapeHtml(op.level || 4)})</small>
-        </span>
-        <button class="btn btn-ghost btn-xs btn-act-deop">Remove OP</button>
-      `;
-      const deopBtn = row.querySelector(".btn-act-deop");
-      if (deopBtn) deopBtn.addEventListener("click", () => triggerPlayerAction("deop", op.name));
-      opsEl.appendChild(row);
-    });
+    const opsKey = JSON.stringify(data.ops);
+    const opsFocused = Boolean(document.activeElement && opsEl.contains(document.activeElement));
+    if (!opsFocused && opsKey !== state.lastOpsKey) {
+      state.lastOpsKey = opsKey;
+      opsEl.innerHTML = "";
+      data.ops.forEach((op) => {
+        const row = document.createElement("div");
+        row.className = "list-row";
+        const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(op.name)}/24`;
+        row.innerHTML = `
+          <span style="display:flex;align-items:center;gap:0.45rem;">
+            <img class="player-avatar" src="${avatarUrl}" alt="" onerror="this.style.display='none'" />
+            ⭐ <strong>${escapeHtml(op.name)}</strong> <small style="color:var(--text-muted)">(Level ${escapeHtml(op.level || 4)})</small>
+          </span>
+          <button class="btn btn-ghost btn-xs btn-act-deop">Remove OP</button>
+        `;
+        const deopBtn = row.querySelector(".btn-act-deop");
+        if (deopBtn) deopBtn.addEventListener("click", () => triggerPlayerAction("deop", op.name));
+        opsEl.appendChild(row);
+      });
+    }
   }
 
   // Whitelist
   const wlEl = document.getElementById("whitelist-container");
   if (wlEl && data.whitelist) {
-    wlEl.innerHTML = "";
-    data.whitelist.forEach((w) => {
-      const row = document.createElement("div");
-      row.className = "list-row";
-      const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(w.name)}/24`;
-      row.innerHTML = `
-        <span style="display:flex;align-items:center;gap:0.45rem;">
-          <img class="player-avatar" src="${avatarUrl}" alt="" onerror="this.style.display='none'" />
-          ✓ <strong>${escapeHtml(w.name)}</strong>
-        </span>
-        <button class="btn btn-ghost btn-xs btn-act-rmwl">Remove</button>
-      `;
-      const rmBtn = row.querySelector(".btn-act-rmwl");
-      if (rmBtn) rmBtn.addEventListener("click", () => triggerPlayerAction("whitelist_remove", w.name));
-      wlEl.appendChild(row);
-    });
+    const wlKey = JSON.stringify(data.whitelist);
+    const wlFocused = Boolean(document.activeElement && wlEl.contains(document.activeElement));
+    if (!wlFocused && wlKey !== state.lastWhitelistKey) {
+      state.lastWhitelistKey = wlKey;
+      wlEl.innerHTML = "";
+      data.whitelist.forEach((w) => {
+        const row = document.createElement("div");
+        row.className = "list-row";
+        const avatarUrl = `https://mc-heads.net/avatar/${encodeURIComponent(w.name)}/24`;
+        row.innerHTML = `
+          <span style="display:flex;align-items:center;gap:0.45rem;">
+            <img class="player-avatar" src="${avatarUrl}" alt="" onerror="this.style.display='none'" />
+            ✓ <strong>${escapeHtml(w.name)}</strong>
+          </span>
+          <button class="btn btn-ghost btn-xs btn-act-rmwl">Remove</button>
+        `;
+        const rmBtn = row.querySelector(".btn-act-rmwl");
+        if (rmBtn) rmBtn.addEventListener("click", () => triggerPlayerAction("whitelist_remove", w.name));
+        wlEl.appendChild(row);
+      });
+    }
   }
 
   // Banned
   const banEl = document.getElementById("banned-container");
   if (banEl && data.banned) {
-    banEl.innerHTML = "";
-    data.banned.forEach((b) => {
-      const row = document.createElement("div");
-      row.className = "list-row";
-      row.innerHTML = `
-        <span>🚫 <strong>${escapeHtml(b.name)}</strong> <small style="color:var(--text-muted)">(${escapeHtml(b.reason || "Banned")})</small></span>
-        <button class="btn btn-secondary btn-xs btn-act-pardon">Unban</button>
-      `;
-      const pardonBtn = row.querySelector(".btn-act-pardon");
-      if (pardonBtn) pardonBtn.addEventListener("click", () => triggerPlayerAction("pardon", b.name));
-      banEl.appendChild(row);
-    });
+    const banKey = JSON.stringify(data.banned);
+    const banFocused = Boolean(document.activeElement && banEl.contains(document.activeElement));
+    if (!banFocused && banKey !== state.lastBannedKey) {
+      state.lastBannedKey = banKey;
+      banEl.innerHTML = "";
+      data.banned.forEach((b) => {
+        const row = document.createElement("div");
+        row.className = "list-row";
+        row.innerHTML = `
+          <span>🚫 <strong>${escapeHtml(b.name)}</strong> <small style="color:var(--text-muted)">(${escapeHtml(b.reason || "Banned")})</small></span>
+          <button class="btn btn-secondary btn-xs btn-act-pardon">Unban</button>
+        `;
+        const pardonBtn = row.querySelector(".btn-act-pardon");
+        if (pardonBtn) pardonBtn.addEventListener("click", () => triggerPlayerAction("pardon", b.name));
+        banEl.appendChild(row);
+      });
+    }
   }
-  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
 }
 
 window.triggerPlayerAction = async function (action, username, extra = {}) {
@@ -1898,8 +2187,10 @@ window.triggerPlayerAction = async function (action, username, extra = {}) {
     });
     renderPlayersTab(res);
     showToast(`Executed ${action} for ${username}`, "success");
+    return true;
   } catch (err) {
     showToast(err.message, "error");
+    return false;
   }
 };
 
@@ -1968,7 +2259,7 @@ function renderInstalledPlugins(plugins) {
     });
     container.appendChild(row);
   });
-  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
 }
 
 function renderPluginCatalog(catalog) {
@@ -2019,7 +2310,7 @@ function renderPluginCatalog(catalog) {
     });
     container.appendChild(card);
   });
-  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
 }
 
 async function loadAdminBackups() {
@@ -2106,6 +2397,7 @@ function renderBackupsList(backups) {
           restoreBtn.textContent = "Restore";
           restoreBtn.classList.remove("btn-primary");
           restoreBtn.classList.add("btn-secondary");
+          applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
           showToast(err.message, "error");
         }
       });
@@ -2126,7 +2418,7 @@ function renderBackupsList(backups) {
     }
     container.appendChild(row);
   });
-  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
 }
 
 function renderFileBreadcrumbs(currentDir) {
@@ -2277,7 +2569,7 @@ function renderFilesList(files, currentDir, isSearching) {
 
     container.appendChild(row);
   });
-  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
 }
 
 async function loadAdminFiles(dirPath = "", searchQuery = "") {
@@ -2406,7 +2698,7 @@ async function openFileInEditor(relPath) {
     document.getElementById("file-editor-box").classList.remove("hidden");
     const btnClose = document.getElementById("btn-close-file");
     if (btnClose) btnClose.textContent = "Close";
-    applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
+    applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
   } catch (err) {
     showToast(err.message, "error");
   }
@@ -2425,7 +2717,7 @@ function switchDashboardTab(tabId) {
     panel.classList.toggle("hidden", panel.id !== tabId);
     panel.classList.toggle("active", panel.id === tabId);
   });
-  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {});
+  applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -2639,8 +2931,9 @@ document.addEventListener("DOMContentLoaded", () => {
       state.pendingAction = null;
       state.status = summary;
       renderStatusSummary(summary);
+      handleClusterSnapshotOrLockTransition(summary);
       if (Array.isArray(summary.logs)) {
-        renderAllConsoleLogs(summary.logs, state.isRemoteHosting, summary.lock || {});
+        renderAllConsoleLogs(summary.logs, { isSnapshot: true });
       }
       if (summary.localStatus === "running") {
         showToast("✅ Minecraft Server is ONLINE and ready to join!", "success");
@@ -2673,8 +2966,9 @@ document.addEventListener("DOMContentLoaded", () => {
         state.pendingAction = null;
         state.status = summary;
         renderStatusSummary(summary);
+        handleClusterSnapshotOrLockTransition(summary);
         if (Array.isArray(summary.logs)) {
-          renderAllConsoleLogs(summary.logs, state.isRemoteHosting, summary.lock || {});
+          renderAllConsoleLogs(summary.logs, { isSnapshot: true });
         }
         showToast("Server restarted and world snapshot synced!", "success");
       } catch (err) {
@@ -2700,10 +2994,12 @@ document.addEventListener("DOMContentLoaded", () => {
       const summary = await apiFetch("/api/server/stop", { method: "POST" });
       state.statusSeq++;
       state.pendingAction = null;
+      state.fileCache = {};
       state.status = summary;
       renderStatusSummary(summary);
+      handleClusterSnapshotOrLockTransition(summary);
       if (Array.isArray(summary.logs)) {
-        renderAllConsoleLogs(summary.logs, state.isRemoteHosting, summary.lock || {});
+        renderAllConsoleLogs(summary.logs, { isSnapshot: true });
       }
       showToast("Server stopped, world synced to Shared Folder, and host lock released!", "success");
       if (state.account && state.account.role === "admin") {
@@ -2782,15 +3078,13 @@ document.addEventListener("DOMContentLoaded", () => {
   const btnClearConsole = document.getElementById("btn-clear-console");
   if (btnClearConsole) {
     btnClearConsole.addEventListener("click", async () => {
-      if (state.isRemoteHosting) {
-        showToast("Console is mirrored from remote host and cannot be cleared remotely.", "info");
-        return;
-      }
       clearLocalConsoleBuffer();
       if (state.account && state.account.role === "admin") {
         try {
           await apiFetch("/api/admin/console/clear", { method: "POST" });
-        } catch (_) {}
+        } catch (err) {
+          showToast(err.message, "error");
+        }
       }
       showToast("Cleared console view.", "info");
     });
@@ -2924,6 +3218,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const cfgAutoSyncMinutes = document.getElementById("cfg-auto-sync-minutes");
   if (netAutoSyncPreset) {
     netAutoSyncPreset.addEventListener("change", () => {
+      state.autoSyncDirty = true;
       if (netAutoSyncPreset.value === "custom") {
         if (netAutoSyncMinutes) netAutoSyncMinutes.focus();
         return;
@@ -2933,6 +3228,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   if (netAutoSyncMinutes) {
     netAutoSyncMinutes.addEventListener("input", () => {
+      state.autoSyncDirty = true;
       if (netAutoSyncMinutes.value !== "") {
         syncAutoSyncInputs(netAutoSyncMinutes.value, "net-auto-sync-minutes");
       }
@@ -2940,6 +3236,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   if (cfgAutoSyncMinutes) {
     cfgAutoSyncMinutes.addEventListener("input", () => {
+      state.autoSyncDirty = true;
       if (cfgAutoSyncMinutes.value !== "") {
         syncAutoSyncInputs(cfgAutoSyncMinutes.value, "cfg-auto-sync-minutes");
       }
@@ -2968,6 +3265,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("form-jvm-settings").addEventListener("submit", async (e) => {
     e.preventDefault();
     const submitBtn = e.currentTarget.querySelector("button[type='submit']");
+    const isStartupLocked = Boolean(state.isRemoteHosting || state.isLocalHosting);
     const memMin = parseInt(document.getElementById("cfg-mem-min").value, 10);
     const memMax = parseInt(document.getElementById("cfg-mem-max").value, 10);
     const serverPort = parseInt(document.getElementById("cfg-server-port").value, 10);
@@ -2976,38 +3274,51 @@ document.addEventListener("DOMContentLoaded", () => {
     const autoSyncEl = document.getElementById("cfg-auto-sync-minutes");
     const autoSyncMinutes = autoSyncEl ? parseInt(autoSyncEl.value, 10) : 10;
 
-    if (!Number.isFinite(memMin) || memMin < 512 || !Number.isFinite(memMax) || memMax < memMin) {
-      showToast("Invalid RAM range: Min RAM must be >= 512 MB and <= Max RAM.", "error");
-      return;
-    }
-    if (!Number.isFinite(serverPort) || serverPort < 1 || serverPort > 65535) {
-      showToast("Invalid Server Port (must be between 1 and 65535).", "error");
-      return;
+    if (!isStartupLocked) {
+      if (!Number.isFinite(memMin) || memMin < 512 || !Number.isFinite(memMax) || memMax < memMin) {
+        showToast("Invalid RAM range: Min RAM must be >= 512 MB and <= Max RAM.", "error");
+        return;
+      }
+      if (!Number.isFinite(serverPort) || serverPort < 1 || serverPort > 65535) {
+        showToast("Invalid Server Port (must be between 1 and 65535).", "error");
+        return;
+      }
     }
     if (!Number.isFinite(autoSyncMinutes) || autoSyncMinutes < 0 || autoSyncMinutes > 1440) {
       showToast("Drive Auto-Sync interval must be 0 (Off) or 1–1440 minutes.", "error");
       return;
     }
 
+    const payload = {
+      serverName: document.getElementById("cfg-server-name").value.trim(),
+      idleShutdownMinutes: Number.isFinite(idleMinutes) ? idleMinutes : 0,
+      autoSyncIntervalMinutes: autoSyncMinutes,
+    };
+    if (!isStartupLocked) {
+      payload.mcSoftware = document.getElementById("cfg-mc-software").value;
+      payload.mcVersion = document.getElementById("cfg-mc-version").value;
+      payload.memoryMinMb = memMin;
+      payload.memoryMaxMb = memMax;
+      payload.javaPath = document.getElementById("cfg-java-path").value.trim();
+      payload.serverPort = serverPort;
+      payload.jvmFlags = document.getElementById("cfg-jvm-flags").value.trim();
+    }
+
     await runWithButtonBusy(submitBtn, "Saving...", async () => {
       try {
         await apiFetch("/api/admin/settings", {
           method: "PUT",
-          body: JSON.stringify({
-            serverName: document.getElementById("cfg-server-name").value.trim(),
-            mcSoftware: document.getElementById("cfg-mc-software").value,
-            mcVersion: document.getElementById("cfg-mc-version").value,
-            memoryMinMb: memMin,
-            memoryMaxMb: memMax,
-            javaPath: document.getElementById("cfg-java-path").value.trim(),
-            serverPort,
-            idleShutdownMinutes: Number.isFinite(idleMinutes) ? idleMinutes : 0,
-            autoSyncIntervalMinutes: autoSyncMinutes,
-            jvmFlags: document.getElementById("cfg-jvm-flags").value.trim(),
-          }),
+          body: JSON.stringify(payload),
         });
+        state.autoSyncDirty = false;
+        state.lastAutoSyncVal = autoSyncMinutes;
         syncAutoSyncInputs(autoSyncMinutes);
-        showToast("Saved JVM and cluster configuration!", "success");
+        showToast(
+          isStartupLocked
+            ? "Saved live cluster settings (Server Name, Idle Auto-Stop, Drive Auto-Sync)!"
+            : "Saved JVM and cluster configuration!",
+          "success"
+        );
         refreshServerStatus();
       } catch (err) {
         showToast(err.message, "error");
@@ -3279,36 +3590,48 @@ document.addEventListener("DOMContentLoaded", () => {
   // Players Forms
   document.getElementById("form-add-op").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const user = document.getElementById("input-op-username").value.trim();
+    const inp = document.getElementById("input-op-username");
+    const submitBtn = e.currentTarget.querySelector("button[type='submit']");
+    const user = inp.value.trim();
     if (!user) return;
-    document.getElementById("input-op-username").value = "";
-    await window.triggerPlayerAction("op", user);
+    await runWithButtonBusy(submitBtn, "Adding...", async () => {
+      const ok = await window.triggerPlayerAction("op", user);
+      if (ok) inp.value = "";
+    });
   });
 
   document.getElementById("form-add-whitelist").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const user = document.getElementById("input-wl-username").value.trim();
+    const inp = document.getElementById("input-wl-username");
+    const submitBtn = e.currentTarget.querySelector("button[type='submit']");
+    const user = inp.value.trim();
     if (!user) return;
-    document.getElementById("input-wl-username").value = "";
-    await window.triggerPlayerAction("whitelist_add", user);
+    await runWithButtonBusy(submitBtn, "Adding...", async () => {
+      const ok = await window.triggerPlayerAction("whitelist_add", user);
+      if (ok) inp.value = "";
+    });
   });
 
   document.getElementById("form-add-ban").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const username = document.getElementById("input-ban-username").value.trim();
+    const userInp = document.getElementById("input-ban-username");
+    const submitBtn = e.currentTarget.querySelector("button[type='submit']");
+    const username = userInp.value.trim();
     const reason = document.getElementById("input-ban-reason").value.trim();
     if (!username) return;
-    document.getElementById("input-ban-username").value = "";
-    try {
-      const res = await apiFetch("/api/admin/players", {
-        method: "POST",
-        body: JSON.stringify({ action: "ban", username, reason }),
-      });
-      renderPlayersTab(res);
-      showToast(`Banned ${username}`, "success");
-    } catch (err) {
-      showToast(err.message, "error");
-    }
+    await runWithButtonBusy(submitBtn, "Banning...", async () => {
+      try {
+        const res = await apiFetch("/api/admin/players", {
+          method: "POST",
+          body: JSON.stringify({ action: "ban", username, reason }),
+        });
+        userInp.value = "";
+        renderPlayersTab(res);
+        showToast(`Banned ${username}`, "success");
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
   });
 
   // Files & Backups Search & Navigation
@@ -3537,6 +3860,8 @@ document.addEventListener("DOMContentLoaded", () => {
             autoSyncIntervalMinutes: autoSyncMinutes,
           }),
         });
+        state.autoSyncDirty = false;
+        state.lastAutoSyncVal = autoSyncMinutes;
         syncAutoSyncInputs(autoSyncMinutes);
         showToast("Saved synchronization preferences!", "success");
         refreshServerStatus();
@@ -3551,8 +3876,18 @@ document.addEventListener("DOMContentLoaded", () => {
     armTwoStepConfirm(btnForceUnlock, "Confirm Force-Unlock?", async () => {
       try {
         await apiFetch("/api/admin/force-unlock", { method: "POST" });
+        state.fileCache = {};
+        state.lastKnownLockKey = "";
+        state.lastKnownSnapshotSeq = null;
         showToast("Host lock forcefully released!", "success");
-        refreshServerStatus();
+        await refreshServerStatus();
+        if (state.account && state.account.role === "admin") {
+          loadAdminProperties(false);
+          loadAdminPlayers();
+          loadAdminBackups();
+          loadAdminFiles(state.currentFileDir, state.fileSearchQuery);
+          loadAdminPlugins(document.getElementById("input-plugin-search")?.value.trim() || "");
+        }
       } catch (err) {
         showToast(err.message, "error");
       }

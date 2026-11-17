@@ -144,6 +144,7 @@ class TunnelManager:
                     tmp_target.unlink(missing_ok=True)
             except OSError:
                 pass
+            self._emit("tunnel_updated", self.get_state())
 
     def save_secret_key(self, secret_key: str) -> None:
         """Saves a playit.gg secret key to the shared folder so all members share the tunnel."""
@@ -152,12 +153,23 @@ class TunnelManager:
         if not clean:
             if self.shared_secret_toml_path.exists():
                 self.shared_secret_toml_path.unlink()
+            with self._mutex:
+                self.claim_url = ""
+                if self.status not in ("online", "starting", "disabled"):
+                    self.status = "stopped"
+            self._append_log("Cleared shared playit.gg tunnel secret key from Shared Sync Folder.")
             return
         if "secret_key" in clean:
             self.shared_secret_toml_path.write_text(clean + "\n", encoding="utf-8")
         else:
             self.shared_secret_toml_path.write_text(f'secret_key = "{clean}"\n', encoding="utf-8")
-        self._append_log("Saved shared playit.gg tunnel secret key to Shared Sync Folder.")
+        with self._mutex:
+            self.claim_url = ""
+            is_running = self._proc is not None
+        if is_running:
+            self._append_log("Saved shared playit.gg tunnel secret key (restart server to apply to active tunnel).")
+        else:
+            self._append_log("Saved shared playit.gg tunnel secret key to Shared Sync Folder.")
 
     def has_shared_secret(self) -> bool:
         return self.shared_secret_toml_path.exists() and self.shared_secret_toml_path.stat().st_size > 5
@@ -439,23 +451,26 @@ class TunnelManager:
             return
         with self._mutex:
             cfg = self.sync_engine.load_cluster_config()
+            if cfg and not cfg.tunnel_enabled:
+                return
             custom_addr = cfg.public_join_address.strip() if (cfg and cfg.public_join_address) else ""
             is_custom_override = bool(
                 cfg
-                and cfg.tunnel_provider == "custom"
-                and custom_addr
+                and cfg.tunnel_provider in ("custom", "none")
+                and (custom_addr or cfg.tunnel_provider == "custom")
             )
-            effective_addr = custom_addr if is_custom_override else found_addr
+            effective_addr = (custom_addr or found_addr) if is_custom_override else found_addr
             self.public_address = effective_addr
             self.status = "online"
             self.claim_url = ""
-            if cfg and not is_custom_override and cfg.public_join_address != found_addr:
+            if cfg and cfg.tunnel_provider == "playit" and cfg.public_join_address != found_addr:
                 cfg.public_join_address = found_addr
                 self.sync_engine.save_cluster_config(cfg)
-        self.sync_engine.update_lock_state(
-            public_address=effective_addr,
-            tunnel_status="online",
-        )
+        if self.sync_engine.is_locked_by_current_machine():
+            self.sync_engine.update_lock_state(
+                public_address=effective_addr,
+                tunnel_status="online",
+            )
         self._emit("tunnel_updated", self.get_state())
 
     def _monitor_playit_output(
@@ -529,6 +544,8 @@ class TunnelManager:
             self._proc = None
             if self.status not in ("stopped", "disabled"):
                 self.status = "stopped"
+                if self.sync_engine.is_locked_by_current_machine():
+                    self.sync_engine.update_lock_state(tunnel_status="stopped")
                 self._emit("tunnel_updated", self.get_state())
 
     def _kill_orphaned_playit_processes(self) -> None:

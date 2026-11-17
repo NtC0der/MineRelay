@@ -192,6 +192,7 @@ class ClusterConfig:
     gamerules: Dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     accounts: List[UserAccount] = field(default_factory=list)
+    deleted_accounts: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self, include_secrets: bool = True) -> Dict[str, Any]:
         data = {
@@ -214,6 +215,11 @@ class ClusterConfig:
             "autoSyncIntervalMinutes": self.auto_sync_interval_minutes,
             "gamerules": dict(self.gamerules) if self.gamerules else {},
             "createdAt": self.created_at,
+            "deletedAccounts": {
+                str(k): _safe_float(v, 0.0)
+                for k, v in (self.deleted_accounts or {}).items()
+                if str(k).strip()
+            },
         }
         if include_secrets:
             data["accounts"] = [asdict(a) for a in self.accounts]
@@ -255,6 +261,13 @@ class ClusterConfig:
             0,
             min(AUTO_SYNC_MAX_MINUTES, _safe_int(raw_auto_sync, AUTO_SYNC_DEFAULT_MINUTES)),
         )
+        raw_deleted = data.get("deletedAccounts", data.get("deleted_accounts"))
+        deleted_accounts: Dict[str, float] = {}
+        if isinstance(raw_deleted, dict):
+            for k, v in raw_deleted.items():
+                sk = _safe_str(k, "").strip()
+                if sk:
+                    deleted_accounts[sk] = _safe_float(v, 0.0)
         return ClusterConfig(
             cluster_id=_safe_str(data.get("clusterId", data.get("cluster_id")), str(uuid.uuid4())) or str(uuid.uuid4()),
             server_name=_safe_str(data.get("serverName", data.get("server_name")), "Shared Minecraft Server") or "Shared Minecraft Server",
@@ -282,6 +295,7 @@ class ClusterConfig:
             gamerules=dict(data.get("gamerules", {})) if isinstance(data.get("gamerules"), dict) else {},
             created_at=_safe_float(data.get("createdAt", data.get("created_at")), time.time()),
             accounts=accounts,
+            deleted_accounts=deleted_accounts,
         )
 
 
