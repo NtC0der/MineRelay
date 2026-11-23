@@ -123,13 +123,19 @@ class AuthService:
         Authenticates any user (Admin or Member) using their unique personal passkey.
         Returns (account, session_token).
         """
-        config = self.sync_engine.load_cluster_config()
-        if not config or not config.accounts:
-            raise AuthError("Cluster is not initialized yet. Please complete initial setup or select an existing Shared Sync Folder.")
-
         norm = self.normalize_passkey(passkey)
         if not norm:
             raise AuthError("Passkey is required.")
+
+        config = self.sync_engine.load_cluster_config()
+        if not config or not config.accounts:
+            for _ in range(3):
+                time.sleep(0.15)
+                config = self.sync_engine.load_cluster_config()
+                if config and config.accounts:
+                    break
+        if not config or not config.accounts:
+            raise AuthError("Cluster is not initialized yet. Please complete initial setup or select an existing Shared Sync Folder.")
 
         matched_account: Optional[UserAccount] = None
         for acc in config.accounts:
@@ -143,6 +149,7 @@ class AuthService:
 
         now = time.time()
         # Avoid rewriting shared cluster-config.json on rapid logins to prevent cloud conflict files
+        # (Still writes 0.0 -> now on a brand-new account's first login)
         if (now - float(matched_account.last_active_at or 0.0)) >= 300.0:
             with self._config_mutex:
                 fresh_cfg = self.sync_engine.load_cluster_config() or config
@@ -150,8 +157,8 @@ class AuthService:
                     if acc.id == matched_account.id:
                         acc.last_active_at = now
                         matched_account.last_active_at = now
+                        self.sync_engine.save_cluster_config(fresh_cfg)
                         break
-                self.sync_engine.save_cluster_config(fresh_cfg)
         token = self.create_session(matched_account.id)
         return matched_account, token
 

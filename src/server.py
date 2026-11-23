@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import queue
+import inspect
 import mimetypes
 import threading
 import webbrowser
@@ -40,6 +41,7 @@ if str(BUNDLE_DIR) not in sys.path:
     sys.path.insert(0, str(BUNDLE_DIR))
 
 from src.models import AUTO_SYNC_DEFAULT_MINUTES, AUTO_SYNC_MAX_MINUTES, _safe_bool
+from src.bootstrap_runtime import check_latest_minerelay_release, is_version_older
 from src.sync_engine import SyncEngine, HostLockConflictError
 from src.auth_service import AuthService, AuthError, PermissionDeniedError
 from src.tunnel_manager import TunnelManager
@@ -66,6 +68,7 @@ class AppContext:
         base_data = data_dir or _resolve_default_data_dir()
         self.sse_clients: List[queue.Queue] = []
         self.sse_mutex = threading.Lock()
+        self._cluster_version_recorded: str = ""
 
         self.sync_engine = SyncEngine(base_data, event_callback=self.broadcast_event)
         self.auth_service = AuthService(self.sync_engine)
@@ -82,10 +85,45 @@ class AppContext:
                 daemon=True,
                 name="RemoteLockWatcher",
             ).start()
+            threading.Thread(
+                target=lambda: self.get_version_check(force=True),
+                daemon=True,
+                name="InitialReleaseVersionCheck",
+            ).start()
+
+    def get_version_check(self, force: bool = False) -> Dict[str, Any]:
+        cfg = None
+        try:
+            cfg = self.sync_engine.load_cluster_config()
+        except Exception:
+            cfg = None
+        cluster_latest = cfg.latest_app_version if cfg else ""
+        vc = check_latest_minerelay_release(force=force, cluster_latest=cluster_latest)
+        cur_ver = str(vc.get("currentVersion") or "")
+        if (
+            cfg is not None
+            and cur_ver
+            and self._cluster_version_recorded != cur_ver
+            and (not cluster_latest or is_version_older(cluster_latest, cur_ver))
+            and os.environ.get("MINERELAY_TEST_MODE") != "1"
+        ):
+            try:
+                if not self.sync_engine._has_active_cloud_transfer():
+                    with self.auth_service._config_mutex:
+                        fresh = self.sync_engine.load_cluster_config()
+                        if fresh and (not fresh.latest_app_version or is_version_older(fresh.latest_app_version, cur_ver)):
+                            fresh.latest_app_version = cur_ver
+                            self.sync_engine.save_cluster_config(fresh)
+                    self._cluster_version_recorded = cur_ver
+            except Exception:
+                pass
+        return vc
 
     def _remote_lock_watcher_loop(self) -> None:
         """Polls shared host lock & remote telemetry state every 3s and pushes instant SSE updates to dashboards."""
         last_sig: Any = None
+        last_prog_sig: Any = None
+        poll_sleep: float = 3.0
         last_remote_epoch: str = ""
         seen_remote_log_ids: set = set()
         last_remote_log_count: int = 0
@@ -116,7 +154,7 @@ class AppContext:
                 return None
 
         while True:
-            time.sleep(3.0)
+            time.sleep(poll_sleep)
             try:
                 with self.sse_mutex:
                     has_clients = len(self.sse_clients) > 0
@@ -163,6 +201,17 @@ class AppContext:
                     last_remote_tail_id = ""
 
                 tel_auto = (remote_tel or {}).get("autoSync") if isinstance(remote_tel, dict) else None
+                local_prog = self.sync_engine.get_sync_progress()
+                tel_prog = (remote_tel or {}).get("syncProgress") if isinstance(remote_tel, dict) else None
+                eff_prog = local_prog if local_prog.get("active") else (tel_prog if isinstance(tel_prog, dict) else local_prog)
+                prog_sig = (
+                    bool(eff_prog.get("active")),
+                    str(eff_prog.get("operation") or ""),
+                    str(eff_prog.get("phase") or ""),
+                    int(int(eff_prog.get("percent", 0) or 0) // 2),
+                    bool(eff_prog.get("indeterminate")),
+                    int(eff_prog.get("totalFiles") or 0),
+                )
                 sig = (
                     lock.is_locked,
                     lock.is_stale(),
@@ -189,12 +238,14 @@ class AppContext:
                     (remote_tel or {}).get("publicAddress") if remote_tel else None,
                     (remote_tel or {}).get("tunnelStatus") if remote_tel else None,
                     (remote_tel or {}).get("lastError") if remote_tel else None,
-                    (tel_auto.get("inProgress"), tel_auto.get("lastSyncAt"), tel_auto.get("lastSyncStatus"))
+                    (tel_auto.get("inProgress"), tel_auto.get("lastSyncAt"), tel_auto.get("lastSyncStatus"), tel_auto.get("syncCount"))
                     if isinstance(tel_auto, dict)
                     else None,
+                    prog_sig,
                     _file_sig(self.sync_engine.cluster_config_path),
                     _file_sig(self.sync_engine.sync_manifest_path),
                     _backups_sig(self.sync_engine.backups_dir),
+                    _backups_sig(self.sync_engine.local_backups_dir),
                     self.mc_manager.local_status,
                     self.mc_manager.jar_downloading,
                     self.mc_manager.jar_download_progress,
@@ -205,9 +256,16 @@ class AppContext:
                     json.dumps(remote_tel.get("worldInfo"), sort_keys=True, default=str)
                     if isinstance(remote_tel, dict) and isinstance(remote_tel.get("worldInfo"), dict)
                     else None,
+                    getattr(self.mc_manager, "_startup_phase", ""),
+                    getattr(self.mc_manager, "_startup_detail", ""),
+                    getattr(self.mc_manager, "_startup_progress", 0),
                 )
+                vc_now = self.get_version_check(force=False)
+                sig = sig + ((vc_now.get("latestVersion"), vc_now.get("isOutdated")),)
 
                 if has_clients:
+                    if last_prog_sig is not None and prog_sig != last_prog_sig:
+                        self.broadcast_event("sync_progress", dict(eff_prog))
                     should_emit_logs = (last_sig is not None) and (not remote_epoch_changed) and (not logs_reset)
                     if should_emit_logs and 0 < len(unseen_logs) <= 25:
                         for entry in unseen_logs:
@@ -219,6 +277,7 @@ class AppContext:
                     )
                     if need_status_push:
                         summary = self.mc_manager.get_status_summary()
+                        summary["versionCheck"] = vc_now
                         if remote_epoch_changed or logs_reset or len(unseen_logs) > 25:
                             if remote_tel and isinstance(remote_tel.get("logs"), list):
                                 summary["logs"] = list(remote_tel["logs"][-120:])
@@ -226,10 +285,25 @@ class AppContext:
                                 summary["logs"] = []
                         self.broadcast_event("status_changed", summary)
                 last_sig = sig
+                last_prog_sig = prog_sig
+                poll_sleep = (
+                    1.0
+                    if (
+                        bool(eff_prog.get("active"))
+                        or self.mc_manager.local_status in ("syncing_pull", "preparing", "syncing_push", "stopping")
+                    )
+                    else 3.0
+                )
             except Exception:
-                pass
+                poll_sleep = 3.0
 
     def broadcast_event(self, event_type: str, payload: Any) -> None:
+        if event_type == "status_changed" and isinstance(payload, dict) and "versionCheck" not in payload:
+            try:
+                payload = dict(payload)
+                payload["versionCheck"] = self.get_version_check(force=False)
+            except Exception:
+                pass
         try:
             msg = json.dumps({"event": event_type, "data": payload}, default=str)
         except Exception:
@@ -359,6 +433,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
 
                 if path == "/api/setup/status":
                     cfg = ctx.sync_engine.load_cluster_config()
+                    vc = ctx.get_version_check(force=False)
                     self._send_json(200, {
                         "initialized": ctx.sync_engine.is_cluster_initialized(),
                         "sharedSyncDir": str(ctx.sync_engine.shared_dir),
@@ -366,16 +441,22 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         "machineName": ctx.sync_engine.local_config.machine_name,
                         "cloudFolders": ctx.sync_engine.detect_cloud_folders(),
                         "syncDiagnostics": ctx.sync_engine.get_sync_diagnostics(),
+                        "syncProgress": ctx.sync_engine.get_sync_progress(),
                         "serverName": cfg.server_name if cfg else "Shared Minecraft Server",
                         "autoSyncIntervalMinutes": cfg.auto_sync_interval_minutes if cfg else AUTO_SYNC_DEFAULT_MINUTES,
+                        "versionCheck": vc,
                     })
                     return
 
                 if path == "/api/auth/me":
                     user = ctx.auth_service.require_auth(token)
+                    vc = ctx.get_version_check(force=False)
+                    status_summary = ctx.mc_manager.get_status_summary()
+                    status_summary["versionCheck"] = vc
                     self._send_json(200, {
                         "account": user.to_public_dict(),
-                        "status": ctx.mc_manager.get_status_summary(),
+                        "status": status_summary,
+                        "versionCheck": vc,
                     })
                     return
 
@@ -384,6 +465,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     summary = ctx.mc_manager.get_status_summary()
                     summary["currentUser"] = user.to_public_dict()
                     summary["logs"] = ctx.mc_manager.get_effective_logs(120)
+                    summary["versionCheck"] = ctx.get_version_check(force=False)
                     self._send_json(200, summary)
                     return
 
@@ -496,6 +578,9 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                 if path == "/api/admin/backups/download":
                     ctx.auth_service.require_admin(token)
                     req_name = qs.get("name", [""])[0]
+                    req_loc = qs.get("location", [""])[0].strip().lower()
+                    if req_loc and req_loc not in ("local", "cloud"):
+                        raise ValueError("Backup location must be 'local' or 'cloud'.")
                     if not req_name or "/" in req_name or "\\" in req_name or "\x00" in req_name or ".." in req_name:
                         raise ValueError("Invalid backup name.")
                     name = Path(req_name).name
@@ -503,9 +588,11 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         raise ValueError("Invalid backup name.")
                     if not all(c.isalnum() or c in (".", "-", "_", " ", "(", ")") for c in name):
                         raise ValueError("Invalid backup name.")
-                    backups_root = ctx.sync_engine.backups_dir.resolve()
-                    bk_path = (backups_root / name).resolve()
-                    if bk_path.parent != backups_root or not bk_path.exists() or not bk_path.is_file():
+                    resolved = ctx.sync_engine.resolve_backup_path(name, location=req_loc)
+                    if not resolved:
+                        raise FileNotFoundError(f"Backup '{name}' not found.")
+                    bk_path, _loc = resolved
+                    if not bk_path.exists() or not bk_path.is_file():
                         raise FileNotFoundError(f"Backup '{name}' not found.")
                     data_bytes = bk_path.read_bytes()
                     self.send_response(200)
@@ -554,10 +641,20 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
+            qs = parse_qs(parsed.query)
 
             try:
                 token = self._get_token(parsed)
                 body = self._read_json_body()
+
+                if path == "/api/app/version-check":
+                    vc = ctx.get_version_check(force=True)
+                    if vc.get("isOutdated"):
+                        summary = ctx.mc_manager.get_status_summary()
+                        summary["versionCheck"] = vc
+                        ctx.broadcast_event("status_changed", summary)
+                    self._send_json(200, {"versionCheck": vc})
+                    return
 
                 if path == "/api/setup/init":
                     admin_username = str(body.get("adminUsername", "Admin"))
@@ -581,6 +678,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         "account": admin_acc.to_public_dict(),
                         "generatedPasskey": raw_pk,
                         "cluster": cfg.to_dict(include_secrets=False),
+                        "versionCheck": ctx.get_version_check(force=False),
                     })
                     return
 
@@ -589,19 +687,27 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         raise ValueError("Cannot change Shared Sync Folder while the server is active.")
                     new_dir = str(body.get("sharedSyncDir", "")).strip()
                     machine_name = str(body.get("machineName", "")).strip()
-                    if not new_dir:
+                    if not new_dir or "\x00" in new_dir:
                         raise ValueError("Shared Sync Folder path is required.")
+                    target_dir = Path(new_dir)
+                    if target_dir.exists() and not target_dir.is_dir():
+                        raise ValueError("Selected Shared Sync path is a file, not a directory.")
+                    drive_part = os.path.splitdrive(new_dir)[0]
+                    if drive_part and not Path(drive_part + os.sep).exists():
+                        raise ValueError(f"Shared drive or root folder is not accessible: '{drive_part}'.")
                     ctx.sync_engine.local_config.shared_sync_dir = new_dir
                     if machine_name:
                         ctx.sync_engine.local_config.machine_name = machine_name
                     ctx.sync_engine.save_local_config()
                     ctx.sync_engine.reset_sync_state()
                     cfg = ctx.sync_engine.load_cluster_config()
+                    ctx.broadcast_event("status_changed", ctx.mc_manager.get_status_summary())
                     self._send_json(200, {
                         "sharedSyncDir": str(ctx.sync_engine.shared_dir),
                         "initialized": ctx.sync_engine.is_cluster_initialized(),
                         "syncDiagnostics": ctx.sync_engine.get_sync_diagnostics(),
                         "serverName": cfg.server_name if cfg else None,
+                        "versionCheck": ctx.get_version_check(force=False),
                     })
                     return
 
@@ -618,10 +724,14 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         ctx.sync_engine.save_local_config()
                         _sync_local_lock_machine_name(ctx, machine_name)
                     acc, session_tok = ctx.auth_service.login_with_passkey(passkey)
+                    vc = ctx.get_version_check(force=False)
+                    status_summary = ctx.mc_manager.get_status_summary()
+                    status_summary["versionCheck"] = vc
                     self._send_json(200, {
                         "token": session_tok,
                         "account": acc.to_public_dict(),
-                        "status": ctx.mc_manager.get_status_summary(),
+                        "status": status_summary,
+                        "versionCheck": vc,
                     })
                     return
 
@@ -634,7 +744,28 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                 # ---------------- MEMBER + ADMIN HOSTING LIFECYCLE ----------------
                 if path == "/api/server/start":
                     user = ctx.auth_service.require_auth(token)
-                    summary = ctx.mc_manager.start_hosting(user)
+                    sync_param = qs.get("sync", [""])[0].strip().lower()
+                    run_sync = (
+                        os.environ.get("MINERELAY_TEST_MODE") == "1"
+                        or sync_param in ("1", "true", "yes")
+                        or bool(body.get("sync"))
+                    )
+                    fn = ctx.mc_manager.start_hosting
+                    try:
+                        params = inspect.signature(fn).parameters
+                    except Exception:
+                        params = {}
+                    kwargs: Dict[str, Any] = {}
+                    if "sync" in params:
+                        kwargs["sync"] = run_sync
+                    elif "blocking" in params:
+                        kwargs["blocking"] = run_sync
+                    elif "async_start" in params:
+                        kwargs["async_start"] = not run_sync
+                    summary = fn(user, **kwargs)
+                    if isinstance(summary, dict):
+                        summary.setdefault("started", True)
+                        summary["versionCheck"] = ctx.get_version_check(force=False)
                     self._send_json(200, summary)
                     return
 
@@ -654,6 +785,27 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                             )
                     summary = ctx.mc_manager.restart_hosting(user)
                     self._send_json(200, summary)
+                    return
+
+                if path == "/api/server/sync-now":
+                    ctx.auth_service.require_auth(token)
+                    lock = ctx.sync_engine.get_lock()
+                    if lock.is_actively_locked() and not ctx.sync_engine.is_locked_by_current_machine(lock):
+                        raise HostLockConflictError(
+                            f"Cannot sync remote server hosted by '{lock.host_username}' ({lock.machine_name})."
+                        )
+                    if ctx.mc_manager.local_status != "running" or not ctx.mc_manager._reached_running:
+                        raise ValueError(
+                            f"Server must be running locally to push a live sync (current status: {ctx.mc_manager.local_status})."
+                        )
+                    if not ctx.sync_engine.owns_lock(ctx.sync_engine._active_lock_epoch):
+                        raise HostLockConflictError("This machine does not hold the active host lock.")
+                    res = ctx.mc_manager.run_live_auto_sync_once(force=True)
+                    self._send_json(200, {
+                        "result": res,
+                        "autoSync": ctx.mc_manager.get_auto_sync_status(),
+                        "status": ctx.mc_manager.get_status_summary(),
+                    })
                     return
 
                 # ---------------- ADMIN ONLY POST ROUTES ----------------
@@ -752,7 +904,14 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                             )
                         ctx.sync_engine.ensure_runtime_synced_when_idle(strict=True)
                     label = str(body.get("label", "manual"))
-                    res = ctx.mc_manager.flush_and_backup_live_world(label=label, host_username=admin_user.username)
+                    scope = str(body.get("scope", "cloud") or "cloud").strip().lower()
+                    if scope not in ("local", "cloud"):
+                        raise ValueError("Backup scope must be 'local' or 'cloud'.")
+                    res = ctx.mc_manager.flush_and_backup_live_world(
+                        label=label,
+                        host_username=admin_user.username,
+                        scope=scope,
+                    )
                     self._send_json(200, {"result": res, "backups": ctx.sync_engine.list_backups()})
                     return
 
@@ -768,7 +927,10 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     name = str(body.get("name", "")).strip()
                     if not name:
                         raise ValueError("Backup name is required.")
-                    res = ctx.sync_engine.restore_backup(name)
+                    location = str(body.get("location", "") or "").strip().lower()
+                    if location and location not in ("local", "cloud"):
+                        raise ValueError("Backup location must be 'local' or 'cloud'.")
+                    res = ctx.sync_engine.restore_backup(name, location=location)
                     ctx.mc_manager._log(f"Restored world backup '{name}' to runtime and shared snapshot.", "INFO", "SyncEngine")
                     ctx.mc_manager._emit("status_changed", ctx.mc_manager.get_status_summary())
                     res["properties"] = ctx.mc_manager.get_server_properties()
@@ -776,6 +938,33 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     res["backups"] = ctx.sync_engine.list_backups()
                     res["status"] = ctx.mc_manager.get_status_summary()
                     self._send_json(200, res)
+                    return
+
+                if path == "/api/admin/backups/prune-cloud":
+                    ctx.auth_service.require_admin(token)
+                    _ensure_no_remote_lock(ctx, "prune cloud backups")
+                    if ctx.mc_manager.local_status != "idle":
+                        raise HostLockConflictError("Cannot prune cloud backups while the local server is running or transitioning.")
+                    keep = 0
+                    if "keep" in body:
+                        keep = self._require_int(body["keep"], "keep")
+                        if keep < 0 or keep > 20:
+                            raise ValueError("keep must be between 0 and 20.")
+                    res = ctx.sync_engine.prune_cloud_backups(keep=keep)
+                    removed_cnt = int(res.get("removedCount", 0) or 0)
+                    freed_mb = round(float(res.get("freedBytes", 0) or 0) / (1024.0 * 1024.0), 2)
+                    ctx.mc_manager._log(
+                        f"Pruned {removed_cnt} cloud backup archive(s) (keep={keep}, freed {freed_mb} MB).",
+                        "INFO",
+                        "SyncEngine",
+                    )
+                    summary = ctx.mc_manager.get_status_summary()
+                    ctx.broadcast_event("status_changed", summary)
+                    self._send_json(200, {
+                        "result": res,
+                        "backups": ctx.sync_engine.list_backups(),
+                        "status": summary,
+                    })
                     return
 
                 if path == "/api/admin/files/write":
@@ -962,6 +1151,12 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                                     f"autoSyncIntervalMinutes must be 0 (disabled) or between 1 and {AUTO_SYNC_MAX_MINUTES}."
                                 )
 
+                        new_max_cloud_backups = getattr(cfg, "max_cloud_backups", 2)
+                        if "maxCloudBackups" in body:
+                            new_max_cloud_backups = self._require_int(body["maxCloudBackups"], "maxCloudBackups")
+                            if new_max_cloud_backups < 0 or new_max_cloud_backups > 20:
+                                raise ValueError("maxCloudBackups must be between 0 and 20.")
+
                         runtime_fields_changed = any([
                             new_port != cfg.server_port,
                             new_sw != cfg.mc_software,
@@ -1001,6 +1196,9 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                             cfg.auto_backup_on_stop = _safe_bool(body["autoBackupOnStop"], cfg.auto_backup_on_stop)
                         if "maxBackups" in body:
                             cfg.max_backups = max(1, self._require_int(body["maxBackups"], "maxBackups"))
+                        if "cloudBackupOnStop" in body:
+                            cfg.cloud_backup_on_stop = _safe_bool(body["cloudBackupOnStop"], cfg.cloud_backup_on_stop)
+                        cfg.max_cloud_backups = new_max_cloud_backups
                         cfg.idle_shutdown_minutes = new_idle_min
                         auto_sync_changed = new_sync_min != cfg.auto_sync_interval_minutes
                         cfg.auto_sync_interval_minutes = new_sync_min
@@ -1072,7 +1270,10 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     if ctx.mc_manager.local_status != "idle":
                         raise HostLockConflictError("Cannot delete backups while the local server is running or transitioning.")
                     name = unquote(path.split("/api/admin/backups/", 1)[1])
-                    ctx.sync_engine.delete_backup(name)
+                    location = qs.get("location", [""])[0].strip().lower()
+                    if location and location not in ("local", "cloud"):
+                        raise ValueError("Backup location must be 'local' or 'cloud'.")
+                    ctx.sync_engine.delete_backup(name, location=location)
                     self._send_json(200, {"backups": ctx.sync_engine.list_backups()})
                     return
 
@@ -1107,6 +1308,7 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
             try:
                 init_summary = ctx.mc_manager.get_status_summary()
                 init_summary["logs"] = ctx.mc_manager.get_effective_logs(120)
+                init_summary["versionCheck"] = ctx.get_version_check(force=False)
                 init_payload = json.dumps({
                     "event": "connected",
                     "data": init_summary,

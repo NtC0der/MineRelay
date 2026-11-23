@@ -42,6 +42,11 @@ const state = {
   pendingActionAt: 0,
   actionInFlight: false,
   statusSeq: 0,
+  versionCheck: null,
+  dismissedStartupError: "",
+  authSyncPollTimer: null,
+  syncProgressHideTimer: null,
+  lastActiveSyncProgress: null,
 };
 
 function clearPendingActionIfSettled(localStatus, lastError) {
@@ -50,7 +55,12 @@ function clearPendingActionIfSettled(localStatus, lastError) {
     state.pendingAction = null;
     return;
   }
-  if (state.pendingAction === "starting" && (localStatus === "running" || (localStatus === "idle" && lastError))) {
+  if (
+    state.pendingAction === "starting" &&
+    (localStatus === "running" ||
+      (!state.actionInFlight && (localStatus === "syncing_pull" || localStatus === "preparing" || localStatus === "starting")) ||
+      (localStatus === "idle" && lastError))
+  ) {
     state.pendingAction = null;
   } else if (state.pendingAction === "stopping" && localStatus === "idle") {
     state.pendingAction = null;
@@ -95,6 +105,87 @@ function showPasskeyModal(title, passkey, subtitle) {
 
 function hidePasskeyModal() {
   document.getElementById("passkey-modal").classList.add("hidden");
+}
+
+function hideVersionModal(persistDismiss = false) {
+  const modal = document.getElementById("version-update-modal");
+  if (modal) modal.classList.add("hidden");
+  if (persistDismiss && state.versionCheck && state.versionCheck.latestVersion) {
+    try {
+      sessionStorage.setItem(`minerelay_dismissed_update_${state.versionCheck.latestVersion}`, "1");
+    } catch (_) {}
+  }
+}
+
+function renderVersionCheck(versionCheck) {
+  if (!versionCheck || typeof versionCheck !== "object") return;
+  state.versionCheck = versionCheck;
+  const curVer = String(versionCheck.currentVersion || "1.0.6");
+  const latestVer = String(versionCheck.latestVersion || "");
+  const isOutdated = Boolean(versionCheck.isOutdated && latestVer);
+  const relUrl = versionCheck.releaseUrl || "https://github.com/NtC0der/MineRelay/releases/latest";
+  const dlUrl = versionCheck.downloadUrl || relUrl;
+
+  const pill = document.getElementById("app-version-pill");
+  if (pill) {
+    pill.textContent = isOutdated ? `v${curVer} (Update Ready)` : `v${curVer}`;
+    pill.className = isOutdated ? "badge badge-admin" : "badge badge-outline";
+    pill.title = isOutdated
+      ? `Installed v${curVer} — Latest v${latestVer} available on GitHub`
+      : `MineRelay v${curVer}`;
+  }
+
+  const authBanner = document.getElementById("auth-version-error");
+  const authText = document.getElementById("auth-version-error-text");
+  const authDl = document.getElementById("auth-version-download");
+  if (authBanner && authText) {
+    if (isOutdated) {
+      authText.innerHTML =
+        `<strong>⚠️ Outdated MineRelay Version (v${escapeHtml(curVer)} installed — v${escapeHtml(latestVer)} available):</strong> ` +
+        `Please download the latest release from GitHub so your sync &amp; host locks stay compatible.`;
+      if (authDl) authDl.href = dlUrl;
+      authBanner.classList.remove("hidden");
+    } else {
+      authBanner.classList.add("hidden");
+    }
+  }
+
+  const dashBanner = document.getElementById("dashboard-version-banner");
+  const dashText = document.getElementById("dashboard-version-text");
+  const dashDl = document.getElementById("dashboard-version-download");
+  if (dashBanner && dashText) {
+    if (isOutdated) {
+      dashText.innerHTML =
+        `<strong>⚠️ Outdated MineRelay Version:</strong> Running <code>v${escapeHtml(curVer)}</code>, latest GitHub release is <code>v${escapeHtml(latestVer)}</code>. Download the latest build to avoid host/sync issues.`;
+      if (dashDl) dashDl.href = dlUrl;
+      dashBanner.classList.remove("hidden");
+    } else {
+      dashBanner.classList.add("hidden");
+    }
+  }
+
+  const modal = document.getElementById("version-update-modal");
+  if (modal) {
+    if (isOutdated) {
+      const modalCur = document.getElementById("version-modal-current");
+      const modalLatest = document.getElementById("version-modal-latest");
+      const modalDl = document.getElementById("version-modal-download");
+      const modalRel = document.getElementById("version-modal-releases");
+      if (modalCur) modalCur.textContent = `v${curVer}`;
+      if (modalLatest) modalLatest.textContent = `v${latestVer}`;
+      if (modalDl) modalDl.href = dlUrl;
+      if (modalRel) modalRel.href = relUrl;
+      let dismissed = false;
+      try {
+        dismissed = sessionStorage.getItem(`minerelay_dismissed_update_${latestVer}`) === "1";
+      } catch (_) {}
+      if (!dismissed) {
+        modal.classList.remove("hidden");
+      }
+    } else {
+      modal.classList.add("hidden");
+    }
+  }
 }
 
 async function apiFetch(path, options = {}) {
@@ -278,6 +369,9 @@ async function bootApp() {
       const me = await apiFetch("/api/auth/me");
       state.account = me.account;
       state.status = me.status;
+      if (me.versionCheck || (me.status && me.status.versionCheck)) {
+        renderVersionCheck(me.versionCheck || me.status.versionCheck);
+      }
       enterDashboard();
       return;
     } catch (err) {
@@ -294,9 +388,204 @@ async function bootApp() {
   await checkInitialSetup();
 }
 
+function _applySyncProgressElements(prog, ids) {
+  const banner = document.getElementById(ids.bannerId);
+  if (!banner) return;
+  const labelEl = document.getElementById(ids.labelId);
+  const pctEl = document.getElementById(ids.pctId);
+  const fillEl = document.getElementById(ids.fillId);
+  const detailEl = document.getElementById(ids.detailId);
+
+  if (!prog || !prog.active) {
+    banner.classList.add("hidden");
+    if (fillEl) {
+      fillEl.classList.remove("indeterminate");
+      fillEl.style.width = "0%";
+    }
+    if (pctEl) pctEl.textContent = "0%";
+    if (detailEl) detailEl.textContent = "";
+    return;
+  }
+
+  banner.classList.remove("hidden");
+  const isIndet = Boolean(prog.indeterminate);
+  const pct = Math.max(0, Math.min(100, Math.round(Number(prog.percent || 0))));
+  if (labelEl) labelEl.textContent = prog.label || "Syncing World Files...";
+  if (pctEl) pctEl.textContent = isIndet ? "Syncing..." : `${pct}%`;
+  if (fillEl) {
+    fillEl.classList.toggle("indeterminate", isIndet);
+    fillEl.style.width = isIndet ? "38%" : `${pct}%`;
+  }
+  if (detailEl) {
+    const parts = [];
+    if (prog.detail) parts.push(prog.detail);
+    if (prog.totalFiles > 0) {
+      if (prog.operation === "cloud_transfer") {
+        if (prog.totalFiles > 1) parts.push(`${prog.totalFiles} files in progress`);
+      } else {
+        parts.push(`${prog.doneFiles || 0}/${prog.totalFiles} files`);
+      }
+    }
+    if (prog.totalBytes > 0 && (!prog.detail || (!/\b(?:MB|GB|KB|B)\b/i.test(prog.detail) && !prog.detail.includes("/")))) {
+      parts.push(`${formatBytes(prog.doneBytes || 0)} / ${formatBytes(prog.totalBytes)}`);
+    }
+    detailEl.textContent = parts.join(" • ");
+  }
+}
+
+function renderSyncProgress(prog, options = {}) {
+  const ids = {
+    bannerId: "sync-progress-banner",
+    labelId: "sync-progress-label",
+    pctId: "sync-progress-pct",
+    fillId: "sync-progress-fill",
+    detailId: "sync-progress-detail",
+  };
+  if (prog && prog.active) {
+    if (state.syncProgressHideTimer) {
+      clearTimeout(state.syncProgressHideTimer);
+      state.syncProgressHideTimer = null;
+    }
+    if (!prog.synthetic) {
+      state.lastActiveSyncProgress = { ...prog };
+    }
+    _applySyncProgressElements(prog, ids);
+    return;
+  }
+
+  if (!options.immediate && state.lastActiveSyncProgress) {
+    const completed = {
+      ...state.lastActiveSyncProgress,
+      active: true,
+      indeterminate: false,
+      percent: 100,
+      label: state.lastActiveSyncProgress.label || "Sync Complete",
+      detail: state.lastActiveSyncProgress.detail || "World sync complete.",
+    };
+    state.lastActiveSyncProgress = null;
+    _applySyncProgressElements(completed, ids);
+    if (state.syncProgressHideTimer) clearTimeout(state.syncProgressHideTimer);
+    state.syncProgressHideTimer = setTimeout(() => {
+      state.syncProgressHideTimer = null;
+      _applySyncProgressElements(null, ids);
+    }, 1200);
+    return;
+  }
+
+  if (state.syncProgressHideTimer) {
+    clearTimeout(state.syncProgressHideTimer);
+    state.syncProgressHideTimer = null;
+  }
+  state.lastActiveSyncProgress = null;
+  _applySyncProgressElements(null, ids);
+}
+
+function buildEffectiveSyncProgress(summary, isLocalHosting, isRemoteHosting) {
+  if (!summary) return null;
+  if (summary.syncProgress && summary.syncProgress.active) {
+    return summary.syncProgress;
+  }
+  const env = summary.environment || {};
+  if (env.jarDownloading) {
+    const jarPct = Number(env.jarDownloadProgress || 0);
+    return {
+      active: true,
+      synthetic: true,
+      operation: "download",
+      phase: "downloading",
+      label: "Downloading Server JAR...",
+      detail: env.jarDownloadStatus || "Downloading Minecraft server binary...",
+      percent: jarPct,
+      indeterminate: !(jarPct > 0),
+    };
+  }
+  const lock = summary.lock || {};
+  const startupInfo = summary.startup || {};
+  const effSt = isLocalHosting
+    ? (state.pendingAction || (summary.localStatus !== "idle" ? summary.localStatus : lock.status || "idle"))
+    : (isRemoteHosting ? (lock.status || "running") : "idle");
+
+  if (effSt === "syncing_pull") {
+    const pct = Number(startupInfo.progress || 0);
+    return {
+      active: true,
+      synthetic: true,
+      operation: "pull",
+      phase: "syncing_pull",
+      label: "Pulling Latest World Snapshot...",
+      detail: startupInfo.detail || "Checking and syncing world files from Shared Folder...",
+      percent: pct,
+      indeterminate: !(pct > 0),
+    };
+  }
+  if (effSt === "preparing") {
+    const pct = Number(startupInfo.progress || 0);
+    return {
+      active: true,
+      synthetic: true,
+      operation: "prepare",
+      phase: "preparing",
+      label: "Preparing Java Runtime & Server Files...",
+      detail: startupInfo.detail || "Preparing local runtime components...",
+      percent: pct,
+      indeterminate: !(pct > 0),
+    };
+  }
+  if (effSt === "syncing_push" || effSt === "stopping" || effSt === "restarting") {
+    return {
+      active: true,
+      synthetic: true,
+      operation: "push",
+      phase: effSt,
+      label: effSt === "restarting" ? "Saving & Restarting Server..." : "Saving & Syncing World to Shared Cloud...",
+      detail: "Flushing world chunks and syncing changes...",
+      percent: 0,
+      indeterminate: true,
+    };
+  }
+  return null;
+}
+
+function renderAuthSyncProgress(prog) {
+  _applySyncProgressElements(prog, {
+    bannerId: "auth-sync-progress",
+    labelId: "auth-sync-progress-label",
+    pctId: "auth-sync-progress-pct",
+    fillId: "auth-sync-progress-fill",
+    detailId: "auth-sync-progress-detail",
+  });
+}
+
+function startAuthSyncPolling() {
+  if (state.authSyncPollTimer) return;
+  state.authSyncPollTimer = setInterval(async () => {
+    if (state.token || document.hidden) return;
+    const authView = document.getElementById("auth-view");
+    if (!authView || authView.classList.contains("hidden")) return;
+    try {
+      const setup = await apiFetch("/api/setup/status");
+      renderAuthSyncProgress(setup.syncProgress || null);
+    } catch (_) {}
+  }, 2500);
+}
+
+function stopAuthSyncPolling() {
+  if (state.authSyncPollTimer) {
+    clearInterval(state.authSyncPollTimer);
+    state.authSyncPollTimer = null;
+  }
+}
+
 async function checkInitialSetup() {
   try {
     const setup = await apiFetch("/api/setup/status");
+    if (setup.versionCheck) {
+      renderVersionCheck(setup.versionCheck);
+    }
+    renderAuthSyncProgress(setup.syncProgress || null);
+    if (!state.token) {
+      startAuthSyncPolling();
+    }
     document.getElementById("auth-sync-dir-label").textContent = setup.sharedSyncDir;
     document.getElementById("input-sync-dir").value = setup.sharedSyncDir;
     const loginMachEl = document.getElementById("login-machine-name");
@@ -304,7 +593,20 @@ async function checkInitialSetup() {
     if (loginMachEl && !loginMachEl.value.trim()) loginMachEl.value = setup.machineName || "";
     if (setupMachEl && !setupMachEl.value.trim()) setupMachEl.value = setup.machineName || "";
 
-    // Render detected cloud folder quick chips
+    const applyPresetSyncDir = async (dirPath) => {
+      try {
+        const res = await apiFetch("/api/setup/sync-dir", {
+          method: "POST",
+          body: JSON.stringify({ sharedSyncDir: dirPath }),
+        });
+        showToast(`Applied Shared Sync Folder: ${res.sharedSyncDir || dirPath}`, "success");
+        await checkInitialSetup();
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    };
+
+    // Render detected cloud folder quick chips (clicking applies the folder immediately)
     const presetsEl = document.getElementById("cloud-folder-presets");
     presetsEl.innerHTML = "";
     (setup.cloudFolders || []).forEach((folder) => {
@@ -314,14 +616,38 @@ async function checkInitialSetup() {
       btn.textContent = `📁 ${folder.label}`;
       btn.addEventListener("click", () => {
         document.getElementById("input-sync-dir").value = folder.path;
+        applyPresetSyncDir(folder.path);
       });
       presetsEl.appendChild(btn);
     });
 
+    const authSyncWarn = document.getElementById("auth-sync-warning");
+    const diag = setup.syncDiagnostics || {};
+    if (authSyncWarn) {
+      if (diag.isShortcutStreamPath) {
+        const altMirror = Array.isArray(diag.mirroredAlternatives) && diag.mirroredAlternatives.length > 0
+          ? diag.mirroredAlternatives[0]
+          : "";
+        authSyncWarn.innerHTML =
+          `⚠️ <strong>Google Drive Shortcut Path Detected:</strong> Virtual <code>.shortcut-targets-by-id</code> paths can lag or serve stale files.` +
+          (altMirror
+            ? ` Recommended local mirror: <code>${escapeHtml(altMirror)}</code> <button type="button" id="btn-auth-use-mirror" class="btn btn-primary btn-xs" style="margin-left:0.35rem;">Use Local Mirror</button>`
+            : "");
+        authSyncWarn.classList.remove("hidden");
+        const mirrorBtn = document.getElementById("btn-auth-use-mirror");
+        if (mirrorBtn && altMirror) {
+          mirrorBtn.addEventListener("click", () => applyPresetSyncDir(altMirror));
+        }
+      } else {
+        authSyncWarn.classList.add("hidden");
+        authSyncWarn.innerHTML = "";
+      }
+    }
+
     const uninitNotice = document.getElementById("cluster-uninit-notice");
     if (!setup.initialized) {
       uninitNotice.classList.remove("hidden");
-      switchAuthTab("setup");
+      switchAuthTab("login");
     } else {
       uninitNotice.classList.add("hidden");
       switchAuthTab("login");
@@ -359,6 +685,7 @@ async function enterDashboard() {
   document.getElementById("auth-view").classList.add("hidden");
   document.getElementById("dashboard-view").classList.remove("hidden");
 
+  stopAuthSyncPolling();
   state.currentFileDir = "";
   state.fileSearchQuery = "";
   state.fileCache = {};
@@ -437,6 +764,7 @@ function leaveDashboard() {
     state.pollTimer = null;
   }
   stopUptimeTicker();
+  renderSyncProgress(null, { immediate: true });
   state.uptimeAnchor = null;
   state.lastSseEventAt = 0;
   state.sseBackoffMs = 2000;
@@ -471,6 +799,7 @@ function leaveDashboard() {
   state.cmdHistoryIdx = -1;
   state.pendingAction = null;
   state.actionInFlight = false;
+  state.dismissedStartupError = "";
   state.statusSeq++;
   renderedLogIds.clear();
   const clearIds = [
@@ -493,7 +822,17 @@ function leaveDashboard() {
     const el = document.getElementById(id);
     if (el) el.value = "";
   });
-  ["file-editor-box", "world-reset-confirm-box", "jar-download-progress-wrap", "remote-admin-banner", "overview-autosync-badge", "file-search-status"].forEach((id) => {
+  [
+    "file-editor-box",
+    "world-reset-confirm-box",
+    "jar-download-progress-wrap",
+    "remote-admin-banner",
+    "overview-autosync-badge",
+    "file-search-status",
+    "hero-startup-error-banner",
+    "first-host-hint-banner",
+    "dashboard-version-banner",
+  ].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.classList.add("hidden");
   });
@@ -773,6 +1112,18 @@ function connectEventStream() {
           state.status.tunnel = payload.data;
           renderStatusSummary(state.status);
         }
+      } else if (payload.event === "sync_progress") {
+        if (state.status) {
+          state.status.syncProgress = payload.data;
+        }
+        if (payload.data && payload.data.active) {
+          renderSyncProgress(payload.data);
+        } else if (state.status) {
+          const fallbackProg = buildEffectiveSyncProgress(state.status, state.isLocalHosting, state.isRemoteHosting);
+          renderSyncProgress(fallbackProg);
+        } else {
+          renderSyncProgress(payload.data);
+        }
       }
     } catch (_) {}
   };
@@ -912,7 +1263,9 @@ function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}, localStatus = (s
     "#form-add-ban input",
     "#form-add-ban button",
     "#form-create-backup input",
+    "#form-create-backup select",
     "#form-create-backup button[type='submit']",
+    "#btn-prune-cloud-backups",
     "#input-file-upload",
     "#btn-save-file",
     "#net-playit-secret",
@@ -953,6 +1306,7 @@ function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}, localStatus = (s
     "#plugin-catalog-container button",
     "#backups-list-container .btn-restore-bk",
     "#backups-list-container .btn-del-bk",
+    "#btn-prune-cloud-backups",
   ];
   localBusySelectors.forEach((sel) => {
     document.querySelectorAll(sel).forEach((el) => {
@@ -1049,18 +1403,23 @@ function renderAutoSyncBadge(autoSync, cluster, isHosting) {
 
 function renderStatusSummary(summary) {
   if (!summary) return;
+  if (summary.versionCheck) {
+    renderVersionCheck(summary.versionCheck);
+  }
   const cluster = summary.cluster || {};
   const lock = summary.lock || {};
   const env = summary.environment || {};
   const tunnel = summary.tunnel || {};
   const telemetry = summary.telemetry || {};
   const autoSync = summary.autoSync || (env.syncDiagnostics && env.syncDiagnostics.autoSync) || {};
+  const startupInfo = summary.startup || {};
 
   const isLockedByThisMachine = Boolean(lock.isLocked && env.machineId && lock.machineId === env.machineId);
   const isLocalHosting = Boolean(state.pendingAction) || isLockedByThisMachine || summary.localStatus !== "idle";
   const isLockedByOther = Boolean(lock.isActivelyLocked && !isLocalHosting);
   const isStaleLock = Boolean(lock.isLocked && lock.isStale && !isLocalHosting);
   const isRemoteHosting = Boolean(lock.isActivelyLocked && !summary.isLocalMachineHosting && !isLocalHosting);
+  renderSyncProgress(buildEffectiveSyncProgress(summary, isLocalHosting, isRemoteHosting));
 
   const activeSoftware = ((isRemoteHosting && lock.mcSoftware) || cluster.mcSoftware || "paper").toUpperCase();
   const activeVersion = (isRemoteHosting && lock.mcVersion) || cluster.mcVersion || "26.3";
@@ -1076,6 +1435,7 @@ function renderStatusSummary(summary) {
   const headline = document.getElementById("hero-status-headline");
   const detail = document.getElementById("hero-status-detail");
   const btnStart = document.getElementById("btn-start-host");
+  const btnSyncNow = document.getElementById("btn-sync-now");
   const btnRestart = document.getElementById("btn-restart-host");
   const btnStop = document.getElementById("btn-stop-host");
 
@@ -1086,7 +1446,7 @@ function renderStatusSummary(summary) {
         : isLockedByThisMachine && lock.status && lock.status !== "idle"
           ? lock.status
           : "idle";
-    const st = state.pendingAction || rawSt;
+    const st = rawSt !== "idle" ? rawSt : (state.pendingAction || "idle");
     const isSameUserHost = !lock.hostUserId || !state.account || lock.hostUserId === state.account.id;
     const activeHostLabel = lock.hostUsername || (state.account && state.account.username) || "Member";
 
@@ -1099,6 +1459,11 @@ function renderStatusSummary(summary) {
         ? `You (${activeHostLabel}) are currently hosting the server (${activeSoftware} ${activeVersion}). When you finish playing, click "Stop & Sync World" so other members can host.`
         : `Member account '${activeHostLabel}' is currently hosting the server on this PC (${activeSoftware} ${activeVersion}). As Admin, you can still use Live Console, Gamerules, Snapshots, or Stop/Restart below.`;
       btnStart.classList.add("hidden");
+      if (btnSyncNow) {
+        btnSyncNow.classList.remove("hidden");
+        btnSyncNow.disabled = Boolean(autoSync.inProgress);
+        btnSyncNow.textContent = autoSync.inProgress ? "⏳ Syncing..." : "☁ Sync Now";
+      }
       btnStop.classList.remove("hidden");
       btnStop.textContent = "⏹ Stop & Sync World";
       btnStop.disabled = false;
@@ -1113,22 +1478,31 @@ function renderStatusSummary(summary) {
       detail.textContent =
         "Saving world changes and relaunching Java server. Your host lock and tunnel remain active.";
       btnStart.classList.add("hidden");
+      if (btnSyncNow) btnSyncNow.classList.add("hidden");
       btnStop.classList.add("hidden");
       if (btnRestart) {
         btnRestart.classList.remove("hidden");
         btnRestart.disabled = true;
         btnRestart.textContent = "⏳ Restarting...";
       }
-    } else if (st === "syncing_pull" || st === "starting") {
+    } else if (st === "syncing_pull" || st === "preparing" || st === "starting") {
       dot.className = "status-dot status-busy";
-      headline.textContent = isSameUserHost
-        ? "Pulling World Snapshot & Starting Server..."
-        : `Starting Server on This PC (Initiated by ${activeHostLabel})...`;
+      const phaseHeadline =
+        st === "syncing_pull"
+          ? "Pulling Latest World Snapshot..."
+          : st === "preparing"
+            ? "Preparing Java, Server JAR & Tunnel..."
+            : isSameUserHost
+              ? "Starting Minecraft Server..."
+              : `Starting Server on This PC (Initiated by ${activeHostLabel})...`;
+      headline.textContent = phaseHeadline;
       detail.textContent =
-        "Starting Java Minecraft server and zero-port-forward tunnel. Wait a few seconds for the indicator to turn GREEN before joining.";
+        startupInfo.detail ||
+        "Starting Java Minecraft server and zero-port-forward tunnel. First-time setup downloads Java & server.jar automatically and may take 1–3 minutes.";
+      if (btnSyncNow) btnSyncNow.classList.add("hidden");
       if (btnRestart) btnRestart.classList.add("hidden");
-      if (state.pendingAction === "starting") {
-        // Keep the start button in place disabled while the initial start request is in flight so buttons don't swap/flash
+      if (state.pendingAction === "starting" && rawSt === "idle") {
+        // Keep the start button in place disabled only while the initial HTTP request is claiming the lock
         btnStart.classList.remove("hidden");
         btnStart.disabled = true;
         btnStart.textContent = "⏳ Claiming Lock & Starting...";
@@ -1144,6 +1518,7 @@ function renderStatusSummary(summary) {
       headline.textContent = "Saving & Syncing World to Shared Folder...";
       detail.textContent = "Packaging world changes into shared storage before releasing the host lock.";
       btnStart.classList.add("hidden");
+      if (btnSyncNow) btnSyncNow.classList.add("hidden");
       if (btnRestart) btnRestart.classList.add("hidden");
       btnStop.classList.remove("hidden");
       btnStop.textContent = "⏳ Stopping & Syncing...";
@@ -1154,6 +1529,7 @@ function renderStatusSummary(summary) {
       detail.textContent =
         "A lock from a previous session on this device is active. Click below to stop any background process, sync the world, and release the lock.";
       btnStart.classList.add("hidden");
+      if (btnSyncNow) btnSyncNow.classList.add("hidden");
       if (btnRestart) btnRestart.classList.add("hidden");
       btnStop.classList.remove("hidden");
       btnStop.textContent = "⏹ Stop & Sync World";
@@ -1167,6 +1543,7 @@ function renderStatusSummary(summary) {
     btnStart.classList.remove("hidden");
     btnStart.disabled = true;
     btnStart.textContent = `🔒 Hosted by ${lock.hostUsername}`;
+    if (btnSyncNow) btnSyncNow.classList.add("hidden");
     btnStop.classList.add("hidden");
     if (btnRestart) btnRestart.classList.add("hidden");
   } else if (isStaleLock) {
@@ -1176,6 +1553,7 @@ function renderStatusSummary(summary) {
     btnStart.classList.remove("hidden");
     btnStart.disabled = false;
     btnStart.textContent = "▶ Reclaim Host & Start Server";
+    if (btnSyncNow) btnSyncNow.classList.add("hidden");
     btnStop.classList.add("hidden");
     if (btnRestart) btnRestart.classList.add("hidden");
   } else {
@@ -1190,6 +1568,7 @@ function renderStatusSummary(summary) {
     btnStart.classList.remove("hidden");
     btnStart.disabled = false;
     btnStart.textContent = "▶ Host Server on My PC";
+    if (btnSyncNow) btnSyncNow.classList.add("hidden");
     btnStop.classList.add("hidden");
     if (btnRestart) btnRestart.classList.add("hidden");
   }
@@ -1256,17 +1635,54 @@ function renderStatusSummary(summary) {
     tunnelBadge.className = "badge badge-outline";
   }
 
+  const isAdmin = state.account && state.account.role === "admin";
   const heroClaimBanner = document.getElementById("hero-claim-banner");
+  const heroClaimText = document.getElementById("hero-claim-text");
+  const heroClaimBtn = document.getElementById("hero-claim-btn");
   if (heroClaimBanner) {
-    if (!isRemoteHosting && tunnel.claimUrl) {
+    const needsClaim = Boolean(
+      !isRemoteHosting &&
+      lock.isActivelyLocked &&
+      summary.isLocalMachineHosting &&
+      tStat !== "disabled" &&
+      tStat !== "online" &&
+      tStat !== "relay_ready" &&
+      (tStat === "claim_required" || tunnel.claimUrl)
+    );
+    if (needsClaim) {
+      const claimHref = tunnel.claimUrl || "https://playit.gg/account/tunnels";
+      if (heroClaimBtn) heroClaimBtn.href = claimHref;
+      if (heroClaimText) {
+        heroClaimText.innerHTML = isAdmin
+          ? `<strong>One-Time Zero-Port-Forward Setup (<code>playit.gg</code>):</strong> Click <strong>Claim Public Tunnel</strong>, sign in to playit.gg, and add a <strong>Minecraft Java (Port ${escapeHtml(portSuffix)})</strong> tunnel. (On this PC, you can already join via <code>localhost:${escapeHtml(portSuffix)}</code>!)`
+          : `<strong>Public Tunnel Not Paired Yet (<code>playit.gg</code>):</strong> Your Admin has not paired a shared playit.gg tunnel for this group yet. Friends on your Wi-Fi can join via LAN IP right now, or your Admin can claim/configure the tunnel in Network Settings.`;
+      }
+      if (heroClaimBtn) heroClaimBtn.classList.toggle("hidden", !isAdmin && !tunnel.claimUrl);
       heroClaimBanner.classList.remove("hidden");
-      document.getElementById("hero-claim-btn").href = tunnel.claimUrl;
-    } else if (!isRemoteHosting && isLanAddress && lock.isActivelyLocked && summary.isLocalMachineHosting) {
-      heroClaimBanner.classList.remove("hidden");
-      document.getElementById("hero-claim-btn").href = "https://playit.gg/account/tunnels";
     } else {
       heroClaimBanner.classList.add("hidden");
     }
+  }
+
+  const errBanner = document.getElementById("hero-startup-error-banner");
+  const errBannerText = document.getElementById("hero-startup-error-text");
+  if (errBanner && errBannerText) {
+    if (!isLocalHosting && summary.lastError && summary.lastError !== state.dismissedStartupError) {
+      errBannerText.innerHTML = `<strong>⚠️ Last Startup Failed:</strong> ${escapeHtml(summary.lastError)}`;
+      errBanner.classList.remove("hidden");
+    } else {
+      errBanner.classList.add("hidden");
+    }
+  }
+
+  const firstHintBanner = document.getElementById("first-host-hint-banner");
+  if (firstHintBanner) {
+    const showFirstHint = Boolean(
+      !isLocalHosting &&
+      !isLockedByOther &&
+      (!env.javaInstalled || !env.serverJarInstalled)
+    );
+    firstHintBanner.classList.toggle("hidden", !showFirstHint);
   }
 
   // Telemetry Cards
@@ -1301,6 +1717,7 @@ function renderStatusSummary(summary) {
 
   const phaseLabels = {
     syncing_pull: "Pulling World...",
+    preparing: "Preparing...",
     starting: "Starting...",
     restarting: "Restarting...",
     stopping: "Stopping...",
@@ -1311,7 +1728,10 @@ function renderStatusSummary(summary) {
     const tpsVal = typeof telemetry.tps === "number" && telemetry.tps > 0 ? telemetry.tps : 20.0;
     tpsEl.textContent = `${tpsVal.toFixed(1)} TPS`;
   } else if (effectiveStatus !== "idle") {
-    tpsEl.textContent = phaseLabels[effectiveStatus] || "Busy...";
+    const pctStr = typeof startupInfo.progress === "number" && startupInfo.progress > 0 && startupInfo.progress < 100
+      ? ` (${Math.round(startupInfo.progress)}%)`
+      : "";
+    tpsEl.textContent = `${phaseLabels[effectiveStatus] || "Busy..."}${pctStr}`;
   } else {
     tpsEl.textContent = "Offline";
   }
@@ -1333,7 +1753,6 @@ function renderStatusSummary(summary) {
   renderAutoSyncBadge(autoSync, cluster, effectiveStatus === "running");
 
   // Sync Console Command Bar, Clear button & Mirror Footer for Local vs Remote Host
-  const isAdmin = state.account && state.account.role === "admin";
   const cmdForm = document.getElementById("form-console-cmd");
   const quickCmds = document.getElementById("admin-quick-cmds");
   const clearConsoleBtn = document.getElementById("btn-clear-console");
@@ -1391,6 +1810,7 @@ function renderAdminEnvBoxes(summary) {
       ? Number(autoSync.intervalMinutes)
       : Number(cluster.autoSyncIntervalMinutes !== undefined ? cluster.autoSyncIntervalMinutes : 10);
     let autoSyncSummary = "";
+    const countPart = autoSync.syncCount ? ` (${autoSync.syncCount} synced)` : "";
     if (intervalMin <= 0 || autoSync.enabled === false) {
       autoSyncSummary = "Disabled (syncs on server stop only)";
     } else if (autoSync.inProgress) {
@@ -1400,9 +1820,13 @@ function renderAdminEnvBoxes(summary) {
         ? `Last: ${formatTimeAgo(autoSync.lastSyncAt)} (${escapeHtml(autoSync.lastSyncStatus || "ok")})`
         : `Last: ${escapeHtml(autoSync.lastSyncStatus || "idle")}`;
       const nextPart = autoSync.nextSyncAt ? ` • Next: ${formatTimeUntil(autoSync.nextSyncAt)}` : "";
-      autoSyncSummary = `Every ${intervalMin}m • ${lastPart}${nextPart}`;
+      autoSyncSummary = `Every ${intervalMin}m • ${lastPart}${countPart}${nextPart}`;
     }
 
+    const smRaw = d.syncManifest || null;
+    const smDeltaLen = smRaw
+      ? (Array.isArray(smRaw.deltas) ? smRaw.deltas.length : (smRaw.lastSyncStats && smRaw.lastSyncStats.deltaCount !== undefined ? smRaw.lastSyncStats.deltaCount : 0))
+      : 0;
     const diagSig = JSON.stringify([
       d.providerDetected,
       d.clusterConfigExists,
@@ -1411,23 +1835,45 @@ function renderAdminEnvBoxes(summary) {
       d.latestSnapshotSizeBytes,
       d.latestSnapshotModifiedAt,
       d.backupCount,
+      d.cloudBackupCount,
+      d.localBackupCount,
+      d.maxDeltaChain,
       d.isShortcutStreamPath,
       altMirror,
       d.cloudTransferActive,
-      d.syncManifest && d.syncManifest.snapshotSeq,
-      d.syncManifest && d.syncManifest.updatedAt,
-      d.syncManifest && d.syncManifest.hostUsername,
+      smRaw && smRaw.snapshotSeq,
+      smRaw && smRaw.updatedAt,
+      smRaw && smRaw.hostUsername,
+      smRaw && smRaw.mode,
+      smDeltaLen,
+      smRaw && smRaw.lastSyncStats && smRaw.lastSyncStats.uploadedBytes,
+      smRaw && smRaw.lastSyncStats && smRaw.lastSyncStats.changedFiles,
       intervalMin,
       autoSync.inProgress,
       autoSync.lastSyncAt,
       autoSync.nextSyncAt,
       autoSync.lastSyncStatus,
       autoSync.lastSyncError,
+      autoSync.syncCount,
     ]);
     if (syncDiagBox.dataset.sig !== diagSig) {
       syncDiagBox.dataset.sig = diagSig;
-      const manifestLine = d.syncManifest
-        ? `<div><strong>Latest Verified World:</strong> Snapshot #${escapeHtml(d.syncManifest.snapshotSeq)} by ${escapeHtml(d.syncManifest.hostUsername || "Host")} (${formatTimeAgo(d.syncManifest.updatedAt)})</div>`
+      const sm = smRaw;
+      let manifestModeLine = "";
+      if (sm && sm.lastSyncStats) {
+        const ls = sm.lastSyncStats;
+        const modeLabel = sm.mode === "delta" ? "⚡ Incremental Delta Sync" : "📦 Full Base Sync";
+        const upStr = formatBytes(ls.uploadedBytes || 0);
+        const skipStr = ls.skippedBytes ? `, skipped ${formatBytes(ls.skippedBytes)} unchanged` : "";
+        const maxChain = d.maxDeltaChain || 25;
+        const chainLen = Array.isArray(sm.deltas) ? sm.deltas.length : (ls.deltaCount !== undefined ? ls.deltaCount : 0);
+        const chainStr = sm.mode === "delta" ? ` • Chain ${chainLen}/${maxChain}` : "";
+        manifestModeLine = `<div><strong>Last Sync Mode:</strong> ${modeLabel} (${ls.changedFiles ?? 0}/${ls.totalFiles ?? 0} files, ${upStr}${skipStr}${chainStr})</div>`;
+      }
+      const cloudBk = d.cloudBackupCount !== undefined ? d.cloudBackupCount : (d.backupCount || 0);
+      const localBk = d.localBackupCount || 0;
+      const manifestLine = sm
+        ? `<div><strong>Latest Verified World:</strong> Snapshot #${escapeHtml(sm.snapshotSeq)} by ${escapeHtml(sm.hostUsername || "Host")} (${formatTimeAgo(sm.updatedAt)})</div>${manifestModeLine}`
         : "";
       const autoSyncErrLine = autoSync.lastSyncStatus === "error" && autoSync.lastSyncError
         ? `<div class="alert-box alert-warning" style="margin-top:0.25rem; padding:0.4rem 0.65rem;">⚠️ Last auto-sync error: ${escapeHtml(autoSync.lastSyncError)}</div>`
@@ -1448,7 +1894,7 @@ function renderAdminEnvBoxes(summary) {
           <div><strong>Latest World Snapshot:</strong> ${d.latestSnapshotExists ? `✅ latest-server.zip (${formatBytes(d.latestSnapshotSizeBytes)} • ${formatTimeAgo(d.latestSnapshotModifiedAt)})` : "ℹ️ Created on first server stop"}</div>
           ${manifestLine}
           <div><strong>Periodic Drive Auto-Sync:</strong> <span id="sync-diag-autosync-row">${autoSyncSummary}</span></div>
-          <div><strong>Rolling World Backups:</strong> ${d.backupCount || 0} archives in shared folder</div>
+          <div><strong>World Backups:</strong> ${localBk} local on this PC • ${cloudBk} shared in Cloud</div>
           ${autoSyncErrLine}
           ${transferLine}
           ${shortcutWarn}
@@ -1949,6 +2395,10 @@ async function loadAdminProperties(includeVersions = true) {
     document.getElementById("net-public-address").value = c.publicJoinAddress || "";
     document.getElementById("net-sync-dir").value = env.sharedSyncDir || "";
     document.getElementById("net-auto-backup").checked = c.autoBackupOnStop !== false;
+    const cloudBkChk = document.getElementById("net-cloud-backup-on-stop");
+    if (cloudBkChk) cloudBkChk.checked = !!c.cloudBackupOnStop;
+    const maxCloudBkEl = document.getElementById("net-max-cloud-backups");
+    if (maxCloudBkEl) maxCloudBkEl.value = c.maxCloudBackups !== undefined ? c.maxCloudBackups : 2;
     document.getElementById("net-git-sync").checked = !!c.gitSyncEnabled;
     const autoSyncMinVal = c.autoSyncIntervalMinutes !== undefined ? c.autoSyncIntervalMinutes : 10;
     state.autoSyncDirty = false;
@@ -2333,10 +2783,18 @@ function renderBackupsList(backups) {
     const row = document.createElement("div");
     row.className = "list-row";
     const dateStr = new Date(b.createdAt * 1000).toLocaleString();
-    const dlUrl = `/api/admin/backups/download?name=${encodeURIComponent(b.name)}&token=${encodeURIComponent(state.token)}`;
+    const loc = b.location === "local" ? "local" : (b.location === "cloud" ? "cloud" : "");
+    const locBadge = loc === "local"
+      ? `<span class="badge badge-local">LOCAL PC</span>`
+      : `<span class="badge badge-cloud">SHARED CLOUD</span>`;
+    const locQuery = loc ? `&location=${encodeURIComponent(loc)}` : "";
+    const dlUrl = `/api/admin/backups/download?name=${encodeURIComponent(b.name)}${locQuery}&token=${encodeURIComponent(state.token)}`;
     row.innerHTML = `
       <div>
-        <strong>📦 ${escapeHtml(b.name)}</strong>
+        <div style="display:flex;align-items:center;gap:0.45rem;flex-wrap:wrap;">
+          <strong>📦 ${escapeHtml(b.name)}</strong>
+          ${locBadge}
+        </div>
         <div style="font-size:0.75rem;color:var(--text-muted);">${formatBytes(b.sizeBytes)} • ${escapeHtml(dateStr)}</div>
       </div>
       <div style="display:flex;gap:0.35rem;flex-wrap:wrap;">
@@ -2371,9 +2829,10 @@ function renderBackupsList(backups) {
         allRestoreBtns.forEach((btn) => { btn.disabled = true; });
         restoreBtn.textContent = "⏳ Restoring...";
         try {
+          const payload = loc ? { name: b.name, location: loc } : { name: b.name };
           const res = await apiFetch("/api/admin/backups/restore", {
             method: "POST",
-            body: JSON.stringify({ name: b.name }),
+            body: JSON.stringify(payload),
           });
           state.fileCache = {};
           state.currentFileDir = "";
@@ -2406,7 +2865,10 @@ function renderBackupsList(backups) {
     if (delBtn) {
       armTwoStepConfirm(delBtn, "Confirm Delete?", async () => {
         try {
-          const res = await apiFetch(`/api/admin/backups/${encodeURIComponent(b.name)}`, {
+          const delUrl = loc
+            ? `/api/admin/backups/${encodeURIComponent(b.name)}?location=${encodeURIComponent(loc)}`
+            : `/api/admin/backups/${encodeURIComponent(b.name)}`;
+          const res = await apiFetch(delUrl, {
             method: "DELETE",
           });
           renderBackupsList(res.backups || []);
@@ -2730,9 +3192,53 @@ document.addEventListener("DOMContentLoaded", () => {
       if (e.target === passkeyModal) hidePasskeyModal();
     });
   }
+  const versionModal = document.getElementById("version-update-modal");
+  const btnVersionClose = document.getElementById("version-modal-close");
+  const btnVersionDismiss = document.getElementById("version-modal-dismiss");
+  if (btnVersionClose) btnVersionClose.addEventListener("click", () => hideVersionModal(true));
+  if (btnVersionDismiss) btnVersionDismiss.addEventListener("click", () => hideVersionModal(true));
+  if (versionModal) {
+    versionModal.addEventListener("click", (e) => {
+      if (e.target === versionModal) hideVersionModal(true);
+    });
+  }
+  const btnVersionRecheck = document.getElementById("dashboard-version-check-btn");
+  if (btnVersionRecheck) {
+    btnVersionRecheck.addEventListener("click", async () => {
+      await runWithButtonBusy(btnVersionRecheck, "Checking...", async () => {
+        try {
+          const res = await apiFetch("/api/app/version-check", { method: "POST" });
+          if (res.versionCheck) {
+            renderVersionCheck(res.versionCheck);
+            showToast(
+              res.versionCheck.isOutdated
+                ? `Update available: v${res.versionCheck.latestVersion}`
+                : `MineRelay v${res.versionCheck.currentVersion} is up to date!`,
+              res.versionCheck.isOutdated ? "info" : "success"
+            );
+          }
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      });
+    });
+  }
+  const btnDismissStartupErr = document.getElementById("btn-dismiss-startup-error");
+  if (btnDismissStartupErr) {
+    btnDismissStartupErr.addEventListener("click", () => {
+      state.dismissedStartupError = (state.status && state.status.lastError) || "";
+      const errBanner = document.getElementById("hero-startup-error-banner");
+      if (errBanner) errBanner.classList.add("hidden");
+    });
+  }
   document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && passkeyModal && !passkeyModal.classList.contains("hidden")) {
-      hidePasskeyModal();
+    if (e.key === "Escape") {
+      if (passkeyModal && !passkeyModal.classList.contains("hidden")) {
+        hidePasskeyModal();
+      }
+      if (versionModal && !versionModal.classList.contains("hidden")) {
+        hideVersionModal(true);
+      }
     }
   });
   document.addEventListener("visibilitychange", () => {
@@ -2846,6 +3352,9 @@ document.addEventListener("DOMContentLoaded", () => {
         state.token = res.token;
         state.account = res.account;
         state.status = res.status;
+        if (res.versionCheck || (res.status && res.status.versionCheck)) {
+          renderVersionCheck(res.versionCheck || res.status.versionCheck);
+        }
         localStorage.setItem("minerelay_token", res.token);
         showToast(`Signed in as ${res.account.username} (${res.account.role.toUpperCase()})`, "success");
         enterDashboard();
@@ -2919,6 +3428,7 @@ document.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btn-start-host").addEventListener("click", async () => {
     if (state.actionInFlight) return;
     state.actionInFlight = true;
+    state.dismissedStartupError = "";
     state.pendingAction = "starting";
     state.pendingActionAt = Date.now();
     state.statusSeq++;
@@ -2938,7 +3448,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (summary.localStatus === "running") {
         showToast("✅ Minecraft Server is ONLINE and ready to join!", "success");
       } else {
-        showToast("Starting Minecraft server... Wait a few seconds for GREEN status before joining!", "info");
+        showToast("Starting server & syncing files... Progress will stream live below!", "info");
       }
     } catch (err) {
       state.pendingAction = null;
@@ -2948,6 +3458,35 @@ document.addEventListener("DOMContentLoaded", () => {
       state.actionInFlight = false;
     }
   });
+
+  const btnSyncNow = document.getElementById("btn-sync-now");
+  if (btnSyncNow) {
+    btnSyncNow.addEventListener("click", async () => {
+      if (btnSyncNow.disabled) return;
+      await runWithButtonBusy(btnSyncNow, "⏳ Syncing...", async () => {
+        try {
+          const res = await apiFetch("/api/server/sync-now", { method: "POST" });
+          if (res.status) {
+            state.status = res.status;
+            renderStatusSummary(res.status);
+          }
+          const r = res.result || {};
+          if (r.error) {
+            showToast(`Sync failed: ${r.error}`, "error");
+          } else if (r.mode === "noop") {
+            showToast("World is already up-to-date on Shared Cloud (0 B needed)!", "success");
+          } else if (r.pushed) {
+            const upBytes = r.uploadedBytes !== undefined ? r.uploadedBytes : (r.sizeBytes || 0);
+            showToast(`Live world synced (${r.mode || "snapshot"}: ${formatBytes(upBytes)})!`, "success");
+          } else {
+            showToast(r.reason || "Live sync skipped.", "info");
+          }
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      });
+    });
+  }
 
   const btnRestartHost = document.getElementById("btn-restart-host");
   if (btnRestartHost) {
@@ -3770,13 +4309,20 @@ document.addEventListener("DOMContentLoaded", () => {
       submitBtn.textContent = "⏳ Creating Snapshot...";
     }
     const label = document.getElementById("input-backup-label").value.trim() || "manual";
+    const scopeEl = document.getElementById("input-backup-scope");
+    const scope = scopeEl && scopeEl.value === "cloud" ? "cloud" : "local";
     try {
       const res = await apiFetch("/api/admin/backups", {
         method: "POST",
-        body: JSON.stringify({ label }),
+        body: JSON.stringify({ label, scope }),
       });
       renderBackupsList(res.backups || []);
-      showToast("Created world snapshot backup in Shared Sync Folder!", "success");
+      showToast(
+        scope === "cloud"
+          ? "Created world snapshot backup in Shared Cloud Folder!"
+          : "Created fast local world snapshot backup on this PC!",
+        "success"
+      );
     } catch (err) {
       showToast(err.message, "error");
     } finally {
@@ -3786,6 +4332,34 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
   });
+
+  const btnPruneCloud = document.getElementById("btn-prune-cloud-backups");
+  if (btnPruneCloud) {
+    armTwoStepConfirm(btnPruneCloud, "Confirm Free Cloud?", async () => {
+      await runWithButtonBusy(btnPruneCloud, "⏳ Freeing Cloud...", async () => {
+        try {
+          const res = await apiFetch("/api/admin/backups/prune-cloud", {
+            method: "POST",
+            body: JSON.stringify({ keep: 0 }),
+          });
+          if (Array.isArray(res.backups)) {
+            renderBackupsList(res.backups);
+          }
+          if (res.status) {
+            state.status = res.status;
+            renderStatusSummary(res.status);
+          }
+          const r = res.result || {};
+          showToast(
+            `Removed ${r.removedCount || 0} cloud backup archive(s), freeing ${formatBytes(r.freedBytes || 0)}.`,
+            "success"
+          );
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      });
+    });
+  }
 
   // Network & Sync Controls
   document.getElementById("btn-save-public-address").addEventListener("click", async (e) => {
@@ -3850,12 +4424,21 @@ document.addEventListener("DOMContentLoaded", () => {
       showToast("Drive Auto-Sync interval must be 0 (Off) or 1–1440 minutes.", "error");
       return;
     }
+    const maxCloudInp = document.getElementById("net-max-cloud-backups");
+    const maxCloudBackups = maxCloudInp ? parseInt(maxCloudInp.value, 10) : 2;
+    if (!Number.isFinite(maxCloudBackups) || maxCloudBackups < 0 || maxCloudBackups > 20) {
+      showToast("Max Cloud Backups must be between 0 and 20.", "error");
+      return;
+    }
+    const cloudBackupChk = document.getElementById("net-cloud-backup-on-stop");
     await runWithButtonBusy(btn, "Saving...", async () => {
       try {
         await apiFetch("/api/admin/settings", {
           method: "PUT",
           body: JSON.stringify({
             autoBackupOnStop: document.getElementById("net-auto-backup").checked,
+            cloudBackupOnStop: cloudBackupChk ? cloudBackupChk.checked : false,
+            maxCloudBackups,
             gitSyncEnabled: document.getElementById("net-git-sync").checked,
             autoSyncIntervalMinutes: autoSyncMinutes,
           }),

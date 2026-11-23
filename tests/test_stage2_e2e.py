@@ -257,8 +257,17 @@ def run_stage2_suite():
         assert pc1.ctx.sync_engine.owns_lock(lock_before.lock_epoch) is True
         assert len(pc1.ctx.sync_engine.list_backups()) == backups_before, "Live auto-sync must not create extra backup archives"
 
-        with zipfile.ZipFile(pc1.ctx.sync_engine.latest_snapshot_path, "r") as zf:
-            assert "world/autosync-live-chunk.mca" in [n.replace("\\", "/") for n in zf.namelist()]
+        manifest_after = pc1.ctx.sync_engine._read_sync_manifest() or {}
+        if manifest_after.get("mode") == "delta" and manifest_after.get("deltas"):
+            latest_delta_rel = manifest_after["deltas"][-1]["file"]
+            delta_zip_path = pc1.ctx.sync_engine.snapshots_dir / latest_delta_rel
+            with zipfile.ZipFile(delta_zip_path, "r") as dzf:
+                assert "world/autosync-live-chunk.mca" in [n.replace("\\", "/") for n in dzf.namelist()]
+            file_idx = json.loads(pc1.ctx.sync_engine.file_index_path.read_text(encoding="utf-8"))
+            assert "world/autosync-live-chunk.mca" in file_idx.get("files", {})
+        else:
+            with zipfile.ZipFile(pc1.ctx.sync_engine.latest_snapshot_path, "r") as zf:
+                assert "world/autosync-live-chunk.mca" in [n.replace("\\", "/") for n in zf.namelist()]
 
         st_stat, stat_res = pc1.request("GET", "/api/server/status", token=admin_token)
         assert st_stat == 200
@@ -758,6 +767,73 @@ def run_stage2_suite():
             assert fn_name in app_js, f"Missing Stage 2 symbol {fn_name} in public/app.js"
 
         assert "--border-subtle:" in styles_css and "--bg-card-hover:" in styles_css, "Missing CSS root variables!"
+
+        # E.4 playit.gg 0.17.1 auto-upgrade, query cooldown & TooManyRequests spam suppression
+        from src import tunnel_manager as tm_mod
+        assert tuple(int(x) for x in tm_mod.PLAYIT_MIN_VERSION.split(".")) >= (0, 17, 1)
+        assert "v0.17.1" in tm_mod.PLAYIT_WINDOWS_URL and "v0.17.1" in tm_mod.PLAYIT_LINUX_URL
+
+        fake_bin = pc1.ctx.tunnel_manager.playit_binary_path
+        fake_bin.parent.mkdir(parents=True, exist_ok=True)
+        fake_bin.write_bytes(b"fake-0.15.26")
+        orig_test_mode = os.environ.get("MINERELAY_TEST_MODE")
+        orig_get_ver = pc1.ctx.tunnel_manager._get_installed_binary_version
+        orig_dl = pc1.ctx.tunnel_manager.download_playit_binary
+        dl_calls = []
+        try:
+            os.environ["MINERELAY_TEST_MODE"] = "0"
+            pc1.ctx.tunnel_manager._checked_binary_upgrade = False
+            pc1.ctx.tunnel_manager._get_installed_binary_version = lambda bp: "0.15.26"
+            pc1.ctx.tunnel_manager.download_playit_binary = lambda: (dl_calls.append(True) or {"installed": True})
+            pc1.ctx.tunnel_manager._ensure_up_to_date_binary()
+            assert len(dl_calls) == 1, f"Expected auto-upgrade download for 0.15.26, got {dl_calls}"
+        finally:
+            if orig_test_mode is None:
+                os.environ.pop("MINERELAY_TEST_MODE", None)
+            else:
+                os.environ["MINERELAY_TEST_MODE"] = orig_test_mode
+            pc1.ctx.tunnel_manager._get_installed_binary_version = orig_get_ver
+            pc1.ctx.tunnel_manager.download_playit_binary = orig_dl
+
+        # Cooldown prevents duplicate -s tunnels list subprocess bursts
+        pc1.ctx.tunnel_manager.shared_secret_toml_path.parent.mkdir(parents=True, exist_ok=True)
+        pc1.ctx.tunnel_manager.shared_secret_toml_path.write_text('secret_key = "abc123"\n', encoding="utf-8")
+        pc1.ctx.tunnel_manager._last_tunnels_query_at = 0.0
+        pc1.ctx.tunnel_manager._last_cached_tunnels_addr = None
+        subproc_calls = []
+        class _FakeSubRes:
+            stdout = "playit_cli::ui: cool-server.gl.joinmc.link => 127.0.0.1:25565\n"
+        orig_run = tm_mod.subprocess.run
+        try:
+            tm_mod.subprocess.run = lambda *a, **kw: (subproc_calls.append(1) or _FakeSubRes())
+            a1 = pc1.ctx.tunnel_manager._query_playit_tunnels_list(str(fake_bin), min_interval_sec=10.0)
+            a2 = pc1.ctx.tunnel_manager._query_playit_tunnels_list(str(fake_bin), min_interval_sec=10.0)
+            assert a1 == "cool-server.gl.joinmc.link" and a2 == a1
+            assert len(subproc_calls) == 1, f"Expected 1 subprocess call under cooldown, got {len(subproc_calls)}"
+        finally:
+            tm_mod.subprocess.run = orig_run
+
+        # TooManyRequests / ReqPingGet log lines are throttled cleanly
+        import io
+        class _FakeProc:
+            def __init__(self, lines):
+                self.stdout = io.StringIO("\n".join(lines) + "\n")
+            def poll(self):
+                return 0
+        pc1.ctx.tunnel_manager.logs.clear()
+        pc1.ctx.tunnel_manager._last_rate_limit_log_at = 0.0
+        pc1.ctx.tunnel_manager._rate_limit_suppressed = 0
+        pc1.ctx.tunnel_manager.public_address = "cool-server.gl.joinmc.link"
+        fake_p = _FakeProc([
+            "2026-11-17T10:39:04Z ERROR playit_cli::autorun: error running ping monitor error=ApiError(ClientError(TooManyRequests))",
+            "2026-11-17T10:39:08Z ERROR playit_api_client::http_client: API call failed error=TooManyRequests request=playit_api_client::api::ReqPingGet",
+            "2026-11-17T10:39:12Z ERROR playit_cli::autorun: error running ping monitor error=ApiError(ClientError(TooManyRequests))",
+        ])
+        pc1.ctx.tunnel_manager._proc = fake_p
+        pc1.ctx.tunnel_manager._monitor_playit_output(fake_p, 25565, str(fake_bin))
+        rl_logs = [l for l in pc1.ctx.tunnel_manager.logs if "TooManyRequests" in l or "ReqPingGet" in l]
+        assert len(rl_logs) == 1, f"Expected throttled single rate-limit log, got {rl_logs}"
+
         print("  [OK] Suite E passed: auth session cleanup, tunnel disabled state & frontend Stage 2 invariants.")
 
         print("\n============================================================")

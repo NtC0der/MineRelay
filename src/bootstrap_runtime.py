@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import time
 import shutil
 import hashlib
 import tarfile
@@ -9,14 +10,320 @@ import zipfile
 import platform
 import threading
 import subprocess
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional, Callable, Dict, List, Any, Tuple
 
+from src.models import (
+    APP_VERSION,
+    GITHUB_RELEASES_API,
+    GITHUB_RELEASES_URL,
+    GITHUB_DOWNLOAD_URL,
+)
+
 ADOPTIUM_JRE_API_TMPL = (
     "https://api.adoptium.net/v3/binary/latest/{major}/ga/{os_name}/{arch}/jre/hotspot/normal/eclipse"
 )
-USER_AGENT = "MineRelay/2.0 (https://github.com/NtC0der/MineRelay; contact@minerelay.local)"
+USER_AGENT = f"MineRelay/{APP_VERSION} (https://github.com/NtC0der/MineRelay; contact@minerelay.local)"
+
+
+def _os_replace_retry(src: Path, dst: Path, attempts: int = 6) -> None:
+    """Retries os.replace briefly to tolerate Windows Defender / AV file locks on freshly downloaded binaries."""
+    last_err: Optional[Exception] = None
+    for i in range(max(1, attempts)):
+        try:
+            os.replace(src, dst)
+            return
+        except (PermissionError, OSError) as e:
+            last_err = e
+            time.sleep(0.15 * (i + 1))
+    if last_err is not None:
+        raise last_err
+
+
+def _is_valid_zip_archive(path: Path) -> bool:
+    try:
+        if not path.exists() or not path.is_file() or path.stat().st_size <= 0:
+            return False
+        with zipfile.ZipFile(path, "r") as zf:
+            return len(zf.infolist()) > 0
+    except Exception:
+        return False
+
+
+def _file_digest_hex(path: Path, algo: str) -> str:
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1048576), b""):
+            h.update(chunk)
+    return h.hexdigest().lower()
+
+
+def _download_to_file_verified(
+    url: str,
+    dest_tmp: Path,
+    expected_sha256: str = "",
+    expected_sha1: str = "",
+    timeout: int = 120,
+    attempts: int = 3,
+    progress_cb: Optional[Callable[[int, int, int], None]] = None,
+) -> int:
+    """Downloads URL to dest_tmp with retries, Content-Length completeness check, and optional digest verification."""
+    exp256 = (expected_sha256 or "").strip().lower()
+    exp1 = (expected_sha1 or "").strip().lower()
+    last_err: Optional[Exception] = None
+
+    for attempt in range(max(1, attempts)):
+        try:
+            try:
+                if dest_tmp.exists():
+                    dest_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw_cl = resp.headers.get("Content-Length")
+                total = int(raw_cl) if raw_cl and str(raw_cl).strip().isdigit() else 0
+                downloaded = 0
+                with open(dest_tmp, "wb") as out:
+                    while True:
+                        chunk = resp.read(131072)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_cb and total > 0:
+                            pct = min(100, int((downloaded / total) * 100))
+                            progress_cb(pct, downloaded, total)
+
+            if total > 0 and downloaded != total:
+                raise RuntimeError(
+                    f"Incomplete download ({downloaded} of {total} bytes received)"
+                )
+            if downloaded <= 0:
+                raise RuntimeError("Downloaded file is empty (0 bytes)")
+            if len(exp256) == 64:
+                actual256 = _file_digest_hex(dest_tmp, "sha256")
+                if actual256 != exp256:
+                    raise RuntimeError(f"SHA-256 mismatch (expected {exp256[:12]}..., got {actual256[:12]}...)")
+            elif len(exp1) == 40:
+                actual1 = _file_digest_hex(dest_tmp, "sha1")
+                if actual1 != exp1:
+                    raise RuntimeError(f"SHA-1 mismatch (expected {exp1[:12]}..., got {actual1[:12]}...)")
+            return downloaded
+        except Exception as e:
+            last_err = e
+            try:
+                if dest_tmp.exists():
+                    dest_tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt + 1 < max(1, attempts):
+                time.sleep(0.8 * (2 ** attempt))
+
+    raise RuntimeError(str(last_err or "Download failed"))
+
+
+def parse_semver(version_str: str) -> Tuple[int, int, int, int, Tuple[Tuple[int, Any], ...]]:
+    """
+    Parses a version string (e.g. 'v1.10.2', '1.0.6-beta.1') into a comparable tuple:
+    (major, minor, patch, is_stable_flag, prerelease_tokens).
+    Stable releases compare greater than prereleases of the same core version.
+    """
+    clean = str(version_str or "").strip()
+    if clean.lower().startswith("v"):
+        clean = clean[1:].strip()
+    clean = clean.split("+", 1)[0]
+    if "-" in clean:
+        core_part, pre_part = clean.split("-", 1)
+        is_stable = 0
+        pre_tokens: List[Tuple[int, Any]] = []
+        for tok in re.split(r"[.\-_]+", pre_part.strip()):
+            if not tok:
+                continue
+            if tok.isdigit():
+                pre_tokens.append((0, int(tok)))
+            else:
+                pre_tokens.append((1, tok.lower()))
+    else:
+        core_part = clean
+        is_stable = 1
+        pre_tokens = []
+
+    nums = [int(x) for x in re.findall(r"\d+", core_part)[:3]]
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2], is_stable, tuple(pre_tokens))
+
+
+def is_version_older(current: str, latest: str) -> bool:
+    c_str = str(current or "").strip()
+    l_str = str(latest or "").strip()
+    if not c_str or not l_str:
+        return False
+    if not re.search(r"\d", c_str) or not re.search(r"\d", l_str):
+        return False
+    return parse_semver(c_str) < parse_semver(l_str)
+
+
+_RELEASE_CACHE: Optional[Dict[str, Any]] = None
+_RELEASE_CACHE_TS: float = 0.0
+_RELEASE_CACHE_URL: str = ""
+_RELEASE_CACHE_LOCK = threading.Lock()
+_RELEASE_CHECK_IN_FLIGHT = False
+RELEASE_CACHE_TTL_SEC = 1800.0
+
+
+def _build_version_check_payload(
+    current_ver: str,
+    gh_data: Optional[Dict[str, Any]],
+    cluster_latest: str = "",
+) -> Dict[str, Any]:
+    gh_latest = str((gh_data or {}).get("latestVersion") or "").strip()
+    c_latest = str(cluster_latest or "").strip()
+
+    effective_latest = gh_latest
+    source = "github" if gh_latest else "none"
+    if c_latest and re.search(r"\d", c_latest):
+        if not effective_latest or is_version_older(effective_latest, c_latest):
+            effective_latest = c_latest
+            source = "cluster"
+
+    outdated = is_version_older(current_ver, effective_latest) if effective_latest else False
+    return {
+        "currentVersion": current_ver,
+        "latestVersion": effective_latest,
+        "isOutdated": outdated,
+        "releaseUrl": str((gh_data or {}).get("releaseUrl") or GITHUB_RELEASES_URL),
+        "downloadUrl": str((gh_data or {}).get("downloadUrl") or GITHUB_DOWNLOAD_URL),
+        "releaseName": str((gh_data or {}).get("releaseName") or (f"MineRelay v{effective_latest}" if effective_latest else "")),
+        "checkedAt": float((gh_data or {}).get("checkedAt") or 0.0),
+        "source": source,
+        "error": str((gh_data or {}).get("error") or ""),
+    }
+
+
+def _fetch_latest_github_release_sync(api_url: str, current_ver: str) -> Dict[str, Any]:
+    now = time.time()
+    try:
+        req = urllib.request.Request(
+            api_url,
+            headers={
+                "User-Agent": f"MineRelay/{current_ver}",
+                "Accept": "application/vnd.github+json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Unexpected GitHub release API payload")
+        tag = str(payload.get("tag_name") or "").strip()
+        latest_ver = tag[1:].strip() if tag.lower().startswith("v") else tag
+        release_url = str(payload.get("html_url") or GITHUB_RELEASES_URL).strip() or GITHUB_RELEASES_URL
+        release_name = str(payload.get("name") or tag or "").strip()
+        download_url = GITHUB_DOWNLOAD_URL
+        assets = payload.get("assets")
+        if isinstance(assets, list):
+            for asset in assets:
+                if isinstance(asset, dict):
+                    aname = str(asset.get("name") or "").lower()
+                    burl = str(asset.get("browser_download_url") or "").strip()
+                    if burl and (aname.endswith(".exe") or "minerelay" in aname):
+                        download_url = burl
+                        break
+        return {
+            "latestVersion": latest_ver,
+            "releaseUrl": release_url,
+            "downloadUrl": download_url,
+            "releaseName": release_name,
+            "checkedAt": now,
+            "error": "",
+        }
+    except Exception as e:
+        return {
+            "latestVersion": "",
+            "releaseUrl": GITHUB_RELEASES_URL,
+            "downloadUrl": GITHUB_DOWNLOAD_URL,
+            "releaseName": "",
+            "checkedAt": now,
+            "error": str(e),
+        }
+
+
+def check_latest_minerelay_release(force: bool = False, cluster_latest: str = "") -> Dict[str, Any]:
+    """
+    Non-blocking cached check against GitHub Releases (latest).
+    Respects MINERELAY_APP_VERSION and MINERELAY_RELEASES_API_URL overrides.
+    Skips live GitHub calls when MINERELAY_TEST_MODE=1 unless MINERELAY_RELEASES_API_URL is set.
+    """
+    global _RELEASE_CACHE, _RELEASE_CACHE_TS, _RELEASE_CACHE_URL, _RELEASE_CHECK_IN_FLIGHT
+
+    current_ver = os.environ.get("MINERELAY_APP_VERSION", "").strip() or APP_VERSION
+    custom_api = os.environ.get("MINERELAY_RELEASES_API_URL", "").strip()
+    api_url = custom_api or GITHUB_RELEASES_API
+    skip_network = (os.environ.get("MINERELAY_TEST_MODE") == "1") and not custom_api
+
+    if skip_network:
+        return _build_version_check_payload(current_ver, None, cluster_latest=cluster_latest)
+
+    now = time.time()
+    with _RELEASE_CACHE_LOCK:
+        cache_valid = (
+            _RELEASE_CACHE is not None
+            and _RELEASE_CACHE_URL == api_url
+            and (now - _RELEASE_CACHE_TS) < RELEASE_CACHE_TTL_SEC
+        )
+        if cache_valid and not force:
+            return _build_version_check_payload(current_ver, _RELEASE_CACHE, cluster_latest=cluster_latest)
+        cached_snap = dict(_RELEASE_CACHE) if (_RELEASE_CACHE and _RELEASE_CACHE_URL == api_url) else None
+
+    if force or (custom_api and cached_snap is None):
+        fresh = _fetch_latest_github_release_sync(api_url, current_ver)
+        with _RELEASE_CACHE_LOCK:
+            if fresh.get("latestVersion") or _RELEASE_CACHE is None or _RELEASE_CACHE_URL != api_url:
+                _RELEASE_CACHE = fresh
+                _RELEASE_CACHE_TS = time.time()
+                _RELEASE_CACHE_URL = api_url
+            elif cached_snap and cached_snap.get("latestVersion"):
+                # Keep previous known latestVersion on transient offline refresh failure, attach latest error
+                merged = dict(cached_snap)
+                merged["checkedAt"] = fresh["checkedAt"]
+                merged["error"] = fresh.get("error", "")
+                _RELEASE_CACHE = merged
+                _RELEASE_CACHE_TS = time.time()
+                fresh = merged
+        return _build_version_check_payload(current_ver, fresh, cluster_latest=cluster_latest)
+
+    # Trigger background refresh so HTTP endpoints stay non-blocking
+    with _RELEASE_CACHE_LOCK:
+        should_spawn = not _RELEASE_CHECK_IN_FLIGHT
+        if should_spawn:
+            _RELEASE_CHECK_IN_FLIGHT = True
+
+    if should_spawn:
+        def _bg_refresh() -> None:
+            global _RELEASE_CACHE, _RELEASE_CACHE_TS, _RELEASE_CACHE_URL, _RELEASE_CHECK_IN_FLIGHT
+            try:
+                fresh = _fetch_latest_github_release_sync(api_url, current_ver)
+                with _RELEASE_CACHE_LOCK:
+                    prev = _RELEASE_CACHE if _RELEASE_CACHE_URL == api_url else None
+                    if fresh.get("latestVersion") or prev is None:
+                        _RELEASE_CACHE = fresh
+                    elif prev and prev.get("latestVersion"):
+                        merged = dict(prev)
+                        merged["checkedAt"] = fresh["checkedAt"]
+                        merged["error"] = fresh.get("error", "")
+                        _RELEASE_CACHE = merged
+                    _RELEASE_CACHE_TS = time.time()
+                    _RELEASE_CACHE_URL = api_url
+            finally:
+                with _RELEASE_CACHE_LOCK:
+                    _RELEASE_CHECK_IN_FLIGHT = False
+
+        threading.Thread(target=_bg_refresh, daemon=True, name="ReleaseVersionCheck").start()
+
+    return _build_version_check_payload(current_ver, cached_snap, cluster_latest=cluster_latest)
 
 
 def get_java_major_version(java_cmd: str) -> int:
@@ -41,12 +348,13 @@ def get_java_major_version(java_cmd: str) -> int:
 
 def required_java_major_for_mc(mc_version: str) -> int:
     """
-    Minecraft 26.1+ (including latest 26.3) requires Java 25 (class file version 69.0).
+    Minecraft 26.1+ (including 26.3, 27.x, 28.x...) requires Java 25 (class file version 69.0).
     Minecraft 1.20.5 - 1.21.11 requires Java 21.
     Java 25 is backwards-compatible and can run both 26.x and 1.21.x!
     """
-    ver = mc_version.strip()
-    if ver.startswith("26.") or ver.startswith("27."):
+    ver = (mc_version or "").strip()
+    m = re.match(r"^\s*(\d+)", ver)
+    if m and int(m.group(1)) >= 26:
         return 25
     return 21
 
@@ -102,26 +410,23 @@ def ensure_portable_java(
             f"Downloading Portable Java {target_major} Runtime (Eclipse Temurin {target_major} JRE for Minecraft)... (~53 MB)"
         )
 
-    req = urllib.request.Request(api_url, headers={"User-Agent": USER_AGENT})
+    last_pct = [-1]
+
+    def _on_progress(pct: int, downloaded: int, total: int) -> None:
+        if pct // 20 > last_pct[0] // 20 and log_fn:
+            last_pct[0] = pct
+            log_fn(
+                f"Downloading Portable Java {target_major} JRE: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
+            )
+
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            last_pct = -1
-            with open(archive_path, "wb") as out:
-                while True:
-                    chunk = resp.read(131072)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        pct = int((downloaded / total) * 100)
-                        if pct // 20 > last_pct // 20 and log_fn:
-                            last_pct = pct
-                            log_fn(
-                                f"Downloading Portable Java {target_major} JRE: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
-                            )
+        _download_to_file_verified(
+            api_url,
+            archive_path,
+            timeout=120,
+            attempts=3,
+            progress_cb=_on_progress,
+        )
 
         if log_fn:
             log_fn(f"Extracting Portable Java {target_major} JRE...")
@@ -158,7 +463,7 @@ def ensure_portable_java(
 
         if jre_root.exists():
             shutil.rmtree(jre_root, ignore_errors=True)
-        os.replace(staging_root, jre_root)
+        _os_replace_retry(staging_root, jre_root)
     finally:
         try:
             if archive_path.exists():
@@ -287,8 +592,8 @@ def fetch_live_minecraft_versions() -> Dict[str, Any]:
     return result
 
 
-def resolve_mojang_server_url(version: str) -> Tuple[str, str]:
-    """Returns (download_url, resolved_version) from Mojang's official manifest."""
+def _resolve_mojang_server_with_sha1(version: str) -> Tuple[str, str, str]:
+    """Returns (download_url, resolved_version, sha1_hex) from Mojang's official manifest."""
     manifest_url = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
     req = urllib.request.Request(manifest_url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=20) as resp:
@@ -303,18 +608,23 @@ def resolve_mojang_server_url(version: str) -> Tuple[str, str]:
         ver_url = next((v["url"] for v in versions if v.get("id") == resolved_ver), versions[0]["url"])
     with urllib.request.urlopen(urllib.request.Request(ver_url, headers={"User-Agent": USER_AGENT}), timeout=20) as resp:
         ver_data = json.loads(resp.read().decode("utf-8"))
-    return ver_data["downloads"]["server"]["url"], resolved_ver
+    srv_info = ver_data["downloads"]["server"]
+    return srv_info["url"], resolved_ver, str(srv_info.get("sha1") or "").strip().lower()
 
 
-def resolve_papermc_or_mojang_url(
+def resolve_mojang_server_url(version: str) -> Tuple[str, str]:
+    """Returns (download_url, resolved_version) from Mojang's official manifest."""
+    url, resolved_ver, _ = _resolve_mojang_server_with_sha1(version)
+    return url, resolved_ver
+
+
+def _resolve_papermc_or_mojang_with_checksum(
     software: str,
     version: str,
     log_fn: Optional[Callable[[str], None]] = None,
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str, str, str, str]:
     """
-    Returns (download_url, resolved_software, resolved_version).
-    Uses PaperMC Fill v3 API (/v3/projects/paper/versions/{version}/builds)
-    and automatically falls back to Mojang Official Vanilla if Paper doesn't have a build for that version yet.
+    Returns (download_url, resolved_software, resolved_version, sha256_hex, sha1_hex).
     """
     headers = {"User-Agent": USER_AGENT}
     if software == "paper":
@@ -332,7 +642,9 @@ def resolve_papermc_or_mojang_url(
                 dl = chosen.get("downloads", {})
                 for key in ("server:default", "application"):
                     if key in dl and "url" in dl[key]:
-                        return dl[key]["url"], "paper", version
+                        checksums = dl[key].get("checksums") if isinstance(dl[key], dict) else None
+                        sha256_hex = str((checksums or {}).get("sha256") or "").strip().lower()
+                        return dl[key]["url"], "paper", version, sha256_hex, ""
         except Exception:
             pass
         if log_fn:
@@ -340,8 +652,24 @@ def resolve_papermc_or_mojang_url(
                 f"Note: PaperMC build not published yet for {version}; using official Mojang Vanilla {version} server.jar."
             )
 
-    url, resolved_ver = resolve_mojang_server_url(version)
-    return url, "vanilla", resolved_ver
+    url, resolved_ver, sha1_hex = _resolve_mojang_server_with_sha1(version)
+    return url, "vanilla", resolved_ver, "", sha1_hex
+
+
+def resolve_papermc_or_mojang_url(
+    software: str,
+    version: str,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> Tuple[str, str, str]:
+    """
+    Returns (download_url, resolved_software, resolved_version).
+    Uses PaperMC Fill v3 API (/v3/projects/paper/versions/{version}/builds)
+    and automatically falls back to Mojang Official Vanilla if Paper doesn't have a build for that version yet.
+    """
+    url, resolved_sw, resolved_ver, _, _ = _resolve_papermc_or_mojang_with_checksum(
+        software, version, log_fn=log_fn
+    )
+    return url, resolved_sw, resolved_ver
 
 
 def get_versioned_jar_path(bin_dir: Path, software: str, version: str) -> Path:
@@ -397,41 +725,40 @@ def ensure_paperclip_mojang_cache(
         def _sha256_matches(path: Path) -> bool:
             if len(exp_sha256) != 64:
                 return True
-            h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for chunk in iter(lambda: f.read(1048576), b""):
-                    h.update(chunk)
-            return h.hexdigest().lower() == exp_sha256
+            return _file_digest_hex(path, "sha256") == exp_sha256
 
-        if target_cache_jar.exists() and target_cache_jar.stat().st_size > 1_000_000 and _sha256_matches(target_cache_jar):
+        if (
+            target_cache_jar.exists()
+            and target_cache_jar.stat().st_size > 1_000_000
+            and _is_valid_zip_archive(target_cache_jar)
+            and _sha256_matches(target_cache_jar)
+        ):
             return
 
         if log_fn:
             log_fn(f"Pre-caching Paperclip base jar ({filename}) for fast startup...")
         tmp_cache = target_cache_jar.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}.jar")
+        last_pct = [-1]
+
+        def _on_progress(pct: int, downloaded: int, total: int) -> None:
+            if pct // 25 > last_pct[0] // 25 and log_fn:
+                last_pct[0] = pct
+                log_fn(
+                    f"Downloading base {filename}: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
+                )
+
         try:
-            req = urllib.request.Request(mojang_url, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                total = int(resp.headers.get("Content-Length", 0))
-                downloaded = 0
-                last_pct = -1
-                with open(tmp_cache, "wb") as out:
-                    while True:
-                        chunk = resp.read(131072)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        downloaded += len(chunk)
-                        if total > 0:
-                            pct = int((downloaded / total) * 100)
-                            if pct // 25 > last_pct // 25 and log_fn:
-                                last_pct = pct
-                                log_fn(
-                                    f"Downloading base {filename}: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
-                                )
-            if not _sha256_matches(tmp_cache):
-                raise RuntimeError(f"Checksum mismatch for Paperclip base jar {filename}")
-            os.replace(tmp_cache, target_cache_jar)
+            _download_to_file_verified(
+                mojang_url,
+                tmp_cache,
+                expected_sha256=exp_sha256 if len(exp_sha256) == 64 else "",
+                timeout=120,
+                attempts=3,
+                progress_cb=_on_progress,
+            )
+            if not _is_valid_zip_archive(tmp_cache):
+                raise RuntimeError(f"Downloaded base jar {filename} is not a valid archive")
+            _os_replace_retry(tmp_cache, target_cache_jar)
             if log_fn:
                 log_fn(f"Cached {filename} ({round(target_cache_jar.stat().st_size / (1024*1024), 1)} MB)")
         finally:
@@ -440,8 +767,9 @@ def ensure_paperclip_mojang_cache(
                     tmp_cache.unlink(missing_ok=True)
             except OSError:
                 pass
-    except Exception:
-        pass
+    except Exception as e:
+        if log_fn:
+            log_fn(f"Warning: Paperclip base jar pre-cache skipped ({e}); server will download on boot if needed.")
 
 
 def ensure_server_jar(
@@ -462,17 +790,12 @@ def ensure_server_jar(
     resolved_bin_dir = bin_dir or (runtime_dir.parent / "bin")
     versioned_jar = get_versioned_jar_path(resolved_bin_dir, software, version)
 
-    if not force and versioned_jar.exists() and versioned_jar.stat().st_size > 1_000_000:
+    if not force and versioned_jar.exists() and versioned_jar.stat().st_size > 1_000_000 and _is_valid_zip_archive(versioned_jar):
         if log_fn:
             log_fn(
                 f"Minecraft {software.upper()} {version} jar ready ({round(versioned_jar.stat().st_size / (1024*1024), 1)} MB)"
             )
         ensure_paperclip_mojang_cache(versioned_jar, runtime_dir, log_fn=log_fn)
-        # Also mirror to runtime_dir/server.jar if not locked
-        try:
-            shutil.copy2(versioned_jar, runtime_dir / "server.jar")
-        except OSError:
-            pass
         return versioned_jar
 
     software = software.lower().strip()
@@ -480,43 +803,41 @@ def ensure_server_jar(
     if log_fn:
         log_fn(f"Resolving {software.upper()} {version} server.jar download URL...")
 
-    download_url, resolved_sw, resolved_ver = resolve_papermc_or_mojang_url(software, version, log_fn=log_fn)
+    download_url, resolved_sw, resolved_ver, exp_sha256, exp_sha1 = _resolve_papermc_or_mojang_with_checksum(
+        software, version, log_fn=log_fn
+    )
     target_jar = get_versioned_jar_path(resolved_bin_dir, resolved_sw, resolved_ver)
 
-    if not force and target_jar.exists() and target_jar.stat().st_size > 1_000_000:
+    if not force and target_jar.exists() and target_jar.stat().st_size > 1_000_000 and _is_valid_zip_archive(target_jar):
         ensure_paperclip_mojang_cache(target_jar, runtime_dir, log_fn=log_fn)
-        try:
-            shutil.copy2(target_jar, runtime_dir / "server.jar")
-        except OSError:
-            pass
         return target_jar
 
     if log_fn:
         log_fn(f"Downloading Minecraft {resolved_sw.upper()} {resolved_ver} server.jar...")
 
     tmp_jar = target_jar.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}.jar")
-    req = urllib.request.Request(download_url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            total = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            last_pct = -1
-            with open(tmp_jar, "wb") as out:
-                while True:
-                    chunk = resp.read(131072)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    downloaded += len(chunk)
-                    if total > 0:
-                        pct = int((downloaded / total) * 100)
-                        if pct // 20 > last_pct // 20 and log_fn:
-                            last_pct = pct
-                            log_fn(
-                                f"Downloading {resolved_sw.upper()} {resolved_ver} server.jar: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
-                            )
+    last_pct = [-1]
 
-        os.replace(tmp_jar, target_jar)
+    def _on_progress(pct: int, downloaded: int, total: int) -> None:
+        if pct // 20 > last_pct[0] // 20 and log_fn:
+            last_pct[0] = pct
+            log_fn(
+                f"Downloading {resolved_sw.upper()} {resolved_ver} server.jar: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
+            )
+
+    try:
+        _download_to_file_verified(
+            download_url,
+            tmp_jar,
+            expected_sha256=exp_sha256,
+            expected_sha1=exp_sha1,
+            timeout=120,
+            attempts=3,
+            progress_cb=_on_progress,
+        )
+        if not _is_valid_zip_archive(tmp_jar):
+            raise RuntimeError(f"Downloaded {resolved_sw.upper()} {resolved_ver} server.jar is corrupt or invalid")
+        _os_replace_retry(tmp_jar, target_jar)
     finally:
         try:
             if tmp_jar.exists():
@@ -524,10 +845,6 @@ def ensure_server_jar(
         except OSError:
             pass
     ensure_paperclip_mojang_cache(target_jar, runtime_dir, log_fn=log_fn)
-    try:
-        shutil.copy2(target_jar, runtime_dir / "server.jar")
-    except OSError:
-        pass
 
     if log_fn:
         log_fn(

@@ -1115,6 +1115,8 @@ def run_verification():
         skew_data["lastHeartbeat"] = time.time()
         sess_path.write_text(json.dumps(skew_data), encoding="utf-8")
         (pc2.ctx.mc_manager.runtime_dir / "world" / "bob_diamond_base.txt").write_text("do-not-lose-me", encoding="utf-8")
+        st_cb, res_cb = pc1.request("PUT", "/api/admin/settings", body={"cloudBackupOnStop": True}, token=admin_token)
+        assert st_cb == 200 and res_cb["cluster"].get("cloudBackupOnStop") is True
         st_b2_stop, res_b2_stop = pc2.request("POST", "/api/server/stop", token=bob_token)
         assert st_b2_stop == 200 and res_b2_stop["lock"]["isLocked"] is False
         assert (pc2.ctx.sync_engine.locks_dir / f"released-{bob_epoch}.json").exists()

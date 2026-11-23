@@ -9,6 +9,12 @@ LOCK_STALE_TIMEOUT_SEC = 240
 AUTO_SYNC_DEFAULT_MINUTES = 10
 AUTO_SYNC_MAX_MINUTES = 1440
 
+APP_VERSION = "1.0.6"
+GITHUB_REPO = "NtC0der/MineRelay"
+GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
+GITHUB_DOWNLOAD_URL = f"https://github.com/{GITHUB_REPO}/releases/latest/download/MineRelay.exe"
+
 
 def _safe_str(val: Any, default: str = "") -> str:
     if val is None:
@@ -187,12 +193,15 @@ class ClusterConfig:
     git_sync_enabled: bool = False
     auto_backup_on_stop: bool = True
     max_backups: int = 10
+    cloud_backup_on_stop: bool = False
+    max_cloud_backups: int = 2
     idle_shutdown_minutes: int = 0
     auto_sync_interval_minutes: int = AUTO_SYNC_DEFAULT_MINUTES
     gamerules: Dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     accounts: List[UserAccount] = field(default_factory=list)
     deleted_accounts: Dict[str, float] = field(default_factory=dict)
+    latest_app_version: str = ""
 
     def to_dict(self, include_secrets: bool = True) -> Dict[str, Any]:
         data = {
@@ -211,6 +220,8 @@ class ClusterConfig:
             "gitSyncEnabled": self.git_sync_enabled,
             "autoBackupOnStop": self.auto_backup_on_stop,
             "maxBackups": self.max_backups,
+            "cloudBackupOnStop": self.cloud_backup_on_stop,
+            "maxCloudBackups": self.max_cloud_backups,
             "idleShutdownMinutes": self.idle_shutdown_minutes,
             "autoSyncIntervalMinutes": self.auto_sync_interval_minutes,
             "gamerules": dict(self.gamerules) if self.gamerules else {},
@@ -220,6 +231,7 @@ class ClusterConfig:
                 for k, v in (self.deleted_accounts or {}).items()
                 if str(k).strip()
             },
+            "latestAppVersion": self.latest_app_version,
         }
         if include_secrets:
             data["accounts"] = [asdict(a) for a in self.accounts]
@@ -287,6 +299,8 @@ class ClusterConfig:
             git_sync_enabled=_safe_bool(data.get("gitSyncEnabled", data.get("git_sync_enabled")), False),
             auto_backup_on_stop=_safe_bool(data.get("autoBackupOnStop", data.get("auto_backup_on_stop")), True),
             max_backups=max(1, _safe_int(data.get("maxBackups", data.get("max_backups")), 10)),
+            cloud_backup_on_stop=_safe_bool(data.get("cloudBackupOnStop", data.get("cloud_backup_on_stop")), False),
+            max_cloud_backups=max(0, min(20, _safe_int(data.get("maxCloudBackups", data.get("max_cloud_backups")), 2))),
             idle_shutdown_minutes=max(
                 0,
                 min(AUTO_SYNC_MAX_MINUTES, _safe_int(data.get("idleShutdownMinutes", data.get("idle_shutdown_minutes")), 0)),
@@ -296,6 +310,7 @@ class ClusterConfig:
             created_at=_safe_float(data.get("createdAt", data.get("created_at")), time.time()),
             accounts=accounts,
             deleted_accounts=deleted_accounts,
+            latest_app_version=_safe_str(data.get("latestAppVersion", data.get("latest_app_version")), "").strip(),
         )
 
 
