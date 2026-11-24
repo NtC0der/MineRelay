@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import stat
 import time
 import zlib
 import shutil
@@ -58,7 +59,9 @@ class SyncEngine:
         self._lock_mutex = threading.RLock()
         self._sync_mutex = threading.RLock()
         self._cluster_merge_lock = threading.RLock()
+        self._config_mutex = self._cluster_merge_lock
         self._browse_lock = threading.Lock()
+        self._archive_hash_lock = threading.Lock()
         self._sync_progress_lock = threading.Lock()
         self._sync_progress: Dict[str, Any] = {
             "active": False,
@@ -361,15 +364,33 @@ class SyncEngine:
                 h.update(chunk)
         return h.hexdigest()
 
+    def _evict_archive_hash_cache(self, target_path: Optional[Path] = None) -> None:
+        with self._archive_hash_lock:
+            if target_path is None:
+                self._archive_hash_cache.clear()
+                return
+            key = os.path.normcase(str(target_path))
+            self._archive_hash_cache.pop(key, None)
+            try:
+                res_key = os.path.normcase(str(target_path.resolve()))
+                self._archive_hash_cache.pop(res_key, None)
+            except OSError:
+                pass
+
     def _cached_archive_sha256(self, target_path: Path) -> str:
         st = target_path.stat()
         mtime_ns = getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))
         key = os.path.normcase(str(target_path))
-        cached = self._archive_hash_cache.get(key)
-        if cached and cached[0] == mtime_ns and cached[1] == st.st_size:
-            return cached[2]
+        with self._archive_hash_lock:
+            cached = self._archive_hash_cache.get(key)
+            if cached and cached[0] == mtime_ns and cached[1] == st.st_size:
+                return cached[2]
         digest = self._sha256_file(target_path).lower()
-        self._archive_hash_cache[key] = (mtime_ns, st.st_size, digest)
+        with self._archive_hash_lock:
+            if len(self._archive_hash_cache) >= 256:
+                oldest_key = next(iter(self._archive_hash_cache))
+                self._archive_hash_cache.pop(oldest_key, None)
+            self._archive_hash_cache[key] = (mtime_ns, st.st_size, digest)
         return digest
 
     def _set_sync_progress(
@@ -435,7 +456,19 @@ class SyncEngine:
         primary_bytes = 0
         primary_action = ""
         primary_folder: Optional[Path] = None
-        for folder in (self.shared_dir, self.snapshots_dir, self.deltas_dir, self.backups_dir, self.locks_dir):
+        scan_folders: List[Path] = [self.shared_dir, self.snapshots_dir, self.deltas_dir, self.backups_dir, self.locks_dir]
+        conflict_dir_re = re.compile(r"^(snapshots|locks)\s*\(\d+\)$", re.IGNORECASE)
+        try:
+            with os.scandir(self.shared_dir) as it:
+                for entry in it:
+                    if conflict_dir_re.match(entry.name) and entry.is_dir(follow_symlinks=False):
+                        ep = Path(entry.path)
+                        scan_folders.append(ep)
+                        if entry.name.lower().startswith("snapshots"):
+                            scan_folders.extend([ep / "deltas", ep / "backups"])
+        except OSError:
+            pass
+        for folder in scan_folders:
             try:
                 with os.scandir(folder) as it:
                     for entry in it:
@@ -590,9 +623,12 @@ class SyncEngine:
         in-place preservation copy if cross-device or Drive holds an active handle.
         """
         dst_path.parent.mkdir(parents=True, exist_ok=True)
+        self._evict_archive_hash_cache(src_path)
+        self._evict_archive_hash_cache(dst_path)
         for attempt in range(4):
             try:
                 os.replace(src_path, dst_path)
+                self._evict_archive_hash_cache(dst_path)
                 return
             except OSError as e:
                 import errno
@@ -606,6 +642,7 @@ class SyncEngine:
             try:
                 shutil.copyfile(src_path, tmp_dst)
                 os.replace(tmp_dst, dst_path)
+                self._evict_archive_hash_cache(dst_path)
                 return
             except OSError:
                 pass
@@ -623,8 +660,9 @@ class SyncEngine:
         Google Drive preserves the existing Cloud File ID inside shared folders instead of orphaning duplicates.
         """
         dst_path.parent.mkdir(parents=True, exist_ok=True)
+        self._evict_archive_hash_cache(dst_path)
+        last_err: Optional[Exception] = None
         if dst_path.exists():
-            last_err: Optional[Exception] = None
             for attempt in range(6):
                 try:
                     with open(src_path, "rb") as fsrc, open(dst_path, "r+b") as fdst:
@@ -633,7 +671,15 @@ class SyncEngine:
                         fdst.truncate()
                         fdst.flush()
                         os.fsync(fdst.fileno())
+                    self._evict_archive_hash_cache(dst_path)
                     return
+                except PermissionError as e:
+                    last_err = e
+                    try:
+                        os.chmod(dst_path, stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+                    time.sleep(0.15 * (attempt + 1))
                 except OSError as e:
                     last_err = e
                     time.sleep(0.15 * (attempt + 1))
@@ -643,11 +689,28 @@ class SyncEngine:
             for attempt in range(6):
                 try:
                     os.replace(tmp_dst, dst_path)
+                    self._evict_archive_hash_cache(dst_path)
                     return
+                except PermissionError as e:
+                    last_err = e
+                    try:
+                        if dst_path.exists():
+                            os.chmod(dst_path, stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+                    time.sleep(0.15 * (attempt + 1))
                 except OSError as e:
                     last_err = e
                     time.sleep(0.15 * (attempt + 1))
+            try:
+                if dst_path.exists():
+                    os.chmod(dst_path, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
             shutil.copyfile(tmp_dst, dst_path)
+            self._evict_archive_hash_cache(dst_path)
+        except OSError as e:
+            raise last_err or e
         finally:
             try:
                 if tmp_dst.exists():
@@ -741,7 +804,7 @@ class SyncEngine:
     def _merge_cluster_config_conflict(self, conflict_path: Path) -> None:
         """Merges accounts, deletion tombstones, and newer settings from a cloud conflict config file before cleanup."""
         try:
-            with self._cluster_merge_lock:
+            with self._config_mutex:
                 cdata = self._read_json_safe(conflict_path)
                 if not isinstance(cdata, dict) or not cdata:
                     return
@@ -777,6 +840,15 @@ class SyncEngine:
                         acc for acc in ccfg.accounts
                         if merged_deleted.get(acc.id, -1.0) < float(acc.created_at or 0.0)
                     ]
+                    seen_admin = False
+                    deduped: List[UserAccount] = []
+                    for acc in ccfg.accounts:
+                        if acc.role == "admin":
+                            if seen_admin:
+                                continue
+                            seen_admin = True
+                        deduped.append(acc)
+                    ccfg.accounts = deduped
                     if hasattr(ccfg, "deleted_accounts"):
                         ccfg.deleted_accounts = merged_deleted
                     if ccfg.accounts:
@@ -822,9 +894,12 @@ class SyncEngine:
                         "public_join_address",
                         "git_sync_enabled",
                         "auto_backup_on_stop",
+                        "cloud_backup_on_stop",
                         "max_backups",
+                        "max_cloud_backups",
                         "idle_shutdown_minutes",
                         "auto_sync_interval_minutes",
+                        "latest_app_version",
                         "gamerules",
                     ):
                         if hasattr(ccfg, attr) and hasattr(mcfg, attr):
@@ -835,13 +910,18 @@ class SyncEngine:
                                 changed = True
 
                 by_id = {a.id: a for a in mcfg.accounts}
+                existing_admin = next((a for a in mcfg.accounts if a.role == "admin"), None)
                 for acc in ccfg.accounts:
                     if merged_deleted.get(acc.id, -1.0) >= float(acc.created_at or 0.0):
                         continue
                     existing = by_id.get(acc.id)
+                    if existing is None and acc.role == "admin" and existing_admin is not None:
+                        existing = existing_admin
                     if existing is None:
                         mcfg.accounts.append(acc)
                         by_id[acc.id] = acc
+                        if acc.role == "admin":
+                            existing_admin = acc
                         changed = True
                     else:
                         if acc.last_active_at > existing.last_active_at:
@@ -899,7 +979,8 @@ class SyncEngine:
                                     epoch = norm_name[len("released-"):-len(".json")]
                                     if epoch:
                                         released_epochs.add(epoch)
-                                        self._known_released_epochs.add(epoch)
+                                        with self._lock_mutex:
+                                            self._known_released_epochs.add(epoch)
                                     if not target.exists():
                                         shutil.copy2(sub, target)
                                 elif norm_name.startswith("session-"):
@@ -1083,17 +1164,17 @@ class SyncEngine:
                             cur_seq = int(manifest.get("snapshotSeq", 0)) if manifest else 0
                             cm_seq = int(cm.get("snapshotSeq", 0) or 0)
                             cm_hash = str(cm.get("sha256", "")).lower()
+                            cm_mode = str(cm.get("mode") or "full").lower()
                             if cm_seq > cur_seq:
-                                cand_src = (
-                                    self.latest_snapshot_path
-                                    if self.latest_snapshot_path.exists() and self._sha256_file(self.latest_snapshot_path).lower() == cm_hash
-                                    else None
-                                )
+                                cand_src = None
+                                promoted_zip = False
+                                # First check if a full snapshot / backup / latest-server (N).zip matches cm["sha256"] directly
+                                if cm_mode != "delta" and self.latest_snapshot_path.exists() and self._sha256_file(self.latest_snapshot_path).lower() == cm_hash:
+                                    cand_src = self.latest_snapshot_path
                                 bk_name = Path(str(cm.get("backupFile", "") or "")).name
                                 if cand_src is None and bk_name and (self.backups_dir / bk_name).exists():
                                     if self._sha256_file(self.backups_dir / bk_name).lower() == cm_hash:
                                         cand_src = self.backups_dir / bk_name
-                                promoted_zip = False
                                 if cand_src is None and cm_hash and self.snapshots_dir.exists():
                                     snap_conflict_re = re.compile(r"^latest-server\s*\(\d+\)\.zip$", re.IGNORECASE)
                                     for zcand in self.snapshots_dir.iterdir():
@@ -1105,10 +1186,64 @@ class SyncEngine:
                                                     break
                                             except OSError:
                                                 continue
+                                if cand_src is None and cm_mode == "delta":
+                                    cm_base_hash = str(cm.get("baseSha256") or "").lower()
+                                    cm_base_size = int(cm.get("baseSizeBytes", -1) or -1)
+                                    base_ok = (
+                                        self.latest_snapshot_path.exists()
+                                        and cm_base_hash
+                                        and (cm_base_size < 0 or self.latest_snapshot_path.stat().st_size == cm_base_size)
+                                        and self._sha256_file(self.latest_snapshot_path).lower() == cm_base_hash
+                                    )
+                                    if not base_ok and cm_base_hash and self.snapshots_dir.exists():
+                                        snap_conflict_re = re.compile(r"^latest-server\s*\(\d+\)\.zip$", re.IGNORECASE)
+                                        for zcand in self.snapshots_dir.iterdir():
+                                            if zcand.is_file() and snap_conflict_re.match(zcand.name):
+                                                try:
+                                                    if (cm_base_size < 0 or zcand.stat().st_size == cm_base_size) and self._sha256_file(zcand).lower() == cm_base_hash:
+                                                        self._copy_file_preserving_cloud_id(zcand, self.latest_snapshot_path)
+                                                        base_ok = True
+                                                        break
+                                                except OSError:
+                                                    continue
+                                    cm_idx_hash = str(cm.get("fileIndexSha256") or "").lower()
+                                    idx_ok = True
+                                    if cm_idx_hash:
+                                        idx_ok = (
+                                            self.file_index_path.exists()
+                                            and self._sha256_file(self.file_index_path).lower() == cm_idx_hash
+                                        )
+                                        if not idx_ok and self.snapshots_dir.exists():
+                                            idx_conflict_re = re.compile(r"^file-index\s*\(\d+\)\.json$", re.IGNORECASE)
+                                            for icand in self.snapshots_dir.iterdir():
+                                                if icand.is_file() and idx_conflict_re.match(icand.name):
+                                                    try:
+                                                        if self._sha256_file(icand).lower() == cm_idx_hash:
+                                                            self._copy_file_preserving_cloud_id(icand, self.file_index_path)
+                                                            idx_ok = True
+                                                            break
+                                                    except OSError:
+                                                        continue
+                                    deltas_ok = True
+                                    for d_entry in (cm.get("deltas") or []):
+                                        if not isinstance(d_entry, dict) or not d_entry.get("file"):
+                                            deltas_ok = False
+                                            break
+                                        d_path = self.snapshots_dir / str(d_entry["file"])
+                                        d_hash = str(d_entry.get("sha256") or "").lower()
+                                        d_size = int(d_entry.get("sizeBytes", -1) or -1)
+                                        if not d_path.exists() or (d_size >= 0 and d_path.stat().st_size != d_size):
+                                            deltas_ok = False
+                                            break
+                                        if d_hash and self._cached_archive_sha256(d_path).lower() != d_hash:
+                                            deltas_ok = False
+                                            break
+                                    if base_ok and idx_ok and deltas_ok:
+                                        cand_src = self.latest_snapshot_path
                                 if cand_src is not None:
                                     if promoted_zip:
                                         self._copy_file_preserving_cloud_id(cand_src, self.latest_snapshot_path)
-                                        if str(cm.get("mode") or "").lower() == "delta":
+                                        if cm_mode == "delta":
                                             cm["mode"] = "full"
                                             cm["baseSeq"] = cm_seq
                                             cm["baseSha256"] = cm_hash
@@ -1139,8 +1274,15 @@ class SyncEngine:
                 elif stem_base == "latest-server":
                     try:
                         if manifest:
-                            exp_size = int(manifest.get("sizeBytes", -1))
-                            exp_hash = str(manifest.get("sha256", "")).lower()
+                            is_delta_m = str(manifest.get("mode") or "").lower() == "delta"
+                            exp_size = int(
+                                (manifest.get("baseSizeBytes") if is_delta_m else None)
+                                or manifest.get("sizeBytes", -1)
+                            )
+                            exp_hash = str(
+                                (manifest.get("baseSha256") if is_delta_m else "")
+                                or manifest.get("sha256", "")
+                            ).lower()
                             if item.stat().st_size == exp_size and exp_hash:
                                 main_ok = (
                                     self.latest_snapshot_path.exists()
@@ -1260,6 +1402,8 @@ class SyncEngine:
     ) -> None:
         target_path.parent.mkdir(parents=True, exist_ok=True)
         content_bytes = json.dumps(data, indent=2).encode("utf-8")
+        self._evict_archive_hash_cache(target_path)
+        last_err: Optional[Exception] = None
 
         # Updating existing shared JSON in-place keeps Google Drive Cloud File IDs intact.
         # Pad trailing whitespace before truncating in binary mode so concurrent readers never observe
@@ -1282,10 +1426,19 @@ class SyncEngine:
                         f.flush()
                         if fsync:
                             os.fsync(f.fileno())
+                    self._evict_archive_hash_cache(target_path)
                     return
                 except FileNotFoundError:
                     break
-                except OSError:
+                except PermissionError as e:
+                    last_err = e
+                    try:
+                        os.chmod(target_path, stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
+                    time.sleep(0.08 * (attempt + 1))
+                except OSError as e:
+                    last_err = e
                     time.sleep(0.08 * (attempt + 1))
 
         tmp_path = target_path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
@@ -1298,11 +1451,30 @@ class SyncEngine:
             for attempt in range(8):
                 try:
                     os.replace(tmp_path, target_path)
+                    self._evict_archive_hash_cache(target_path)
                     return
-                except OSError:
+                except PermissionError as e:
+                    last_err = e
+                    try:
+                        if target_path.exists():
+                            os.chmod(target_path, stat.S_IWRITE | stat.S_IREAD)
+                    except OSError:
+                        pass
                     time.sleep(0.08 * (attempt + 1))
-            if not target_path.exists():
+                except OSError as e:
+                    last_err = e
+                    time.sleep(0.08 * (attempt + 1))
+            try:
+                if target_path.exists():
+                    os.chmod(target_path, stat.S_IWRITE | stat.S_IREAD)
+            except OSError:
+                pass
+            try:
                 shutil.copyfile(tmp_path, target_path)
+                self._evict_archive_hash_cache(target_path)
+                return
+            except OSError as copy_err:
+                raise (last_err or copy_err)
         finally:
             try:
                 if tmp_path.exists():
@@ -1713,42 +1885,42 @@ class SyncEngine:
         return cfg is not None and len(cfg.accounts) > 0
 
     def load_cluster_config(self, _reconcile_conflicts: bool = True) -> Optional[ClusterConfig]:
-        conflict_pattern = re.compile(r"^cluster-config\s*\(\d+\)\.json$", re.IGNORECASE)
-        conflict_files: List[Path] = []
-        if _reconcile_conflicts:
-            try:
-                with os.scandir(self.shared_dir) as it:
-                    for entry in it:
-                        if entry.name.lower().startswith("cluster-config") and conflict_pattern.match(entry.name):
-                            if entry.is_file(follow_symlinks=False):
-                                conflict_files.append(Path(entry.path))
-            except OSError:
-                pass
-
-        data = self._read_json_safe(self.cluster_config_path)
-        if not data:
-            # Fallback to newest valid Google Drive conflict copy if main cluster-config.json is missing/corrupt
-            candidates: List[Tuple[float, Dict[str, Any]]] = []
-            for item in conflict_files:
-                cdata = self._read_json_safe(item)
-                if isinstance(cdata, dict) and cdata.get("accounts"):
-                    try:
-                        cmtime = item.stat().st_mtime
-                    except OSError:
-                        cmtime = 0.0
-                    candidates.append((cmtime, cdata))
-            if candidates:
-                candidates.sort(key=lambda x: x[0], reverse=True)
-                data = candidates[0][1]
+        with self._config_mutex:
+            conflict_pattern = re.compile(r"^cluster-config\s*\(\d+\)\.json$", re.IGNORECASE)
+            conflict_files: List[Path] = []
+            if _reconcile_conflicts:
                 try:
-                    self._write_json_atomic(self.cluster_config_path, data, in_place_if_exists=True)
-                except Exception:
+                    with os.scandir(self.shared_dir) as it:
+                        for entry in it:
+                            if entry.name.lower().startswith("cluster-config") and conflict_pattern.match(entry.name):
+                                if entry.is_file(follow_symlinks=False):
+                                    conflict_files.append(Path(entry.path))
+                except OSError:
                     pass
-            else:
-                return None
 
-        if _reconcile_conflicts and conflict_files and not self._has_active_cloud_transfer():
-            with self._cluster_merge_lock:
+            data = self._read_json_safe(self.cluster_config_path)
+            if not data:
+                # Fallback to newest valid Google Drive conflict copy if main cluster-config.json is missing/corrupt
+                candidates: List[Tuple[float, Dict[str, Any]]] = []
+                for item in conflict_files:
+                    cdata = self._read_json_safe(item)
+                    if isinstance(cdata, dict) and cdata.get("accounts"):
+                        try:
+                            cmtime = item.stat().st_mtime
+                        except OSError:
+                            cmtime = 0.0
+                        candidates.append((cmtime, cdata))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0], reverse=True)
+                    data = candidates[0][1]
+                    try:
+                        self._write_json_atomic(self.cluster_config_path, data, in_place_if_exists=True)
+                    except Exception:
+                        pass
+                else:
+                    return None
+
+            if _reconcile_conflicts and conflict_files and not self._has_active_cloud_transfer():
                 for cpath in conflict_files:
                     if cpath.exists():
                         self._merge_cluster_config_conflict(cpath)
@@ -1757,30 +1929,31 @@ class SyncEngine:
                                 cpath.unlink(missing_ok=True)
                         except OSError:
                             pass
-            refreshed = self._read_json_safe(self.cluster_config_path)
-            if isinstance(refreshed, dict) and refreshed:
-                data = refreshed
+                refreshed = self._read_json_safe(self.cluster_config_path)
+                if isinstance(refreshed, dict) and refreshed:
+                    data = refreshed
 
-        cfg = ClusterConfig.from_dict(data)
-        migrated = False
-        for acc in cfg.accounts:
-            if acc.role == "admin" and acc.username in ("Admin Manager", "AdminManager"):
-                acc.username = "Admin"
-                migrated = True
-        if migrated:
-            try:
-                self.save_cluster_config(cfg)
-            except Exception:
-                pass
-        return cfg
+            cfg = ClusterConfig.from_dict(data)
+            migrated = False
+            for acc in cfg.accounts:
+                if acc.role == "admin" and acc.username in ("Admin Manager", "AdminManager"):
+                    acc.username = "Admin"
+                    migrated = True
+            if migrated:
+                try:
+                    self.save_cluster_config(cfg)
+                except Exception:
+                    pass
+            return cfg
 
     def save_cluster_config(self, config: ClusterConfig) -> None:
-        self._ensure_shared_dirs(cleanup_conflicts=False)
-        self._write_json_atomic(
-            self.cluster_config_path,
-            config.to_dict(include_secrets=True),
-            in_place_if_exists=True,
-        )
+        with self._config_mutex:
+            self._ensure_shared_dirs(cleanup_conflicts=False)
+            self._write_json_atomic(
+                self.cluster_config_path,
+                config.to_dict(include_secrets=True),
+                in_place_if_exists=True,
+            )
 
     def _write_lock_tombstone(
         self,
@@ -1792,7 +1965,8 @@ class SyncEngine:
         if not lock_epoch:
             return
         self._ensure_shared_dirs(cleanup_conflicts=False)
-        self._known_released_epochs.add(lock_epoch)
+        with self._lock_mutex:
+            self._known_released_epochs.add(lock_epoch)
         tombstone = self.locks_dir / f"released-{lock_epoch}.json"
         self._write_json_atomic(
             tombstone,
@@ -1982,9 +2156,10 @@ class SyncEngine:
 
     def get_lock(self) -> HostLock:
         now = time.time()
-        owns_active = self._owns_active_lock
-        active_epoch = self._active_lock_epoch
-        released_epochs = set(self._known_released_epochs)
+        with self._lock_mutex:
+            owns_active = self._owns_active_lock
+            active_epoch = self._active_lock_epoch
+            released_epochs = set(self._known_released_epochs)
 
         locks_conflict_re = re.compile(r"^locks\s*\(\d+\)$", re.IGNORECASE)
         host_conflict_re = re.compile(r"^host-lock\s*\(\d+\)\.json$", re.IGNORECASE)
@@ -2123,7 +2298,8 @@ class SyncEngine:
         return HostLock(is_locked=False, status="idle")
 
     def save_lock(self, lock: HostLock, fsync: bool = True, include_session: bool = True) -> None:
-        self._write_lock_bundle(lock, include_session=include_session, fsync=fsync)
+        with self._lock_mutex:
+            self._write_lock_bundle(lock, include_session=include_session, fsync=fsync)
         self._emit("lock_updated", lock.to_dict())
 
     def owns_lock(self, lock_epoch: str = "") -> bool:
@@ -2150,30 +2326,54 @@ class SyncEngine:
         Atomically claims the distributed host lock for `user` on this machine.
         Raises HostLockConflictError if another user/machine holds an active lock.
         """
+        self.git_pull_if_enabled()
         with self._lock_mutex:
-            self.git_pull_if_enabled()
             self._cleanup_cloud_conflict_files()
             current = self.get_lock()
             now = time.time()
 
-            if current.is_actively_locked(now):
+            current_active = self._is_lock_effectively_active(current, now)
+            if current_active:
                 if current.machine_id != self.local_config.machine_id or current.host_user_id != user.id:
                     raise HostLockConflictError(
                         f"Server is already being hosted by '{current.host_username}' "
                         f"on machine '{current.machine_name}' (status: {current.status})."
                     )
 
-            # Tombstone any dead/stale previous lock epoch before creating ours
+            reuse_epoch = (
+                current.lock_epoch
+                if (current_active and current.machine_id == self.local_config.machine_id and current.lock_epoch)
+                else ""
+            )
+
+            # Tombstone any dead/stale previous lock epoch (and stale secondary session files) before creating ours
             if current.is_locked and current.lock_epoch and (
-                current.machine_id != self.local_config.machine_id or current.host_user_id != user.id
+                not current_active
+                or current.machine_id != self.local_config.machine_id
+                or current.host_user_id != user.id
             ):
                 self._write_lock_tombstone(current.lock_epoch, released_by=user.username)
 
-            reuse_epoch = (
-                current.lock_epoch
-                if (current.is_actively_locked(now) and current.machine_id == self.local_config.machine_id and current.lock_epoch)
-                else ""
-            )
+            for ldir in self._iter_locks_dirs():
+                try:
+                    for item in list(ldir.iterdir()):
+                        if not item.is_file() or not item.name.startswith("session-") or not item.name.endswith(".json"):
+                            continue
+                        raw_ep = item.name[len("session-"):-len(".json")]
+                        ep = self._strip_conflict_suffix(raw_ep)
+                        if not ep or ep == reuse_epoch:
+                            continue
+                        sdata = self._read_json_safe(item)
+                        slock = HostLock.from_dict(sdata) if isinstance(sdata, dict) else None
+                        if slock is None or not slock.is_locked or not self._is_lock_effectively_active(slock, now):
+                            self._write_lock_tombstone(ep, released_by=user.username)
+                            try:
+                                item.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+
             lock_epoch = reuse_epoch or f"{int(now * 1000)}-{secrets.token_hex(4)}"
             carry_seq, carry_hash, _ = self.get_expected_snapshot_state()
             if current.expected_snapshot_seq > carry_seq:
@@ -2193,7 +2393,7 @@ class SyncEngine:
                 host_role=user.role,
                 machine_id=self.local_config.machine_id,
                 machine_name=self.local_config.machine_name,
-                started_at=now if not current.is_actively_locked(now) else current.started_at,
+                started_at=now if not current_active else current.started_at,
                 last_heartbeat=now,
                 status=initial_status,
                 public_address=public_address,
@@ -2204,13 +2404,15 @@ class SyncEngine:
                 expected_snapshot_seq=carry_seq,
                 expected_snapshot_hash=carry_hash,
             )
-            self.save_lock(new_lock)
+            self._write_lock_bundle(new_lock, include_session=True, fsync=True)
 
             # Re-verify ownership to guard against simultaneous cloud folder writes
             time.sleep(0.15)
             check = self.get_lock()
-            if check.is_locked and (
-                check.machine_id != self.local_config.machine_id or check.host_user_id != user.id
+            if (
+                check.is_locked
+                and self._is_lock_effectively_active(check, time.time())
+                and (check.machine_id != self.local_config.machine_id or check.host_user_id != user.id)
             ):
                 if not reuse_epoch:
                     self._write_lock_tombstone(lock_epoch, released_by="race_lost")
@@ -2233,23 +2435,25 @@ class SyncEngine:
                 self._cached_own_lock_mtime = 0.0
             self._last_session_write_at = now
             self._last_telemetry_publish_at = now
-            self.write_host_telemetry({
-                "isActive": True,
-                "lockEpoch": lock_epoch,
-                "machineId": self.local_config.machine_id,
-                "machineName": self.local_config.machine_name,
-                "hostUsername": user.username,
-                "status": initial_status,
-                "publicAddress": public_address,
-                "tunnelStatus": new_lock.tunnel_status,
-                "mcVersion": mc_version,
-                "startedAt": new_lock.started_at,
-                "onlinePlayers": [],
-                "maxPlayers": new_lock.max_players,
-                "logs": [],
-            })
             self._start_heartbeat_loop()
-            return new_lock
+
+        self.write_host_telemetry({
+            "isActive": True,
+            "lockEpoch": lock_epoch,
+            "machineId": self.local_config.machine_id,
+            "machineName": self.local_config.machine_name,
+            "hostUsername": user.username,
+            "status": initial_status,
+            "publicAddress": public_address,
+            "tunnelStatus": new_lock.tunnel_status,
+            "mcVersion": mc_version,
+            "startedAt": new_lock.started_at,
+            "onlinePlayers": [],
+            "maxPlayers": new_lock.max_players,
+            "logs": [],
+        })
+        self._emit("lock_updated", new_lock.to_dict())
+        return new_lock
 
     def _publish_telemetry_from_lock(self, lock: HostLock, snap: Dict[str, Any]) -> None:
         if "logs" not in snap and not lock.is_locked:
@@ -2280,23 +2484,28 @@ class SyncEngine:
         self.write_host_telemetry(tel_payload)
         self._last_telemetry_publish_at = time.time()
 
+    def _apply_telemetry_snapshot(self, lock: HostLock, snap: Optional[Dict[str, Any]]) -> None:
+        if not snap:
+            return
+        if "memoryUsedMb" in snap:
+            lock.memory_used_mb = int(snap["memoryUsedMb"] or 0)
+        if "memoryMaxMb" in snap:
+            lock.memory_max_mb = max(512, int(snap["memoryMaxMb"] or 4096))
+        if "cpuPercent" in snap:
+            lock.cpu_percent = round(float(snap["cpuPercent"] or 0.0), 1)
+        if "tps" in snap:
+            lock.tps = round(float(snap["tps"] or 0.0), 2)
+        if "serverReadyAt" in snap:
+            lock.server_ready_at = float(snap["serverReadyAt"] or 0.0)
+        if "onlinePlayers" in snap and isinstance(snap["onlinePlayers"], list):
+            lock.online_players = [str(p) for p in snap["onlinePlayers"] if p]
+
     def _apply_telemetry_provider(self, lock: HostLock, publish: bool = True) -> Optional[Dict[str, Any]]:
         if not self.telemetry_provider:
             return None
         try:
             snap = self.telemetry_provider() or {}
-            if "memoryUsedMb" in snap:
-                lock.memory_used_mb = int(snap["memoryUsedMb"] or 0)
-            if "memoryMaxMb" in snap:
-                lock.memory_max_mb = max(512, int(snap["memoryMaxMb"] or 4096))
-            if "cpuPercent" in snap:
-                lock.cpu_percent = round(float(snap["cpuPercent"] or 0.0), 1)
-            if "tps" in snap:
-                lock.tps = round(float(snap["tps"] or 0.0), 2)
-            if "serverReadyAt" in snap:
-                lock.server_ready_at = float(snap["serverReadyAt"] or 0.0)
-            if "onlinePlayers" in snap and isinstance(snap["onlinePlayers"], list):
-                lock.online_players = [str(p) for p in snap["onlinePlayers"] if p]
+            self._apply_telemetry_snapshot(lock, snap)
             if publish:
                 self._publish_telemetry_from_lock(lock, snap)
             return snap
@@ -2306,10 +2515,12 @@ class SyncEngine:
     def _has_released_tombstone(self, lock_epoch: str) -> bool:
         if not lock_epoch:
             return False
-        if lock_epoch in self._known_released_epochs:
-            return True
+        with self._lock_mutex:
+            if lock_epoch in self._known_released_epochs:
+                return True
         if os.path.exists(self.locks_dir / f"released-{lock_epoch}.json"):
-            self._known_released_epochs.add(lock_epoch)
+            with self._lock_mutex:
+                self._known_released_epochs.add(lock_epoch)
             return True
         locks_conflict_re = re.compile(r"^locks\s*\(\d+\)$", re.IGNORECASE)
         prefix = f"released-{lock_epoch}"
@@ -2327,7 +2538,8 @@ class SyncEngine:
                                 if lname.startswith(prefix) and lname.endswith(".json") and lentry.is_file(follow_symlinks=False):
                                     norm_epoch = self._strip_conflict_suffix(lname[len("released-"):-len(".json")])
                                     if norm_epoch == lock_epoch:
-                                        self._known_released_epochs.add(lock_epoch)
+                                        with self._lock_mutex:
+                                            self._known_released_epochs.add(lock_epoch)
                                         return True
                     except OSError:
                         pass
@@ -2349,6 +2561,17 @@ class SyncEngine:
         tps: Optional[float] = None,
         server_ready_at: Optional[float] = None,
     ) -> Optional[HostLock]:
+        snap: Optional[Dict[str, Any]] = None
+        if self.telemetry_provider:
+            try:
+                snap = self.telemetry_provider() or {}
+            except Exception:
+                snap = None
+
+        lost_payload: Optional[Dict[str, Any]] = None
+        emit_lock: Optional[HostLock] = None
+        should_publish_tel = False
+
         with self._lock_mutex:
             current: Optional[HostLock] = None
             if (
@@ -2378,42 +2601,51 @@ class SyncEngine:
                 self._cached_own_lock_mtime = 0.0
                 self._stop_heartbeat_loop()
                 if was_owning:
-                    self._emit("lock_lost", {
+                    lost_payload = {
                         "expectedEpoch": expected_ep,
                         "currentLock": current.to_dict(),
-                    })
-                return None
-            now = time.time()
-            current.last_heartbeat = now
-            snap = self._apply_telemetry_provider(current, publish=False)
-            if status is not None:
-                current.status = status
-            if public_address is not None:
-                current.public_address = public_address
-            if tunnel_status is not None:
-                current.tunnel_status = tunnel_status
-            if online_players is not None:
-                current.online_players = online_players
-            if max_players is not None:
-                current.max_players = max_players
-            if mc_version is not None:
-                current.mc_version = mc_version
-            if memory_used_mb is not None:
-                current.memory_used_mb = memory_used_mb
-            if memory_max_mb is not None:
-                current.memory_max_mb = max(512, int(memory_max_mb))
-            if cpu_percent is not None:
-                current.cpu_percent = round(float(cpu_percent), 1)
-            if tps is not None:
-                current.tps = round(float(tps), 2)
-            if server_ready_at is not None:
-                current.server_ready_at = float(server_ready_at)
-            is_status_change = status is not None
-            include_session = is_status_change or ((now - self._last_session_write_at) >= 2.0)
-            self.save_lock(current, fsync=is_status_change, include_session=include_session)
-            if snap is not None and (is_status_change or (now - self._last_telemetry_publish_at) >= 0.5):
-                self._publish_telemetry_from_lock(current, snap)
-            return current
+                    }
+            else:
+                now = time.time()
+                current.last_heartbeat = now
+                self._apply_telemetry_snapshot(current, snap)
+                if status is not None:
+                    current.status = status
+                if public_address is not None:
+                    current.public_address = public_address
+                if tunnel_status is not None:
+                    current.tunnel_status = tunnel_status
+                if online_players is not None:
+                    current.online_players = online_players
+                if max_players is not None:
+                    current.max_players = max_players
+                if mc_version is not None:
+                    current.mc_version = mc_version
+                if memory_used_mb is not None:
+                    current.memory_used_mb = memory_used_mb
+                if memory_max_mb is not None:
+                    current.memory_max_mb = max(512, int(memory_max_mb))
+                if cpu_percent is not None:
+                    current.cpu_percent = round(float(cpu_percent), 1)
+                if tps is not None:
+                    current.tps = round(float(tps), 2)
+                if server_ready_at is not None:
+                    current.server_ready_at = float(server_ready_at)
+                is_status_change = status is not None
+                include_session = is_status_change or ((now - self._last_session_write_at) >= 2.0)
+                self._write_lock_bundle(current, include_session=include_session, fsync=is_status_change)
+                emit_lock = HostLock.from_dict(current.to_dict())
+                should_publish_tel = snap is not None and (is_status_change or (now - self._last_telemetry_publish_at) >= 0.5)
+
+        if lost_payload is not None:
+            self._emit("lock_lost", lost_payload)
+            return None
+        if emit_lock is None:
+            return None
+        if should_publish_tel and snap is not None:
+            self._publish_telemetry_from_lock(emit_lock, snap)
+        self._emit("lock_updated", emit_lock.to_dict())
+        return emit_lock
 
     def release_lock(
         self,
@@ -2422,23 +2654,20 @@ class SyncEngine:
         expected_snapshot_hash: str = "",
     ) -> HostLock:
         with self._lock_mutex:
+            current = self.get_lock()
+            if current.is_locked:
+                same_machine = current.machine_id == self.local_config.machine_id
+                user_ok = (not user) or (current.host_user_id == user.id) or (user.role == "admin")
+                is_owner = (same_machine and user_ok) or (not self._is_lock_effectively_active(current))
+                if not is_owner:
+                    raise HostLockConflictError(
+                        f"Cannot release lock owned by '{current.host_username}' on '{current.machine_name}'."
+                    )
             self._owns_active_lock = False
             self._active_lock_epoch = ""
             self._cached_own_lock = None
             self._cached_own_lock_mtime = 0.0
             self._stop_heartbeat_loop()
-            current = self.get_lock()
-            if current.is_locked:
-                is_owner = (
-                    current.machine_id == self.local_config.machine_id
-                    or (user and current.host_user_id == user.id)
-                    or (user and user.role == "admin")
-                    or current.is_stale()
-                )
-                if not is_owner:
-                    raise HostLockConflictError(
-                        f"Cannot release lock owned by '{current.host_username}' on '{current.machine_name}'."
-                    )
             carry_seq = int(expected_snapshot_seq or 0)
             carry_hash = str(expected_snapshot_hash or "")
             if carry_seq == 0:
@@ -2453,7 +2682,6 @@ class SyncEngine:
                 )
             self._last_known_remote_lock = None
             self._last_known_remote_lock_at = 0.0
-            self.clear_host_telemetry()
             unlocked = HostLock(
                 is_locked=False,
                 status="idle",
@@ -2461,9 +2689,11 @@ class SyncEngine:
                 expected_snapshot_hash=carry_hash,
             )
             self._write_lock_bundle(unlocked, include_session=False)
-            self._emit("lock_updated", unlocked.to_dict())
-            self.git_push_if_enabled("Release host lock and sync world")
-            return unlocked
+
+        self.clear_host_telemetry()
+        self._emit("lock_updated", unlocked.to_dict())
+        self.git_push_if_enabled("Release host lock and sync world")
+        return unlocked
 
     def force_unlock(self) -> HostLock:
         """Admin emergency lock override that preserves expected snapshot verification state."""
@@ -2517,7 +2747,6 @@ class SyncEngine:
 
             self._last_known_remote_lock = None
             self._last_known_remote_lock_at = 0.0
-            self.clear_host_telemetry()
             unlocked = HostLock(
                 is_locked=False,
                 status="idle",
@@ -2525,9 +2754,11 @@ class SyncEngine:
                 expected_snapshot_hash=carry_hash,
             )
             self._write_lock_bundle(unlocked, include_session=False)
-            self._emit("lock_updated", unlocked.to_dict())
-            self.git_push_if_enabled("Force unlock host lock")
-            return unlocked
+
+        self.clear_host_telemetry()
+        self._emit("lock_updated", unlocked.to_dict())
+        self.git_push_if_enabled("Force unlock host lock")
+        return unlocked
 
     def _start_heartbeat_loop(self) -> None:
         self._stop_heartbeat_loop()
@@ -2537,6 +2768,15 @@ class SyncEngine:
 
         def _loop() -> None:
             while not stop_event.wait(HEARTBEAT_INTERVAL_SEC):
+                snap: Optional[Dict[str, Any]] = None
+                if self.telemetry_provider:
+                    try:
+                        snap = self.telemetry_provider() or {}
+                    except Exception:
+                        snap = None
+                emit_evt: Optional[Tuple[str, Dict[str, Any]]] = None
+                tel_lock: Optional[HostLock] = None
+                keep_running = True
                 with self._lock_mutex:
                     if stop_event.is_set() or not self._owns_active_lock:
                         break
@@ -2549,20 +2789,27 @@ class SyncEngine:
                         and (not expected_epoch or not current.lock_epoch or current.lock_epoch == expected_epoch)
                     ):
                         current.last_heartbeat = time.time()
-                        snap = self._apply_telemetry_provider(current, publish=False)
-                        self.save_lock(current, fsync=False)
+                        self._apply_telemetry_snapshot(current, snap)
+                        self._write_lock_bundle(current, fsync=False)
+                        emit_evt = ("lock_updated", current.to_dict())
                         if snap is not None:
-                            self._publish_telemetry_from_lock(current, snap)
+                            tel_lock = HostLock.from_dict(current.to_dict())
                     else:
                         self._owns_active_lock = False
                         self._active_lock_epoch = ""
                         self._cached_own_lock = None
                         self._cached_own_lock_mtime = 0.0
-                        self._emit("lock_lost", {
+                        emit_evt = ("lock_lost", {
                             "expectedEpoch": expected_epoch,
                             "currentLock": current.to_dict(),
                         })
-                        break
+                        keep_running = False
+                if tel_lock is not None and snap is not None:
+                    self._publish_telemetry_from_lock(tel_lock, snap)
+                if emit_evt is not None:
+                    self._emit(emit_evt[0], emit_evt[1])
+                if not keep_running:
+                    break
 
         self._heartbeat_thread = threading.Thread(target=_loop, daemon=True, name="HostLockHeartbeat")
         self._heartbeat_thread.start()
@@ -2613,6 +2860,11 @@ class SyncEngine:
         """
         with self._sync_mutex:
             self.git_pull_if_enabled()
+            transfer_msg = self._has_active_cloud_transfer()
+            if transfer_msg:
+                if strict:
+                    raise RuntimeError(f"{transfer_msg} Wait for cloud sync to finish before continuing.")
+                return
             if self._has_snapshot_conflicts():
                 self._cleanup_cloud_conflict_files()
             manifest = self._read_sync_manifest()
@@ -2813,12 +3065,14 @@ class SyncEngine:
                     shutil.move(str(item), str(rb_dst))
                     moved_to_rollback.append((rb_dst, item))
 
+                placed_targets: List[Path] = []
                 # Move verified staged items into runtime_dir without ever nesting dirs on locked paths
                 def _place_entry(src: Path, dst: Path) -> None:
                     if dst.exists():
                         self._remove_path_with_retry(dst)
                     if not dst.exists():
                         shutil.move(str(src), str(dst))
+                        placed_targets.append(dst)
                     elif src.is_dir():
                         for existing_sub in list(dst.iterdir()):
                             if dst.name == "plugins" and existing_sub.name == ".paper-remapped":
@@ -2827,8 +3081,10 @@ class SyncEngine:
                                 continue
                             self._remove_path_with_retry(existing_sub)
                         shutil.copytree(str(src), str(dst), dirs_exist_ok=True, copy_function=shutil.copyfile)
+                        placed_targets.append(dst)
                     else:
                         shutil.copyfile(str(src), str(dst))
+                        placed_targets.append(dst)
 
                 for staged_item in list(staging_dir.iterdir()):
                     if _is_preserved_top(staged_item.name):
@@ -2851,6 +3107,13 @@ class SyncEngine:
                         continue
                     _place_entry(staged_item, dest_item)
             except Exception:
+                self._file_hash_cache.clear()
+                for pt in placed_targets:
+                    try:
+                        if pt.exists():
+                            self._remove_path_with_retry(pt)
+                    except OSError:
+                        pass
                 # Roll back previous runtime entries if placing new files failed partway
                 for rb_src, orig_dst in moved_to_rollback:
                     try:
@@ -2866,6 +3129,7 @@ class SyncEngine:
                 if rollback_dir.exists():
                     shutil.rmtree(rollback_dir, ignore_errors=True)
 
+            self._file_hash_cache.clear()
             self._ensure_default_runtime_files()
             return {"fileCount": file_count}
         finally:
@@ -3028,6 +3292,8 @@ class SyncEngine:
                     total_bytes += sz
                 except OSError:
                     continue
+        for stale_key in [k for k in self._file_hash_cache.keys() if k not in file_index]:
+            self._file_hash_cache.pop(stale_key, None)
         return items, file_index, total_bytes
 
     def _prune_old_deltas(self, keep_files: Optional[set] = None) -> None:
@@ -3056,7 +3322,8 @@ class SyncEngine:
         """
         if not manifest or source_zip != self.latest_snapshot_path:
             return None
-        if str(manifest.get("mode") or "").lower() == "delta":
+        is_delta_mode = str(manifest.get("mode") or "").lower() == "delta"
+        if is_delta_mode:
             exp_hash = str(manifest.get("sha256") or "").strip().lower()
             base_hash = str(manifest.get("baseSha256") or "").strip().lower()
             if exp_hash and exp_hash != base_hash:
@@ -3067,14 +3334,22 @@ class SyncEngine:
                     pass
         idx_hash = str(manifest.get("fileIndexSha256") or "").strip().lower()
         if not idx_hash or not self.file_index_path.exists():
+            if is_delta_mode:
+                raise ValueError("Delta snapshot index 'file-index.json' is missing; cannot safely apply delta pull.")
             return None
         try:
             if self._cached_archive_sha256(self.file_index_path).lower() != idx_hash:
+                if is_delta_mode:
+                    raise ValueError("Delta snapshot index 'file-index.json' hash does not match sync manifest.")
                 return None
         except OSError:
+            if is_delta_mode:
+                raise ValueError("Delta snapshot index 'file-index.json' is unreadable; cannot apply delta pull.")
             return None
         idx_data = self._read_json_safe(self.file_index_path)
         if not isinstance(idx_data, dict) or not isinstance(idx_data.get("files"), dict):
+            if is_delta_mode:
+                raise ValueError("Delta snapshot index 'file-index.json' is malformed.")
             return None
         target_files: Dict[str, Dict[str, Any]] = idx_data["files"]
 
@@ -3218,6 +3493,7 @@ class SyncEngine:
                 shutil.rmtree(rollback_dir, ignore_errors=True)
             rollback_dir.mkdir(parents=True, exist_ok=True)
             moved_to_rollback: List[Tuple[Path, Path]] = []
+            placed_paths: List[Path] = []
             affected_rels = list(needed.keys()) + extra_rels
             try:
                 for rel_posix in affected_rels:
@@ -3236,6 +3512,7 @@ class SyncEngine:
                     if dst_rt.exists():
                         self._remove_path_with_retry(dst_rt)
                     shutil.move(str(staged_src), str(dst_rt))
+                    placed_paths.append(dst_rt)
                     self._fast_file_sha256(dst_rt, rel_posix, now=now)
 
                 # Clean up empty directories left behind by deleted files
@@ -3250,6 +3527,13 @@ class SyncEngine:
                         except OSError:
                             break
             except Exception:
+                self._file_hash_cache.clear()
+                for pp in placed_paths:
+                    try:
+                        if pp.exists():
+                            self._remove_path_with_retry(pp)
+                    except OSError:
+                        pass
                 for rb_src, orig_dst in moved_to_rollback:
                     try:
                         if orig_dst.exists():
@@ -3427,21 +3711,6 @@ class SyncEngine:
 
         with self._sync_mutex:
             t_start = time.time()
-            self._set_sync_progress(
-                True,
-                operation=op_name,
-                phase="scanning",
-                label=op_title,
-                detail="Scanning server files and verifying changes...",
-                percent=5,
-                force_emit=True,
-            )
-            self._verify_required_lock_epoch(require_lock_epoch)
-            self._ensure_shared_dirs()
-            self.runtime_dir.mkdir(parents=True, exist_ok=True)
-            self.local_backups_dir.mkdir(parents=True, exist_ok=True)
-
-            # Build zips inside local non-cloud data_dir so Google Drive never sees half-written temp zips
             tmp_zip = self.base_data_dir / f".push_stage.{os.getpid()}.{threading.get_ident()}.zip"
             tmp_delta = self.base_data_dir / f".push_delta.{os.getpid()}.{threading.get_ident()}.zip"
             stage_root = self.base_data_dir / f".push_files_{os.getpid()}_{threading.get_ident()}"
@@ -3572,6 +3841,19 @@ class SyncEngine:
             backup_sha256 = ""
             backup_size = 0
             try:
+                self._set_sync_progress(
+                    True,
+                    operation=op_name,
+                    phase="scanning",
+                    label=op_title,
+                    detail="Scanning server files and verifying changes...",
+                    percent=5,
+                    force_emit=True,
+                )
+                self._verify_required_lock_epoch(require_lock_epoch)
+                self._ensure_shared_dirs()
+                self.runtime_dir.mkdir(parents=True, exist_ok=True)
+                self.local_backups_dir.mkdir(parents=True, exist_ok=True)
                 eligible, current_index, total_raw_bytes = self._build_runtime_file_index(now=t_start)
                 file_count = len(eligible)
                 self._set_sync_progress(
@@ -3642,10 +3924,24 @@ class SyncEngine:
 
                 deleted_files = sorted(set(prev_files.keys()) - set(current_index.keys())) if prev_files else []
                 cum_delta_bytes = sum(int(d.get("sizeBytes", 0) or 0) for d in prev_deltas)
-                deltas_intact = all(
-                    isinstance(d, dict) and d.get("file") and (self.snapshots_dir / str(d["file"])).exists()
-                    for d in prev_deltas
-                )
+                deltas_intact = True
+                for d in prev_deltas:
+                    if not isinstance(d, dict) or not d.get("file"):
+                        deltas_intact = False
+                        break
+                    dp = self.snapshots_dir / str(d["file"])
+                    d_size = int(d.get("sizeBytes", -1) or -1)
+                    d_hash = str(d.get("sha256") or "").strip().lower()
+                    try:
+                        if not dp.exists() or (d_size >= 0 and dp.stat().st_size != d_size):
+                            deltas_intact = False
+                            break
+                        if d_hash and self._cached_archive_sha256(dp).lower() != d_hash:
+                            deltas_intact = False
+                            break
+                    except OSError:
+                        deltas_intact = False
+                        break
 
                 # Fast no-op exit when nothing changed and no backup file was requested
                 if (
@@ -3693,11 +3989,13 @@ class SyncEngine:
                     and len(changed_entries) > len(eligible) * 0.60
                     and changed_raw_bytes > total_raw_bytes * 0.60
                 )
+                has_delta_changes = len(changed_entries) > 0 or len(deleted_files) > 0
                 can_delta = (
                     (not force_full)
                     and base_valid
                     and bool(prev_files)
                     and deltas_intact
+                    and has_delta_changes
                     and (not huge_rewrite)
                     and (len(prev_deltas) < self.MAX_DELTA_CHAIN)
                     and (base_size > 0 and cum_delta_bytes < int(base_size * self.MAX_DELTA_RATIO))
@@ -3752,9 +4050,9 @@ class SyncEngine:
                         tmp_bk = target_bk_dir / f".{bk_fname}.tmp.{os.getpid()}.{threading.get_ident()}"
                         try:
                             shutil.copyfile(tmp_zip, tmp_bk)
-                            os.replace(tmp_bk, backup_target)
-                        except OSError:
-                            if tmp_bk.exists():
+                            try:
+                                os.replace(tmp_bk, backup_target)
+                            except OSError:
                                 shutil.copyfile(tmp_bk, backup_target)
                         finally:
                             try:
@@ -3762,11 +4060,12 @@ class SyncEngine:
                                     tmp_bk.unlink(missing_ok=True)
                             except OSError:
                                 pass
+                        if not backup_target.exists() or backup_target.stat().st_size != full_size:
+                            raise RuntimeError(f"Failed to verify created {scope} backup '{bk_fname}'.")
                         if scope == "cloud":
                             backup_name = bk_fname
                             backup_sha256 = full_sha256
                             backup_size = full_size
-                            self._prune_old_backups(protect_name=bk_fname, scope="cloud")
                         else:
                             self._prune_old_backups(protect_name=bk_fname, scope="local")
 
@@ -3852,6 +4151,8 @@ class SyncEngine:
                             "lastSyncStats": sync_stats,
                         },
                     )
+                    if backup_name:
+                        self._prune_old_backups(protect_name=backup_name, scope="cloud")
                     st = self.latest_snapshot_path.stat()
                     self._last_synced_snapshot_mtime = st.st_mtime
                     self._last_synced_snapshot_sig = (st.st_mtime, st.st_size, str(self.latest_snapshot_path))
@@ -3956,6 +4257,8 @@ class SyncEngine:
                         "lastSyncStats": sync_stats,
                     },
                 )
+                if backup_name:
+                    self._prune_old_backups(protect_name=backup_name, scope="cloud")
                 self._set_sync_progress(
                     True,
                     operation=op_name,
@@ -4106,159 +4409,188 @@ class SyncEngine:
             raise ValueError("Invalid backup name.")
 
         with self._sync_mutex:
-            with self._lock_mutex:
-                try:
-                    self._set_sync_progress(
-                        True,
-                        operation="restore",
-                        phase="verifying",
-                        label="Restoring World Backup...",
-                        detail=f"Checking lock and verifying '{safe_name}'...",
-                        percent=5,
-                        force_emit=True,
-                    )
-                    self.git_pull_if_enabled()
+            tmp_restore_zip = self.base_data_dir / f".restore_snap.{os.getpid()}.{threading.get_ident()}.zip"
+            try:
+                self._set_sync_progress(
+                    True,
+                    operation="restore",
+                    phase="verifying",
+                    label="Restoring World Backup...",
+                    detail=f"Checking lock and verifying '{safe_name}'...",
+                    percent=5,
+                    force_emit=True,
+                )
+                self.git_pull_if_enabled()
+                with self._lock_mutex:
                     current_lock = self.get_lock()
-                    if current_lock.is_actively_locked():
+                    if self._is_lock_effectively_active(current_lock):
                         raise HostLockConflictError(
                             f"Cannot restore backup while '{current_lock.host_username}' is hosting on '{current_lock.machine_name}'. Stop the server first."
                         )
 
-                    self._ensure_shared_dirs()
-                    self.local_backups_dir.mkdir(parents=True, exist_ok=True)
-                    transfer_msg = self._has_active_cloud_transfer()
-                    if transfer_msg:
-                        raise RuntimeError(f"{transfer_msg} Wait for cloud sync to finish before restoring a backup.")
+                self._ensure_shared_dirs()
+                self.local_backups_dir.mkdir(parents=True, exist_ok=True)
+                transfer_msg = self._has_active_cloud_transfer()
+                if transfer_msg:
+                    raise RuntimeError(f"{transfer_msg} Wait for cloud sync to finish before restoring a backup.")
 
-                    resolved = self.resolve_backup_path(safe_name, location=location)
-                    if resolved is None:
-                        raise FileNotFoundError(f"Backup '{safe_name}' not found.")
-                    source, resolved_loc = resolved
+                resolved = self.resolve_backup_path(safe_name, location=location)
+                if resolved is None:
+                    raise FileNotFoundError(f"Backup '{safe_name}' not found.")
+                source, resolved_loc = resolved
 
-                    # Stage-extract & validate every entry/CRC directly from backup BEFORE modifying latest-server.zip or runtime-server
-                    try:
-                        extract_info = self._extract_zip_to_runtime_safely(source, operation="restore")
-                    except (zipfile.BadZipFile, zlib.error, ValueError) as e:
-                        raise ValueError(f"Backup '{safe_name}' is invalid or corrupted: {e}")
-                    except OSError as e:
-                        raise RuntimeError(f"Backup file '{safe_name}' is temporarily locked by cloud sync ({e}). Please try again.")
+                # Stage-extract & validate every entry/CRC directly from backup BEFORE modifying latest-server.zip or runtime-server
+                try:
+                    extract_info = self._extract_zip_to_runtime_safely(source, operation="restore")
+                except (zipfile.BadZipFile, zlib.error, ValueError) as e:
+                    raise ValueError(f"Backup '{safe_name}' is invalid or corrupted: {e}")
+                except OSError as e:
+                    raise RuntimeError(f"Backup file '{safe_name}' is temporarily locked by cloud sync ({e}). Please try again.")
 
-                    # Promote backup -> latest-server.zip
-                    self._set_sync_progress(
-                        True,
-                        operation="restore",
-                        phase="uploading",
-                        label="Promoting Restored World to Cloud...",
-                        detail=f"Updating cloud snapshot from '{safe_name}'...",
-                        percent=88,
-                        done_files=extract_info.get("fileCount", 0),
-                        total_files=extract_info.get("fileCount", 0),
-                        force_emit=True,
-                    )
-                    try:
-                        sha256_hex = self._cached_archive_sha256(source)
-                        src_size = source.stat().st_size
-                        self._copy_file_preserving_cloud_id(source, self.latest_snapshot_path)
-                        try:
-                            os.utime(self.latest_snapshot_path, None)
-                        except OSError:
-                            pass
-                    except OSError as e:
-                        raise RuntimeError(
-                            f"Could not update '{self.latest_snapshot_path.name}' because cloud sync locked the file ({e}). Try again in a moment."
+                # Build clean base archive + index directly from restored runtime_dir so latest-server.zip & file-index.json always match
+                self._set_sync_progress(
+                    True,
+                    operation="restore",
+                    phase="uploading",
+                    label="Promoting Restored World to Cloud...",
+                    detail=f"Packaging & updating cloud snapshot from '{safe_name}'...",
+                    percent=88,
+                    done_files=extract_info.get("fileCount", 0),
+                    total_files=extract_info.get("fileCount", 0),
+                    force_emit=True,
+                )
+                self._file_hash_cache.clear()
+                eligible, restored_index, _ = self._build_runtime_file_index()
+                with zipfile.ZipFile(tmp_restore_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                    for abs_file, rel_file in eligible:
+                        self._zip_write_file(zf, abs_file, rel_file.as_posix())
+
+                with self._lock_mutex:
+                    current_lock = self.get_lock()
+                    if self._is_lock_effectively_active(current_lock):
+                        raise HostLockConflictError(
+                            f"Cannot restore backup while '{current_lock.host_username}' is hosting on '{current_lock.machine_name}'."
                         )
 
-                    st = self.latest_snapshot_path.stat()
-                    self._last_verified_base_sig = (st.st_mtime, st.st_size, sha256_hex.lower())
-                    _, restored_index, _ = self._build_runtime_file_index()
-                    idx_payload = {
-                        "snapshotSeq": 0,
-                        "files": restored_index,
-                    }
-                    self._write_json_atomic(self.file_index_path, idx_payload, in_place_if_exists=True)
-                    idx_sha256 = self._cached_archive_sha256(self.file_index_path)
-                    self._prune_old_deltas(keep_files=set())
+                try:
+                    snap_sha256 = self._sha256_file(tmp_restore_zip).lower()
+                    snap_size = tmp_restore_zip.stat().st_size
+                    bk_sha256 = self._cached_archive_sha256(source).lower() if resolved_loc == "cloud" else ""
+                    bk_size = source.stat().st_size if resolved_loc == "cloud" else 0
+                    self._move_or_copy_to_cloud(tmp_restore_zip, self.latest_snapshot_path, is_immutable=False)
+                    try:
+                        os.utime(self.latest_snapshot_path, None)
+                    except OSError:
+                        pass
+                except OSError as e:
+                    raise RuntimeError(
+                        f"Could not update '{self.latest_snapshot_path.name}' because cloud sync locked the file ({e}). Try again in a moment."
+                    )
 
-                    sync_stats = {
+                st = self.latest_snapshot_path.stat()
+                self._last_verified_base_sig = (st.st_mtime, st.st_size, snap_sha256)
+
+                prev_manifest = self._read_sync_manifest()
+                prev_seq = int(prev_manifest.get("snapshotSeq", 0)) if prev_manifest else 0
+                exp_seq, _, _ = self.get_expected_snapshot_state()
+                next_seq = max(prev_seq, self._last_synced_manifest_seq, exp_seq) + 1
+
+                idx_payload = {
+                    "snapshotSeq": next_seq,
+                    "baseSeq": next_seq,
+                    "files": restored_index,
+                }
+                self._write_json_atomic(self.file_index_path, idx_payload, in_place_if_exists=True)
+                idx_sha256 = self._cached_archive_sha256(self.file_index_path).lower()
+                self._prune_old_deltas(keep_files=set())
+
+                sync_stats = {
+                    "mode": "full",
+                    "uploadedBytes": snap_size,
+                    "skippedBytes": 0,
+                    "changedFiles": len(eligible),
+                    "deletedFiles": 0,
+                    "totalFiles": len(restored_index),
+                    "deltaCount": 0,
+                    "elapsedSec": 0.0,
+                }
+                self._last_sync_stats = sync_stats
+
+                manifest = self._write_sync_manifest(
+                    self.latest_snapshot_path,
+                    sha256_hex=snap_sha256,
+                    size_bytes=snap_size,
+                    file_count=len(eligible),
+                    backup_file=safe_name if resolved_loc == "cloud" else "",
+                    host_username="Restore",
+                    snapshot_seq=next_seq,
+                    extra={
                         "mode": "full",
-                        "uploadedBytes": src_size,
-                        "skippedBytes": 0,
-                        "changedFiles": extract_info.get("fileCount", 0),
-                        "deletedFiles": 0,
-                        "totalFiles": len(restored_index),
-                        "deltaCount": 0,
-                        "elapsedSec": 0.0,
-                    }
-                    self._last_sync_stats = sync_stats
+                        "baseSeq": next_seq,
+                        "baseSha256": snap_sha256,
+                        "baseSizeBytes": snap_size,
+                        "deltaFile": "",
+                        "deltas": [],
+                        "fileIndexSha256": idx_sha256,
+                        "backupSha256": bk_sha256 if resolved_loc == "cloud" else "",
+                        "backupSizeBytes": bk_size if resolved_loc == "cloud" else 0,
+                        "lastSyncStats": sync_stats,
+                    },
+                )
+                self._last_synced_snapshot_mtime = st.st_mtime
+                self._last_synced_snapshot_sig = (st.st_mtime, st.st_size, str(self.latest_snapshot_path))
+                self._save_sync_state(
+                    st.st_mtime,
+                    st.st_size,
+                    str(self.latest_snapshot_path),
+                    manifest_seq=int(manifest.get("snapshotSeq", 0)),
+                    sha256_hex=snap_sha256,
+                )
 
-                    manifest = self._write_sync_manifest(
-                        self.latest_snapshot_path,
-                        sha256_hex=sha256_hex,
-                        size_bytes=src_size,
-                        file_count=extract_info.get("fileCount", 0),
-                        backup_file=safe_name if resolved_loc == "cloud" else "",
-                        host_username="Restore",
-                        extra={
-                            "mode": "full",
-                            "baseSha256": sha256_hex,
-                            "baseSizeBytes": src_size,
-                            "deltaFile": "",
-                            "deltas": [],
-                            "fileIndexSha256": idx_sha256,
-                            "backupSha256": sha256_hex if resolved_loc == "cloud" else "",
-                            "backupSizeBytes": src_size if resolved_loc == "cloud" else 0,
-                            "lastSyncStats": sync_stats,
-                        },
-                    )
-                    idx_payload["snapshotSeq"] = int(manifest.get("snapshotSeq", 0))
-                    idx_payload["baseSeq"] = idx_payload["snapshotSeq"]
-                    self._write_json_atomic(self.file_index_path, idx_payload, in_place_if_exists=True)
-                    manifest["fileIndexSha256"] = self._cached_archive_sha256(self.file_index_path)
-                    self._write_json_atomic(self.sync_manifest_path, manifest, in_place_if_exists=True)
-                    self._last_synced_snapshot_mtime = st.st_mtime
-                    self._last_synced_snapshot_sig = (st.st_mtime, st.st_size, str(self.latest_snapshot_path))
-                    self._save_sync_state(
-                        st.st_mtime,
-                        st.st_size,
-                        str(self.latest_snapshot_path),
-                        manifest_seq=int(manifest.get("snapshotSeq", 0)),
-                        sha256_hex=sha256_hex,
-                    )
+                # Clean up any stale/empty unlocked host-lock.json while preserving expectedSnapshotSeq/Hash
+                if not self._is_lock_effectively_active(self.get_lock()):
+                    try:
+                        self.force_unlock()
+                    except Exception:
+                        pass
 
-                    # Clean up any stale/empty unlocked host-lock.json while preserving expectedSnapshotSeq/Hash
-                    if not self.get_lock().is_actively_locked():
-                        try:
-                            self.force_unlock()
-                        except Exception:
-                            pass
-
-                    self.git_push_if_enabled(f"Restore backup {safe_name}")
-                    self._set_sync_progress(
-                        True,
-                        operation="restore",
-                        phase="done",
-                        label="Backup Restored",
-                        detail=f"Restored '{safe_name}' to runtime and shared cloud.",
-                        percent=100,
-                        done_files=int(extract_info.get("fileCount", 0) or 0),
-                        total_files=int(extract_info.get("fileCount", 0) or 0),
-                        done_bytes=st.st_size,
-                        total_bytes=st.st_size,
-                        force_emit=True,
-                    )
-                    return {
-                        "restored": safe_name,
-                        "location": resolved_loc,
-                        "pull": {
-                            "synced": True,
-                            "snapshotPath": str(self.latest_snapshot_path),
-                            "sizeBytes": st.st_size,
-                            "fileCount": extract_info.get("fileCount", 0),
-                            "timestamp": time.time(),
-                        },
-                    }
-                finally:
-                    self._set_sync_progress(False, force_emit=True)
+                self.git_push_if_enabled(f"Restore backup {safe_name}")
+                self._set_sync_progress(
+                    True,
+                    operation="restore",
+                    phase="done",
+                    label="Backup Restored",
+                    detail=f"Restored '{safe_name}' to runtime and shared cloud.",
+                    percent=100,
+                    done_files=int(len(eligible) or extract_info.get("fileCount", 0) or 0),
+                    total_files=int(len(eligible) or extract_info.get("fileCount", 0) or 0),
+                    done_bytes=st.st_size,
+                    total_bytes=st.st_size,
+                    force_emit=True,
+                )
+                return {
+                    "restored": safe_name,
+                    "location": resolved_loc,
+                    "pull": {
+                        "synced": True,
+                        "snapshotPath": str(self.latest_snapshot_path),
+                        "sizeBytes": st.st_size,
+                        "fileCount": len(eligible),
+                        "timestamp": time.time(),
+                    },
+                }
+            except Exception:
+                self._file_hash_cache.clear()
+                self._last_verified_base_sig = (0.0, -1, "")
+                self._evict_archive_hash_cache()
+                raise
+            finally:
+                try:
+                    if tmp_restore_zip.exists():
+                        tmp_restore_zip.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                self._set_sync_progress(False, force_emit=True)
 
     def _is_snapshot_chain_intact(self, manifest: Optional[Dict[str, Any]]) -> bool:
         if not isinstance(manifest, dict):
@@ -4301,16 +4633,19 @@ class SyncEngine:
             target, resolved_loc = resolved
             if resolved_loc == "cloud":
                 manifest = self._read_sync_manifest()
-                if manifest and Path(str(manifest.get("backupFile", "") or "")).name == safe_name:
-                    if not self._is_snapshot_chain_intact(manifest):
-                        raise RuntimeError(
-                            f"Cannot delete '{safe_name}' while it is the active fallback for the latest cloud snapshot."
-                        )
+                is_fallback = bool(manifest and Path(str(manifest.get("backupFile", "") or "")).name == safe_name)
+                if is_fallback and not self._is_snapshot_chain_intact(manifest):
+                    raise RuntimeError(
+                        f"Cannot delete '{safe_name}' while it is the active fallback for the latest cloud snapshot."
+                    )
+                target.unlink()
+                if is_fallback and manifest:
                     manifest["backupFile"] = ""
                     manifest.pop("backupSha256", None)
                     manifest.pop("backupSizeBytes", None)
                     self._write_json_atomic(self.sync_manifest_path, manifest, in_place_if_exists=True)
-            target.unlink()
+            else:
+                target.unlink()
             return True
         finally:
             self._sync_mutex.release()
@@ -4376,6 +4711,199 @@ class SyncEngine:
                 "freedBytes": freed_bytes,
             }
         finally:
+            self._sync_mutex.release()
+
+    def push_local_backup_to_cloud(self, backup_name: str = "", push_all: bool = False) -> Dict[str, Any]:
+        """Copies local backup archive(s) from `data/backups` into `snapshots/backups` (Shared Drive)."""
+        safe_name = ""
+        if not push_all:
+            safe_name = Path(backup_name or "").name
+            if not safe_name or safe_name in (".", "..") or not safe_name.lower().endswith(".zip"):
+                raise ValueError("Invalid local backup filename.")
+
+        lock = self.get_lock()
+        if self._is_lock_effectively_active(lock) and not self.is_locked_by_current_machine(lock):
+            raise HostLockConflictError(
+                f"Cannot push local backup to Shared Folder while '{lock.host_username}' is hosting on '{lock.machine_name}'."
+            )
+
+        acquired = self._sync_mutex.acquire(timeout=5.0)
+        if not acquired:
+            raise RuntimeError("Another snapshot sync or backup operation is in progress. Try again in a moment.")
+
+        progress_active = False
+        try:
+            lock = self.get_lock()
+            if self._is_lock_effectively_active(lock) and not self.is_locked_by_current_machine(lock):
+                raise HostLockConflictError(
+                    f"Cannot push local backup to Shared Folder while '{lock.host_username}' is hosting on '{lock.machine_name}'."
+                )
+
+            cloud_notice = self._has_active_cloud_transfer()
+            if cloud_notice:
+                raise RuntimeError(cloud_notice)
+
+            self._ensure_shared_dirs(cleanup_conflicts=False)
+
+            candidates: List[Path] = []
+            if not push_all:
+                resolved = self.resolve_backup_path(safe_name, location="local")
+                if resolved is None:
+                    raise FileNotFoundError(f"Local backup '{safe_name}' was not found.")
+                candidates = [resolved[0]]
+            else:
+                with_mtime: List[Tuple[float, Path]] = []
+                for p in self.local_backups_dir.glob("*.zip"):
+                    try:
+                        if p.is_file():
+                            with_mtime.append((p.stat().st_mtime, p))
+                    except OSError:
+                        continue
+                with_mtime.sort(key=lambda item: item[0], reverse=True)
+                candidates = [p for _, p in with_mtime]
+
+            valid_items: List[Tuple[Path, int]] = []
+            total_bytes_all = 0
+            for src in candidates:
+                try:
+                    sz = src.stat().st_size if src.exists() else 0
+                except OSError:
+                    sz = 0
+                if sz <= 0 or not zipfile.is_zipfile(src):
+                    if not push_all:
+                        raise ValueError(f"Local backup '{src.name}' is empty or not a valid ZIP archive.")
+                    continue
+                valid_items.append((src, sz))
+                total_bytes_all += sz
+
+            pushed: List[str] = []
+            skipped: List[str] = []
+            pushed_bytes = 0
+            done_bytes_all = 0
+            total_files = len(valid_items)
+
+            if total_files > 0:
+                progress_active = True
+                self._set_sync_progress(
+                    True,
+                    operation="push_backup",
+                    phase="uploading_backup",
+                    label="Pushing local backup(s) to Shared Drive",
+                    detail=f"Checking {total_files} local archive(s)...",
+                    percent=0,
+                    done_files=0,
+                    total_files=total_files,
+                    done_bytes=0,
+                    total_bytes=total_bytes_all,
+                    indeterminate=False,
+                    force_emit=True,
+                )
+
+            for idx, (src, src_size) in enumerate(valid_items):
+                dst = self.backups_dir / src.name
+                src_sha = self._cached_archive_sha256(src).lower()
+                if dst.exists() and dst.is_file():
+                    try:
+                        if (
+                            dst.stat().st_size == src_size
+                            and bool(src_sha)
+                            and self._cached_archive_sha256(dst).lower() == src_sha
+                        ):
+                            skipped.append(src.name)
+                            done_bytes_all += src_size
+                            pct = int((done_bytes_all * 100) / max(1, total_bytes_all))
+                            self._set_sync_progress(
+                                True,
+                                operation="push_backup",
+                                phase="uploading_backup",
+                                label="Pushing local backup(s) to Shared Drive",
+                                detail=f"Already in Shared Drive: {src.name}",
+                                percent=pct,
+                                done_files=idx + 1,
+                                total_files=total_files,
+                                done_bytes=done_bytes_all,
+                                total_bytes=total_bytes_all,
+                                indeterminate=False,
+                                force_emit=(idx + 1 == total_files),
+                            )
+                            continue
+                    except OSError:
+                        pass
+
+                tmp_dst = self.backups_dir / f".{src.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+                copied_this = 0
+                try:
+                    with open(src, "rb") as src_f, open(tmp_dst, "wb") as dst_f:
+                        while True:
+                            chunk = src_f.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            dst_f.write(chunk)
+                            copied_this += len(chunk)
+                            cur_done = done_bytes_all + copied_this
+                            pct = int((cur_done * 100) / max(1, total_bytes_all))
+                            self._set_sync_progress(
+                                True,
+                                operation="push_backup",
+                                phase="uploading_backup",
+                                label=f"Pushing {src.name} to Shared Drive",
+                                detail=f"{idx + 1}/{total_files} • {cur_done // (1024 * 1024)}/{max(1, total_bytes_all // (1024 * 1024))} MB",
+                                percent=pct,
+                                done_files=idx,
+                                total_files=total_files,
+                                done_bytes=cur_done,
+                                total_bytes=total_bytes_all,
+                                indeterminate=False,
+                            )
+                        dst_f.flush()
+                        try:
+                            os.fsync(dst_f.fileno())
+                        except OSError:
+                            pass
+                    os.replace(tmp_dst, dst)
+                    self._evict_archive_hash_cache(dst)
+                except Exception:
+                    if tmp_dst.exists():
+                        try:
+                            tmp_dst.unlink()
+                        except OSError:
+                            pass
+                    raise
+
+                done_bytes_all += src_size
+                pushed.append(src.name)
+                pushed_bytes += src_size
+                pct = int((done_bytes_all * 100) / max(1, total_bytes_all))
+                self._set_sync_progress(
+                    True,
+                    operation="push_backup",
+                    phase="uploading_backup",
+                    label=f"Pushed {src.name} to Shared Drive",
+                    detail=f"{idx + 1}/{total_files} completed",
+                    percent=pct,
+                    done_files=idx + 1,
+                    total_files=total_files,
+                    done_bytes=done_bytes_all,
+                    total_bytes=total_bytes_all,
+                    indeterminate=False,
+                    force_emit=True,
+                )
+
+            if pushed:
+                self.git_push_if_enabled(f"Push {len(pushed)} local backup(s) to shared folder")
+
+            return {
+                "pushed": pushed,
+                "pushedCount": len(pushed),
+                "skipped": skipped,
+                "skippedCount": len(skipped),
+                "pushedBytes": pushed_bytes,
+                "alreadyInCloud": bool(not push_all and not pushed and skipped),
+                "backupName": safe_name if not push_all else "",
+            }
+        finally:
+            if progress_active:
+                self._set_sync_progress(False, force_emit=True)
             self._sync_mutex.release()
 
     def _prune_old_backups(self, protect_name: str = "", scope: str = "cloud") -> None:
@@ -4465,6 +4993,8 @@ class SyncEngine:
                     ["git", "pull", "--rebase", "--autostash"],
                     cwd=str(self.shared_dir),
                     capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0,
                     timeout=15,
                 )
             except Exception:
@@ -4475,14 +5005,31 @@ class SyncEngine:
         if not cfg or not cfg.git_sync_enabled:
             return
         if (self.shared_dir / ".git").exists():
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
             try:
-                subprocess.run(["git", "add", "-A"], cwd=str(self.shared_dir), capture_output=True, timeout=10)
+                subprocess.run(
+                    ["git", "add", "-A"],
+                    cwd=str(self.shared_dir),
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=flags,
+                    timeout=10,
+                )
                 subprocess.run(
                     ["git", "commit", "-m", commit_msg],
                     cwd=str(self.shared_dir),
                     capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=flags,
                     timeout=10,
                 )
-                subprocess.run(["git", "push"], cwd=str(self.shared_dir), capture_output=True, timeout=20)
+                subprocess.run(
+                    ["git", "push"],
+                    cwd=str(self.shared_dir),
+                    capture_output=True,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=flags,
+                    timeout=20,
+                )
             except Exception:
                 pass

@@ -123,7 +123,10 @@ class TunnelManager:
             res = subprocess.run(
                 [bin_path, "version"],
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=4,
                 creationflags=creationflags,
             )
@@ -171,6 +174,10 @@ class TunnelManager:
 
     def download_playit_binary(self) -> Dict[str, Any]:
         """Downloads the official playit.gg standalone binary into ./data/bin/."""
+        with self._mutex:
+            running = self._proc is not None and self._proc.poll() is None
+        if running:
+            raise RuntimeError("Cannot download or update playit.gg binary while tunnel is running. Stop the server first.")
         with self._download_lock:
             if self.is_downloading:
                 return {"status": "downloading", "progress": self.download_progress}
@@ -203,7 +210,8 @@ class TunnelManager:
             self._append_log(f"Failed to download playit.gg binary: {e}")
             raise RuntimeError(f"Could not download playit binary: {e}")
         finally:
-            self.is_downloading = False
+            with self._download_lock:
+                self.is_downloading = False
             try:
                 if tmp_target.exists():
                     tmp_target.unlink(missing_ok=True)
@@ -213,21 +221,49 @@ class TunnelManager:
 
     def save_secret_key(self, secret_key: str) -> None:
         """Saves a playit.gg secret key to the shared folder so all members share the tunnel."""
-        clean = secret_key.strip()
+        clean = str(secret_key or "").strip()
+        if any(ord(ch) < 32 and ch not in ("\r", "\n", "\t") for ch in clean):
+            raise ValueError("Invalid control characters in tunnel secret key.")
         self.sync_engine._ensure_shared_dirs()
         if not clean:
             if self.shared_secret_toml_path.exists():
                 self.shared_secret_toml_path.unlink()
             with self._mutex:
+                ex_proc = self._claim_exchange_proc
+                self._claim_exchange_proc = None
+                self._claim_init_started = False
                 self.claim_url = ""
                 if self.status not in ("online", "starting", "disabled"):
                     self.status = "stopped"
+            if ex_proc is not None:
+                try:
+                    ex_proc.terminate()
+                except Exception:
+                    pass
             self._append_log("Cleared shared playit.gg tunnel secret key from Shared Sync Folder.")
             return
+
         if "secret_key" in clean:
-            self.shared_secret_toml_path.write_text(clean + "\n", encoding="utf-8")
+            m = re.match(r'^secret_key\s*=\s*"([A-Za-z0-9_=-]{16,256})"\s*$', clean)
+            if not m:
+                raise ValueError("Invalid playit.toml secret_key format.")
+            toml_text = f'secret_key = "{m.group(1)}"\n'
         else:
-            self.shared_secret_toml_path.write_text(f'secret_key = "{clean}"\n', encoding="utf-8")
+            if "\n" in clean or "\r" in clean or not re.fullmatch(r"[A-Za-z0-9_=-]{16,256}", clean):
+                raise ValueError("Invalid playit.gg secret key format.")
+            toml_text = f'secret_key = "{clean}"\n'
+
+        tmp_toml = self.shared_secret_toml_path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+        try:
+            tmp_toml.write_text(toml_text, encoding="utf-8")
+            _os_replace_retry(tmp_toml, self.shared_secret_toml_path)
+        finally:
+            try:
+                if tmp_toml.exists():
+                    tmp_toml.unlink(missing_ok=True)
+            except OSError:
+                pass
+
         with self._mutex:
             self.claim_url = ""
             is_running = self._proc is not None
@@ -237,41 +273,55 @@ class TunnelManager:
             self._append_log("Saved shared playit.gg tunnel secret key to Shared Sync Folder.")
 
     def has_shared_secret(self) -> bool:
-        return self.shared_secret_toml_path.exists() and self.shared_secret_toml_path.stat().st_size > 5
+        try:
+            return self.shared_secret_toml_path.exists() and self.shared_secret_toml_path.stat().st_size > 5
+        except OSError:
+            return False
 
     def start_tunnel(self, server_port: int = 25565) -> Dict[str, Any]:
         """
         Starts the zero-port-forwarding tunnel when a member starts hosting.
         If a static publicJoinAddress is configured in ClusterConfig, advertises it immediately.
-        If playit binary is installed, launches playit with the shared playit.toml config.
+        If playit binary is installed and tunnel_provider is 'playit', launches playit with the shared playit.toml config.
         """
+        cfg = self.sync_engine.load_cluster_config()
+        disabled = False
+        lan = f"{self.get_lan_ip()}:{server_port}"
         with self._mutex:
             self._stop_tunnel_internal(emit_stopped=False)
-            cfg = self.sync_engine.load_cluster_config()
             if cfg and not cfg.tunnel_enabled:
                 self.status = "disabled"
                 self.claim_url = ""
-                lan = f"{self.get_lan_ip()}:{server_port}"
                 self.public_address = lan
-                self.sync_engine.update_lock_state(
-                    public_address=self.public_address,
-                    tunnel_status="disabled",
-                )
-                state = self.get_state()
-                self._emit("tunnel_updated", state)
-                return state
+                disabled = True
+        if disabled:
+            self.sync_engine.update_lock_state(
+                public_address=lan,
+                tunnel_status="disabled",
+            )
+            state = self.get_state()
+            self._emit("tunnel_updated", state)
+            return state
+
+        provider = str(getattr(cfg, "tunnel_provider", "playit") or "playit").strip().lower() if cfg else "playit"
+        use_playit = (provider == "playit")
 
         # Download/upgrade outside self._mutex so download_playit_binary's lock order stays consistent
-        bin_path = self._ensure_up_to_date_binary()
+        bin_path = self._ensure_up_to_date_binary() if use_playit else None
+
+        launch_lock_addr = ""
+        launch_lock_status = ""
+        need_claim_flow = False
+        early_return = False
 
         with self._mutex:
             cfg = self.sync_engine.load_cluster_config()
             configured_addr = cfg.public_join_address.strip() if cfg and cfg.public_join_address else ""
             lan_addr = f"{self.get_lan_ip()}:{server_port}"
-            if not bin_path:
+            if use_playit and not bin_path:
                 bin_path = self.resolve_binary()
 
-            if bin_path and os.environ.get("MINERELAY_TEST_MODE") != "1":
+            if use_playit and bin_path and os.environ.get("MINERELAY_TEST_MODE") != "1":
                 try:
                     self.sync_engine._ensure_shared_dirs()
                     if not self.has_shared_secret() and sys.platform.startswith("win"):
@@ -286,45 +336,46 @@ class TunnelManager:
                     if not self.has_shared_secret():
                         self.status = "claim_required"
                         self.public_address = configured_addr or lan_addr
-                        self._ensure_claim_flow_async(server_port=server_port)
-                        self.sync_engine.update_lock_state(
-                            public_address=self.public_address,
-                            tunnel_status="online" if configured_addr else "claim_required",
-                        )
-                        state = self.get_state()
-                        self._emit("tunnel_updated", state)
-                        return state
-
-                    self.status = "starting"
-                    self.claim_url = ""
-                    self.public_address = configured_addr or lan_addr
-                    self._launch_playit_daemon(bin_path, server_port)
-                    self.sync_engine.update_lock_state(
-                        public_address=self.public_address,
-                        tunnel_status="online" if configured_addr else "starting",
-                    )
-                    return self.get_state()
+                        need_claim_flow = True
+                        launch_lock_addr = self.public_address
+                        launch_lock_status = "online" if configured_addr else "claim_required"
+                        early_return = True
+                    else:
+                        self.status = "starting"
+                        self.claim_url = ""
+                        self.public_address = configured_addr or lan_addr
+                        self._launch_playit_daemon(bin_path, server_port)
+                        launch_lock_addr = self.public_address
+                        launch_lock_status = "online" if configured_addr else "starting"
+                        early_return = True
                 except Exception as e:
                     self._append_log(f"Could not spawn playit binary ({e}); falling back to LAN address.")
 
-            # Configured Address or Local LAN Fallback
-            if configured_addr:
-                self.public_address = configured_addr
-                self.status = "online"
-                self._append_log(f"Tunnel active using shared cluster address: {configured_addr}")
-            else:
-                self.public_address = lan_addr
-                self.status = "lan_only"
-                self._append_log(
-                    f"Server reachable on Local/LAN IP: {self.public_address} (or localhost:{server_port})."
-                )
+            if not early_return:
+                # Configured Address or Local LAN Fallback
+                if configured_addr:
+                    self.public_address = configured_addr
+                    self.status = "online"
+                    self._append_log(f"Tunnel active using shared cluster address: {configured_addr}")
+                else:
+                    self.public_address = lan_addr
+                    self.status = "lan_only"
+                    self._append_log(
+                        f"Server reachable on Local/LAN IP: {self.public_address} (or localhost:{server_port})."
+                    )
+                launch_lock_addr = self.public_address
+                launch_lock_status = self.status
 
-            self.sync_engine.update_lock_state(
-                public_address=self.public_address,
-                tunnel_status=self.status,
-            )
-            self._emit("tunnel_updated", self.get_state())
-            return self.get_state()
+        if need_claim_flow:
+            self._ensure_claim_flow_async(server_port=server_port)
+        self.sync_engine.update_lock_state(
+            public_address=launch_lock_addr,
+            tunnel_status=launch_lock_status,
+        )
+        state = self.get_state()
+        if not early_return or need_claim_flow:
+            self._emit("tunnel_updated", state)
+        return state
 
     @staticmethod
     def is_private_lan_address(addr: str) -> bool:
@@ -356,7 +407,10 @@ class TunnelManager:
                 res = subprocess.run(
                     [bin_path, "--secret_path", str(self.shared_secret_toml_path), "-s", "tunnels", "list"],
                     capture_output=True,
+                    stdin=subprocess.DEVNULL,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
                     creationflags=creationflags,
                 )
@@ -395,6 +449,8 @@ class TunnelManager:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
                 creationflags=creationflags,
             )
@@ -408,12 +464,13 @@ class TunnelManager:
     def _ensure_claim_flow_async(self, server_port: int = 25565) -> None:
         if os.environ.get("MINERELAY_TEST_MODE") == "1":
             return
-        if self._claim_init_started or self.has_shared_secret() or self.claim_url:
-            return
-        bin_path = self.resolve_binary()
-        if not bin_path:
-            return
-        self._claim_init_started = True
+        with self._mutex:
+            if self._claim_init_started or self.has_shared_secret() or self.claim_url:
+                return
+            bin_path = self.resolve_binary()
+            if not bin_path:
+                return
+            self._claim_init_started = True
 
         def _worker() -> None:
             try:
@@ -432,8 +489,9 @@ class TunnelManager:
                             if discovered:
                                 self._apply_discovered_public_address(discovered)
                             else:
-                                self.claim_url = "https://playit.gg/account/tunnels"
-                                self.status = "claim_required"
+                                with self._mutex:
+                                    self.claim_url = "https://playit.gg/account/tunnels"
+                                    self.status = "claim_required"
                                 if self.sync_engine.is_locked_by_current_machine():
                                     self.sync_engine.update_lock_state(tunnel_status="claim_required")
                                 self._emit("tunnel_updated", self.get_state())
@@ -444,7 +502,10 @@ class TunnelManager:
                 gen_res = subprocess.run(
                     [bin_path, "-s", "claim", "generate"],
                     capture_output=True,
+                    stdin=subprocess.DEVNULL,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=10,
                     creationflags=creationflags,
                 )
@@ -462,12 +523,14 @@ class TunnelManager:
                         code = tokens[-1]
 
                 if not code:
-                    self._claim_init_started = False
+                    with self._mutex:
+                        self._claim_init_started = False
                     return
 
-                self.claim_url = f"https://playit.gg/claim/{code}"
-                if self.status in ("stopped", "lan_only", "starting"):
-                    self.status = "claim_required"
+                with self._mutex:
+                    self.claim_url = f"https://playit.gg/claim/{code}"
+                    if self.status in ("stopped", "lan_only", "starting"):
+                        self.status = "claim_required"
                 self._append_log(f"Generated playit.gg claim link: {self.claim_url}")
                 if self.sync_engine.is_locked_by_current_machine():
                     self.sync_engine.update_lock_state(tunnel_status="claim_required")
@@ -478,26 +541,42 @@ class TunnelManager:
                     [bin_path, "-s", "claim", "exchange", code, "--wait", "600"],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     creationflags=creationflags,
                 )
-                self._claim_exchange_proc = ex_proc
+                with self._mutex:
+                    self._claim_exchange_proc = ex_proc
                 ex_stdout = ""
                 try:
                     ex_stdout, _ = ex_proc.communicate(timeout=610)
                 except subprocess.TimeoutExpired:
                     ex_proc.kill()
+                    try:
+                        ex_stdout, _ = ex_proc.communicate(timeout=2)
+                    except Exception:
+                        pass
                 finally:
-                    if self._claim_exchange_proc is ex_proc:
-                        self._claim_exchange_proc = None
+                    if ex_proc.stdout is not None:
+                        try:
+                            ex_proc.stdout.close()
+                        except OSError:
+                            pass
+                    with self._mutex:
+                        if self._claim_exchange_proc is ex_proc:
+                            self._claim_exchange_proc = None
+
                 secret_key = ""
-                for line in (ex_stdout or "").splitlines():
-                    clean = ansi_escape.sub("", line).strip()
-                    if "playit_cli::ui:" in clean:
-                        clean = clean.split("playit_cli::ui:", 1)[1].strip()
-                    if re.fullmatch(r"[0-9a-fA-F]{32,128}", clean):
-                        secret_key = clean
-                        break
+                if ex_proc.returncode == 0 or ex_stdout:
+                    for line in (ex_stdout or "").splitlines():
+                        clean = ansi_escape.sub("", line).strip()
+                        if "playit_cli::ui:" in clean:
+                            clean = clean.split("playit_cli::ui:", 1)[1].strip()
+                        if re.fullmatch(r"[0-9a-fA-F]{32,128}", clean):
+                            secret_key = clean
+                            break
                 if secret_key:
                     self.save_secret_key(secret_key)
                     try:
@@ -517,35 +596,46 @@ class TunnelManager:
                                 "MineRelay",
                             ],
                             capture_output=True,
+                            stdin=subprocess.DEVNULL,
                             text=True,
+                            encoding="utf-8",
+                            errors="replace",
                             timeout=15,
                             creationflags=creationflags,
                         )
                     except Exception:
                         pass
-                    if self.sync_engine.is_locked_by_current_machine():
+                    if not self.sync_engine.is_locked_by_current_machine():
+                        with self._mutex:
+                            self._claim_init_started = False
+                        self._emit("tunnel_updated", self.get_state())
+                        return
+                    with self._mutex:
                         self.status = "starting"
-                        self._launch_playit_daemon(bin_path, server_port)
+                    self._launch_playit_daemon(bin_path, server_port)
                     discovered = self._query_playit_tunnels_list(bin_path)
                     if discovered:
                         self._apply_discovered_public_address(discovered)
                     else:
-                        self.claim_url = "https://playit.gg/account/tunnels"
-                        self.status = "claim_required"
+                        with self._mutex:
+                            self.claim_url = "https://playit.gg/account/tunnels"
+                            self.status = "claim_required"
                         if self.sync_engine.is_locked_by_current_machine():
                             self.sync_engine.update_lock_state(tunnel_status="claim_required")
                         self._emit("tunnel_updated", self.get_state())
                 else:
-                    self._claim_init_started = False
+                    with self._mutex:
+                        self._claim_init_started = False
             except Exception:
-                self._claim_init_started = False
+                with self._mutex:
+                    self._claim_init_started = False
 
         threading.Thread(target=_worker, daemon=True, name="PlayitClaimFlow").start()
 
     def _apply_discovered_public_address(self, found_addr: str) -> None:
         if not found_addr:
             return
-        with self._mutex:
+        with self.sync_engine._config_mutex:
             cfg = self.sync_engine.load_cluster_config()
             if cfg and not cfg.tunnel_enabled:
                 return
@@ -556,12 +646,13 @@ class TunnelManager:
                 and (custom_addr or cfg.tunnel_provider == "custom")
             )
             effective_addr = (custom_addr or found_addr) if is_custom_override else found_addr
-            self.public_address = effective_addr
-            self.status = "online"
-            self.claim_url = ""
             if cfg and cfg.tunnel_provider == "playit" and cfg.public_join_address != found_addr:
                 cfg.public_join_address = found_addr
                 self.sync_engine.save_cluster_config(cfg)
+        with self._mutex:
+            self.public_address = effective_addr
+            self.status = "online"
+            self.claim_url = ""
         if self.sync_engine.is_locked_by_current_machine():
             self.sync_engine.update_lock_state(
                 public_address=effective_addr,
@@ -590,8 +681,11 @@ class TunnelManager:
         def _poll_until_public() -> None:
             delay = 10.0
             attempts = 0
-            while self._proc is proc and proc.poll() is None and attempts < 12:
-                if not self.is_private_lan_address(self.public_address):
+            while attempts < 12:
+                with self._mutex:
+                    is_cur = self._proc is proc
+                    cur_pub = self.public_address
+                if not is_cur or proc.poll() is not None or not self.is_private_lan_address(cur_pub):
                     break
                 if self.has_shared_secret():
                     discovered = self._query_playit_tunnels_list(effective_bin, min_interval_sec=8.0)
@@ -601,79 +695,106 @@ class TunnelManager:
                         break
                     attempts += 1
                     delay = min(60.0, delay * 1.5)
-                time.sleep(delay)
+                slept = 0.0
+                while slept < delay:
+                    with self._mutex:
+                        if self._proc is not proc:
+                            return
+                    if proc.poll() is not None:
+                        return
+                    time.sleep(1.0)
+                    slept += 1.0
 
         threading.Thread(target=_poll_until_public, daemon=True, name="PlayitTunnelListPoller").start()
 
-        for raw_line in proc.stdout:
-            line = ansi_escape.sub("", raw_line).strip()
-            if not line:
-                continue
-            low = line.lower()
-            if "toomanyrequests" in low or "reqpingget" in low:
-                now_mono = time.monotonic()
-                if (now_mono - self._last_rate_limit_log_at) >= 60.0:
-                    suffix = (
-                        f" (suppressed {self._rate_limit_suppressed} repeated rate-limit messages)"
-                        if self._rate_limit_suppressed > 0
-                        else ""
-                    )
-                    self._last_rate_limit_log_at = now_mono
-                    self._rate_limit_suppressed = 0
-                    self._append_log(f"{line}{suffix}")
-                else:
-                    self._rate_limit_suppressed += 1
-                continue
-            self._append_log(line)
+        try:
+            for raw_line in proc.stdout:
+                line = ansi_escape.sub("", raw_line).strip()
+                if not line:
+                    continue
+                low = line.lower()
+                if "toomanyrequests" in low or "reqpingget" in low:
+                    now_mono = time.monotonic()
+                    if (now_mono - self._last_rate_limit_log_at) >= 60.0:
+                        suffix = (
+                            f" (suppressed {self._rate_limit_suppressed} repeated rate-limit messages)"
+                            if self._rate_limit_suppressed > 0
+                            else ""
+                        )
+                        self._last_rate_limit_log_at = now_mono
+                        self._rate_limit_suppressed = 0
+                        self._append_log(f"{line}{suffix}")
+                    else:
+                        self._rate_limit_suppressed += 1
+                    continue
+                self._append_log(line)
 
-            claim_match = claim_regex.search(line)
-            if claim_match:
-                self.claim_url = claim_match.group(1)
-                self.status = "claim_required"
-                self.sync_engine.update_lock_state(tunnel_status="claim_required")
-                self._emit("tunnel_updated", self.get_state())
-
-            if "tunnel running" in low or "tunnels registered" in low:
-                discovered = (
-                    self._query_playit_tunnels_list(effective_bin, min_interval_sec=8.0)
-                    if self.is_private_lan_address(self.public_address)
-                    else self.public_address
-                )
-                if discovered and not self.is_private_lan_address(discovered):
-                    if discovered != self.public_address or self.status != "online":
-                        self._apply_discovered_public_address(discovered)
-                elif "0 tunnels registered" in low:
-                    self.claim_url = "https://playit.gg/account/tunnels"
-                    self.status = "claim_required"
-                    self._append_log(
-                        "Agent claimed, but 0 tunnels are configured on playit.gg! Open https://playit.gg/account/tunnels and add a 'Minecraft Java' tunnel (local port 25565)."
-                    )
-                    self.sync_engine.update_lock_state(tunnel_status="claim_required")
-                    self._emit("tunnel_updated", self.get_state())
-                elif self.status != "online":
-                    self.status = "online"
-                    self.claim_url = ""
-                    self.sync_engine.update_lock_state(tunnel_status="online")
+                claim_match = claim_regex.search(line)
+                if claim_match:
+                    with self._mutex:
+                        self.claim_url = claim_match.group(1)
+                        self.status = "claim_required"
+                    if self.sync_engine.is_locked_by_current_machine():
+                        self.sync_engine.update_lock_state(tunnel_status="claim_required")
                     self._emit("tunnel_updated", self.get_state())
 
-            addr_match = addr_regex.search(line) or arrow_addr_regex.search(line)
-            if addr_match:
-                found_addr = addr_match.group(1).strip()
-                self._apply_discovered_public_address(found_addr)
+                if "tunnel running" in low or "tunnels registered" in low:
+                    with self._mutex:
+                        cur_pub = self.public_address
+                        cur_status = self.status
+                    discovered = (
+                        self._query_playit_tunnels_list(effective_bin, min_interval_sec=8.0)
+                        if self.is_private_lan_address(cur_pub)
+                        else cur_pub
+                    )
+                    if discovered and not self.is_private_lan_address(discovered):
+                        if discovered != cur_pub or cur_status != "online":
+                            self._apply_discovered_public_address(discovered)
+                    elif "0 tunnels registered" in low:
+                        with self._mutex:
+                            self.claim_url = "https://playit.gg/account/tunnels"
+                            self.status = "claim_required"
+                        self._append_log(
+                            "Agent claimed, but 0 tunnels are configured on playit.gg! Open https://playit.gg/account/tunnels and add a 'Minecraft Java' tunnel (local port 25565)."
+                        )
+                        if self.sync_engine.is_locked_by_current_machine():
+                            self.sync_engine.update_lock_state(tunnel_status="claim_required")
+                        self._emit("tunnel_updated", self.get_state())
+                    elif cur_status != "online":
+                        with self._mutex:
+                            self.status = "online"
+                            self.claim_url = ""
+                        if self.sync_engine.is_locked_by_current_machine():
+                            self.sync_engine.update_lock_state(tunnel_status="online")
+                        self._emit("tunnel_updated", self.get_state())
 
-        if self._proc is proc:
-            self._proc = None
-            if self.status not in ("stopped", "disabled"):
-                self.status = "stopped"
-                if self.sync_engine.is_locked_by_current_machine():
-                    self.sync_engine.update_lock_state(tunnel_status="stopped")
-                self._emit("tunnel_updated", self.get_state())
+                addr_match = addr_regex.search(line) or arrow_addr_regex.search(line)
+                if addr_match:
+                    found_addr = addr_match.group(1).strip()
+                    self._apply_discovered_public_address(found_addr)
+        finally:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+
+        should_emit_stopped = False
+        with self._mutex:
+            if self._proc is proc:
+                self._proc = None
+                if self.status not in ("stopped", "disabled"):
+                    self.status = "stopped"
+                    should_emit_stopped = True
+        if should_emit_stopped:
+            if self.sync_engine.is_locked_by_current_machine():
+                self.sync_engine.update_lock_state(tunnel_status="stopped")
+            self._emit("tunnel_updated", self.get_state())
 
     def _kill_orphaned_playit_processes(self) -> None:
         if psutil is None or os.environ.get("MINERELAY_TEST_MODE") == "1":
             return
         bin_norm = str(self.playit_binary_path.resolve()).lower()
-        secret_norm = str(self.shared_secret_toml_path).lower()
+        secret_norm = str(self.shared_secret_toml_path.resolve()).lower()
         for p in psutil.process_iter(["pid", "name", "cmdline", "exe"]):
             try:
                 pname = (p.info.get("name") or "").lower()
@@ -683,7 +804,7 @@ class TunnelManager:
                 if "claim" in cmdline or "tunnels" in cmdline:
                     continue
                 exe_path = (p.info.get("exe") or "").lower()
-                if bin_norm in exe_path or bin_norm in cmdline or secret_norm in cmdline or "playit.toml" in cmdline:
+                if bin_norm in exe_path or bin_norm in cmdline or secret_norm in cmdline:
                     p.kill()
             except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                 pass

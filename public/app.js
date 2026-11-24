@@ -120,52 +120,137 @@ function hideVersionModal(persistDismiss = false) {
 function renderVersionCheck(versionCheck) {
   if (!versionCheck || typeof versionCheck !== "object") return;
   state.versionCheck = versionCheck;
-  const curVer = String(versionCheck.currentVersion || "1.0.6");
+  const curVer = String(versionCheck.currentVersion || "1.0.7");
   const latestVer = String(versionCheck.latestVersion || "");
   const isOutdated = Boolean(versionCheck.isOutdated && latestVer);
   const relUrl = versionCheck.releaseUrl || "https://github.com/NtC0der/MineRelay/releases/latest";
   const dlUrl = versionCheck.downloadUrl || relUrl;
+  const au = versionCheck.autoUpdate && typeof versionCheck.autoUpdate === "object" ? versionCheck.autoUpdate : null;
+  const auStatus = au ? String(au.status || "idle") : "idle";
+  const auIsReady = auStatus === "downloaded" || auStatus === "ready_to_restart";
+  const auPct = au ? Math.max(0, Math.min(100, Math.round(Number(au.progress || 0)))) : 0;
+  const auVer = (au && au.targetVersion) || latestVer;
+  const canRestartApply = Boolean(au && au.canRestartApply);
+  const canApplyNow = au ? Boolean(au.canApplyNow !== false) : true;
+
+  let autoStatusHtml = "";
+  if (isOutdated && au) {
+    if (auStatus === "downloading") {
+      const sizeStr = au.totalBytes > 0
+        ? `${formatBytes(au.downloadedBytes || 0)} / ${formatBytes(au.totalBytes)}`
+        : `${formatBytes(au.downloadedBytes || 0)}`;
+      autoStatusHtml = `⏳ Auto-downloading <code>v${escapeHtml(auVer)}</code> from GitHub... <strong>${auPct}%</strong>${sizeStr !== "0 B" ? ` (${escapeHtml(sizeStr)})` : ""}`;
+    } else if (auIsReady) {
+      autoStatusHtml = canRestartApply
+        ? `✅ Verified update <code>v${escapeHtml(auVer)}</code> downloaded &amp; ready to install.${canApplyNow ? "" : " Stop the active server first to apply."}`
+        : `✅ Verified update <code>v${escapeHtml(auVer)}</code> downloaded (${escapeHtml(formatBytes(au.downloadedBytes || au.totalBytes || 0))}). Click Save Verified .exe or launch the updated build.`;
+    } else if (auStatus === "error") {
+      autoStatusHtml = `⚠️ Auto-download failed: ${escapeHtml(au.error || "Network or checksum verification error.")}`;
+    }
+  }
+
+  const configureButtons = (retryBtn, applyBtn) => {
+    if (retryBtn) {
+      const showRetry = Boolean(isOutdated && auStatus !== "downloading" && !auIsReady);
+      retryBtn.classList.toggle("hidden", !showRetry);
+      retryBtn.textContent = auStatus === "error" ? "↻ Retry Auto-Download" : "⬇ Auto-Download Update";
+    }
+    if (applyBtn) {
+      const showApply = Boolean(isOutdated && auIsReady);
+      applyBtn.classList.toggle("hidden", !showApply);
+      if (showApply) {
+        applyBtn.textContent = canRestartApply ? "🔄 Restart & Update Now" : "⬇ Save Verified .exe";
+        if (canRestartApply && !canApplyNow) {
+          applyBtn.disabled = true;
+          applyBtn.title = "Stop the Minecraft server before restarting to apply the update";
+        } else {
+          applyBtn.disabled = false;
+          applyBtn.title = canRestartApply
+            ? `Restart MineRelay and update to v${auVer}`
+            : `Save downloaded MineRelay v${auVer} executable`;
+        }
+      }
+    }
+  };
 
   const pill = document.getElementById("app-version-pill");
   if (pill) {
-    pill.textContent = isOutdated ? `v${curVer} (Update Ready)` : `v${curVer}`;
-    pill.className = isOutdated ? "badge badge-admin" : "badge badge-outline";
-    pill.title = isOutdated
-      ? `Installed v${curVer} — Latest v${latestVer} available on GitHub`
-      : `MineRelay v${curVer}`;
+    if (!isOutdated) {
+      pill.textContent = `v${curVer}`;
+      pill.className = "badge badge-outline";
+      pill.title = `MineRelay v${curVer}`;
+    } else if (auIsReady) {
+      pill.textContent = `v${curVer} (Update v${auVer} Ready)`;
+      pill.className = "badge badge-member";
+      pill.title = `Verified update v${auVer} downloaded and ready to apply`;
+    } else if (auStatus === "downloading") {
+      pill.textContent = `v${curVer} (Downloading ${auPct}%)`;
+      pill.className = "badge badge-admin";
+      pill.title = `Downloading MineRelay v${auVer} (${auPct}%)`;
+    } else {
+      pill.textContent = `v${curVer} (Update Ready)`;
+      pill.className = "badge badge-admin";
+      pill.title = `Installed v${curVer} — Latest v${latestVer} available on GitHub`;
+    }
   }
 
   const authBanner = document.getElementById("auth-version-error");
   const authText = document.getElementById("auth-version-error-text");
+  const authStatusEl = document.getElementById("auth-version-auto-status");
   const authDl = document.getElementById("auth-version-download");
+  const authRetry = document.getElementById("auth-version-retry-btn");
+  const authApply = document.getElementById("auth-version-apply-btn");
   if (authBanner && authText) {
     if (isOutdated) {
       authText.innerHTML =
         `<strong>⚠️ Outdated MineRelay Version (v${escapeHtml(curVer)} installed — v${escapeHtml(latestVer)} available):</strong> ` +
-        `Please download the latest release from GitHub so your sync &amp; host locks stay compatible.`;
+        `Please update to the latest GitHub release so your sync &amp; host locks stay compatible.`;
       if (authDl) authDl.href = dlUrl;
+      if (authStatusEl) {
+        authStatusEl.innerHTML = autoStatusHtml;
+        authStatusEl.classList.toggle("hidden", !autoStatusHtml);
+      }
+      configureButtons(authRetry, authApply);
       authBanner.classList.remove("hidden");
     } else {
+      if (authStatusEl) authStatusEl.classList.add("hidden");
+      configureButtons(authRetry, authApply);
       authBanner.classList.add("hidden");
     }
   }
 
   const dashBanner = document.getElementById("dashboard-version-banner");
   const dashText = document.getElementById("dashboard-version-text");
+  const dashStatusEl = document.getElementById("dashboard-version-auto-status");
   const dashDl = document.getElementById("dashboard-version-download");
+  const dashRetry = document.getElementById("dashboard-version-retry-btn");
+  const dashApply = document.getElementById("dashboard-version-apply-btn");
   if (dashBanner && dashText) {
     if (isOutdated) {
       dashText.innerHTML =
-        `<strong>⚠️ Outdated MineRelay Version:</strong> Running <code>v${escapeHtml(curVer)}</code>, latest GitHub release is <code>v${escapeHtml(latestVer)}</code>. Download the latest build to avoid host/sync issues.`;
+        `<strong>⚠️ Outdated MineRelay Version:</strong> Running <code>v${escapeHtml(curVer)}</code>, latest GitHub release is <code>v${escapeHtml(latestVer)}</code>. Update to avoid host/sync issues.`;
       if (dashDl) dashDl.href = dlUrl;
+      if (dashStatusEl) {
+        dashStatusEl.innerHTML = autoStatusHtml;
+        dashStatusEl.classList.toggle("hidden", !autoStatusHtml);
+      }
+      configureButtons(dashRetry, dashApply);
       dashBanner.classList.remove("hidden");
     } else {
+      if (dashStatusEl) dashStatusEl.classList.add("hidden");
+      configureButtons(dashRetry, dashApply);
       dashBanner.classList.add("hidden");
     }
   }
 
   const modal = document.getElementById("version-update-modal");
   if (modal) {
+    const modalRetry = document.getElementById("version-modal-retry-btn");
+    const modalApply = document.getElementById("version-modal-apply-btn");
+    const progWrap = document.getElementById("version-modal-progress-wrap");
+    const progText = document.getElementById("version-modal-progress-text");
+    const progPct = document.getElementById("version-modal-progress-pct");
+    const progFill = document.getElementById("version-modal-progress-fill");
     if (isOutdated) {
       const modalCur = document.getElementById("version-modal-current");
       const modalLatest = document.getElementById("version-modal-latest");
@@ -175,6 +260,19 @@ function renderVersionCheck(versionCheck) {
       if (modalLatest) modalLatest.textContent = `v${latestVer}`;
       if (modalDl) modalDl.href = dlUrl;
       if (modalRel) modalRel.href = relUrl;
+      if (progWrap) {
+        const showProg = Boolean(au && (auStatus === "downloading" || auIsReady || auStatus === "error"));
+        progWrap.classList.toggle("hidden", !showProg);
+        if (showProg) {
+          if (progText) progText.innerHTML = autoStatusHtml || "Preparing update...";
+          if (progPct) progPct.textContent = auStatus === "error" ? "Failed" : (auIsReady ? "100%" : `${auPct}%`);
+          if (progFill) {
+            progFill.classList.toggle("indeterminate", auStatus === "downloading" && auPct === 0);
+            progFill.style.width = auIsReady ? "100%" : (auStatus === "error" ? "0%" : `${auPct}%`);
+          }
+        }
+      }
+      configureButtons(modalRetry, modalApply);
       let dismissed = false;
       try {
         dismissed = sessionStorage.getItem(`minerelay_dismissed_update_${latestVer}`) === "1";
@@ -183,6 +281,8 @@ function renderVersionCheck(versionCheck) {
         modal.classList.remove("hidden");
       }
     } else {
+      if (progWrap) progWrap.classList.add("hidden");
+      configureButtons(modalRetry, modalApply);
       modal.classList.add("hidden");
     }
   }
@@ -285,8 +385,18 @@ async function runWithButtonBusy(btn, busyText, fn) {
     return await fn();
   } finally {
     if (btn) {
-      btn.disabled = false;
+      const stillGuardLocked = Boolean(
+        btn.dataset.remoteLocked === "1" ||
+        btn.dataset.localBusyLocked === "1" ||
+        btn.dataset.noLockLocked === "1"
+      );
+      if (!stillGuardLocked) {
+        btn.disabled = false;
+      }
       btn.textContent = origText;
+      if (state.status) {
+        applyRemoteAdminLockGuards(state.isRemoteHosting, state.status.lock || {}, state.status.localStatus || "idle");
+      }
     }
   }
 }
@@ -565,6 +675,9 @@ function startAuthSyncPolling() {
     try {
       const setup = await apiFetch("/api/setup/status");
       renderAuthSyncProgress(setup.syncProgress || null);
+      if (setup.versionCheck) {
+        renderVersionCheck(setup.versionCheck);
+      }
     } catch (_) {}
   }, 2500);
 }
@@ -949,7 +1062,14 @@ function handleClusterSnapshotOrLockTransition(summary) {
     state.fileCache = {};
     if (state.account && state.account.role === "admin") {
       if (state.activeTabId === "tab-files") {
-        loadAdminFiles(state.currentFileDir, state.fileSearchQuery);
+        const edBox = document.getElementById("file-editor-box");
+        const edTextarea = document.getElementById("file-editor-textarea");
+        const isDirtyOpen = Boolean(
+          edBox && !edBox.classList.contains("hidden") && state.editingFilePath && edTextarea && edTextarea.value !== state.editingFileSavedContent
+        );
+        if (!isDirtyOpen) {
+          loadAdminFiles(state.currentFileDir, state.fileSearchQuery);
+        }
         loadAdminBackups();
         const plgQ = document.getElementById("input-plugin-search")?.value.trim() || "";
         loadAdminPlugins(plgQ);
@@ -1112,6 +1232,20 @@ function connectEventStream() {
           state.status.tunnel = payload.data;
           renderStatusSummary(state.status);
         }
+      } else if (payload.event === "update_status") {
+        if (payload.data && typeof payload.data === "object") {
+          const curVc = state.versionCheck && typeof state.versionCheck === "object" ? { ...state.versionCheck } : {};
+          curVc.autoUpdate = payload.data;
+          if (payload.data.targetVersion && !curVc.latestVersion) {
+            curVc.latestVersion = payload.data.targetVersion;
+          }
+          renderVersionCheck(curVc);
+        }
+      } else if (payload.event === "lock_lost") {
+        state.pendingAction = null;
+        state.actionInFlight = false;
+        showToast("Host lock was lost or overridden remotely — local server stopped safely to prevent corruption.", "error");
+        refreshServerStatus();
       } else if (payload.event === "sync_progress") {
         if (state.status) {
           state.status.syncProgress = payload.data;
@@ -1265,6 +1399,7 @@ function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}, localStatus = (s
     "#form-create-backup input",
     "#form-create-backup select",
     "#form-create-backup button[type='submit']",
+    "#btn-push-all-local-backups",
     "#btn-prune-cloud-backups",
     "#input-file-upload",
     "#btn-save-file",
@@ -1275,6 +1410,7 @@ function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}, localStatus = (s
     "#banned-container button",
     "#installed-plugins-container button",
     "#plugin-catalog-container button",
+    "#backups-list-container .btn-push-cloud-bk",
     "#backups-list-container .btn-restore-bk",
     "#backups-list-container .btn-del-bk",
     "#files-list-container .btn-del-file",
@@ -1318,6 +1454,8 @@ function applyRemoteAdminLockGuards(isRemoteHosting, lock = {}, localStatus = (s
   const isLocalTransition = isLocalActive && localStatus !== "running";
   const transientSelectors = [
     "#form-create-backup button[type='submit']",
+    "#btn-push-all-local-backups",
+    "#backups-list-container .btn-push-cloud-bk",
     "#form-gamerules button[type='submit']",
     "#form-server-properties button[type='submit']",
     "#btn-world-reset-random",
@@ -1667,8 +1805,11 @@ function renderStatusSummary(summary) {
   const errBanner = document.getElementById("hero-startup-error-banner");
   const errBannerText = document.getElementById("hero-startup-error-text");
   if (errBanner && errBannerText) {
-    if (!isLocalHosting && summary.lastError && summary.lastError !== state.dismissedStartupError) {
-      errBannerText.innerHTML = `<strong>⚠️ Last Startup Failed:</strong> ${escapeHtml(summary.lastError)}`;
+    const hasSyncFailedLock = Boolean(lock && lock.status === "sync_failed");
+    const activeErrMsg = summary.lastError || (hasSyncFailedLock ? "Previous host stop sync failed — use Force Unlock only if you are sure, or let the previous host finish syncing." : "");
+    if (!isLocalHosting && activeErrMsg && activeErrMsg !== state.dismissedStartupError) {
+      const prefixLabel = hasSyncFailedLock ? "⚠️ World Sync Incomplete (sync_failed):" : "⚠️ Last Startup Failed:";
+      errBannerText.innerHTML = `<strong>${prefixLabel}</strong> ${escapeHtml(activeErrMsg)}`;
       errBanner.classList.remove("hidden");
     } else {
       errBanner.classList.add("hidden");
@@ -2336,6 +2477,19 @@ function renderWorldGeneratorInfo(worldInfo, props = {}, forceSeedSync = false) 
   }
 }
 
+function setSelectValueSafely(sel, rawVal) {
+  if (!sel || rawVal === undefined || rawVal === null) return;
+  const val = String(rawVal);
+  const exists = Array.from(sel.options).some((opt) => opt.value === val);
+  if (!exists && val) {
+    const opt = document.createElement("option");
+    opt.value = val;
+    opt.textContent = `${val} (Custom / Saved)`;
+    sel.appendChild(opt);
+  }
+  if (val) sel.value = val;
+}
+
 function populateMcVersions(software, preferredVersion = "") {
   const vers = state.availableVersions;
   const sel = document.getElementById("cfg-mc-version");
@@ -2352,8 +2506,8 @@ function populateMcVersions(software, preferredVersion = "") {
       sel.appendChild(opt);
     });
   }
-  if (preferredVersion && list.includes(preferredVersion)) {
-    sel.value = preferredVersion;
+  if (preferredVersion) {
+    setSelectValueSafely(sel, preferredVersion);
   } else if (list.length > 0 && !list.includes(sel.value)) {
     sel.value = list[0];
   }
@@ -2407,8 +2561,8 @@ async function loadAdminProperties(includeVersions = true) {
 
     // server.properties visual form
     document.getElementById("prop-motd").value = p["motd"] || "";
-    document.getElementById("prop-gamemode").value = p["gamemode"] || "survival";
-    document.getElementById("prop-difficulty").value = p["difficulty"] || "normal";
+    setSelectValueSafely(document.getElementById("prop-gamemode"), p["gamemode"] || "survival");
+    setSelectValueSafely(document.getElementById("prop-difficulty"), p["difficulty"] || "normal");
     document.getElementById("prop-max-players").value = p["max-players"] || "20";
     document.getElementById("prop-view-distance").value = p["view-distance"] || "10";
     document.getElementById("prop-sim-distance").value = p["simulation-distance"] || "10";
@@ -2774,11 +2928,16 @@ async function loadAdminBackups() {
 
 function renderBackupsList(backups) {
   const container = document.getElementById("backups-list-container");
+  const btnPushAll = document.getElementById("btn-push-all-local-backups");
   container.innerHTML = "";
   if (!backups || backups.length === 0) {
+    if (btnPushAll) btnPushAll.classList.add("hidden");
     container.innerHTML = `<div style="color:var(--text-muted);font-size:0.84rem;">No backup snapshots yet. Snapshots are created automatically when stopping the server or manually above.</div>`;
     return;
   }
+  const cloudNames = new Set(backups.filter((x) => x && x.location === "cloud").map((x) => x.name));
+  let unpushedLocalCount = 0;
+
   backups.forEach((b) => {
     const row = document.createElement("div");
     row.className = "list-row";
@@ -2787,6 +2946,15 @@ function renderBackupsList(backups) {
     const locBadge = loc === "local"
       ? `<span class="badge badge-local">LOCAL PC</span>`
       : `<span class="badge badge-cloud">SHARED CLOUD</span>`;
+    const alreadyInCloud = loc === "local" && cloudNames.has(b.name);
+    if (loc === "local" && !alreadyInCloud) {
+      unpushedLocalCount += 1;
+    }
+    const pushControlHtml = loc === "local"
+      ? (alreadyInCloud
+          ? `<span class="badge badge-cloud" title="Already copied into Shared Drive snapshots/backups">✓ In Drive</span>`
+          : `<button class="btn btn-secondary btn-xs btn-push-cloud-bk" title="Copy this local backup into the Shared Drive folder">☁️ Push to Drive</button>`)
+      : "";
     const locQuery = loc ? `&location=${encodeURIComponent(loc)}` : "";
     const dlUrl = `/api/admin/backups/download?name=${encodeURIComponent(b.name)}${locQuery}&token=${encodeURIComponent(state.token)}`;
     row.innerHTML = `
@@ -2797,12 +2965,44 @@ function renderBackupsList(backups) {
         </div>
         <div style="font-size:0.75rem;color:var(--text-muted);">${formatBytes(b.sizeBytes)} • ${escapeHtml(dateStr)}</div>
       </div>
-      <div style="display:flex;gap:0.35rem;flex-wrap:wrap;">
+      <div style="display:flex;gap:0.35rem;flex-wrap:wrap;align-items:center;">
+        ${pushControlHtml}
         <a href="${dlUrl}" class="btn btn-ghost btn-xs" download="${escapeHtml(b.name)}">⬇ Download</a>
         <button class="btn btn-secondary btn-xs btn-restore-bk">Restore</button>
         <button class="btn btn-danger btn-xs btn-del-bk">Delete</button>
       </div>
     `;
+    const pushBtn = row.querySelector(".btn-push-cloud-bk");
+    if (pushBtn) {
+      pushBtn.addEventListener("click", async () => {
+        if (pushBtn.disabled) return;
+        await runWithButtonBusy(pushBtn, "⏳ Pushing...", async () => {
+          try {
+            const res = await apiFetch("/api/admin/backups/push-cloud", {
+              method: "POST",
+              body: JSON.stringify({ name: b.name }),
+            });
+            if (res.status) {
+              state.status = res.status;
+              renderStatusSummary(res.status);
+            }
+            if (Array.isArray(res.backups)) {
+              renderBackupsList(res.backups);
+            } else {
+              loadAdminBackups();
+            }
+            const r = res.result || {};
+            if (r.alreadyInCloud) {
+              showToast(`'${b.name}' is already identical in Shared Drive.`, "info");
+            } else {
+              showToast(`Pushed '${b.name}' (${formatBytes(r.pushedBytes || b.sizeBytes || 0)}) to Shared Drive folder!`, "success");
+            }
+          } catch (err) {
+            showToast(err.message, "error");
+          }
+        });
+      });
+    }
     const restoreBtn = row.querySelector(".btn-restore-bk");
     if (restoreBtn) {
       let confirmStep = false;
@@ -2880,6 +3080,14 @@ function renderBackupsList(backups) {
     }
     container.appendChild(row);
   });
+  if (btnPushAll) {
+    if (unpushedLocalCount > 0) {
+      btnPushAll.classList.remove("hidden");
+      btnPushAll.textContent = `☁️ Push All Local to Shared Drive (${unpushedLocalCount})`;
+    } else {
+      btnPushAll.classList.add("hidden");
+    }
+  }
   applyRemoteAdminLockGuards(state.isRemoteHosting, (state.status && state.status.lock) || {}, (state.status && state.status.localStatus) || "idle");
 }
 
@@ -3129,6 +3337,10 @@ let pendingDiscardFilePath = "";
 let pendingDiscardFileTimer = null;
 
 async function openFileInEditor(relPath) {
+  if (/\.(zip|gz|xz|bz2|zst|jar|mca|mcr|mcc|dat|dat_old|nbt|png|jpg|jpeg|webp|ogg|mp3|exe|dll|bin)$/i.test(String(relPath || ""))) {
+    showToast("Binary file cannot be opened in the text editor.", "info");
+    return;
+  }
   const editorBox = document.getElementById("file-editor-box");
   const textarea = document.getElementById("file-editor-textarea");
   if (
@@ -3223,6 +3435,61 @@ document.addEventListener("DOMContentLoaded", () => {
       });
     });
   }
+
+  const triggerAutoUpdateDownload = async (btn) => {
+    await runWithButtonBusy(btn, "Downloading...", async () => {
+      try {
+        const res = await apiFetch("/api/app/update/download", { method: "POST" });
+        if (res.versionCheck) renderVersionCheck(res.versionCheck);
+        showToast("Downloading update in background...", "info");
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
+  };
+
+  const triggerAutoUpdateApply = async (btn) => {
+    await runWithButtonBusy(btn, "Preparing Update...", async () => {
+      try {
+        const res = await apiFetch("/api/app/update/apply", { method: "POST" });
+        if (res.restartScheduled) {
+          showToast(`Restarting MineRelay to install v${res.version || "latest"}...`, "success");
+          setTimeout(() => {
+            const pollReload = async () => {
+              try {
+                const ping = await fetch("/api/setup/status");
+                if (ping.ok) {
+                  window.location.reload();
+                  return;
+                }
+              } catch (_) {}
+              setTimeout(pollReload, 1000);
+            };
+            pollReload();
+          }, 1500);
+        } else if (res.downloadUrl) {
+          showToast(res.message || "Update downloaded and verified!", "success");
+          const a = document.createElement("a");
+          a.href = res.downloadUrl;
+          a.download = "";
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+        }
+      } catch (err) {
+        showToast(err.message, "error");
+      }
+    });
+  };
+
+  ["auth-version-retry-btn", "dashboard-version-retry-btn", "version-modal-retry-btn"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("click", () => triggerAutoUpdateDownload(el));
+  });
+  ["auth-version-apply-btn", "dashboard-version-apply-btn", "version-modal-apply-btn"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener("click", () => triggerAutoUpdateApply(el));
+  });
   const btnDismissStartupErr = document.getElementById("btn-dismiss-startup-error");
   if (btnDismissStartupErr) {
     btnDismissStartupErr.addEventListener("click", () => {
@@ -3873,6 +4140,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const netherEl = document.getElementById("prop-allow-nether");
     const endEl = document.getElementById("prop-disable-end");
     const spEl = document.getElementById("prop-spawn-protection");
+    const onlineModeEl = document.getElementById("prop-online-mode");
     const updates = {
       motd: document.getElementById("prop-motd").value.trim(),
       gamemode: document.getElementById("prop-gamemode").value,
@@ -3880,7 +4148,6 @@ document.addEventListener("DOMContentLoaded", () => {
       "max-players": document.getElementById("prop-max-players").value,
       "view-distance": document.getElementById("prop-view-distance").value,
       "simulation-distance": document.getElementById("prop-sim-distance").value,
-      "online-mode": document.getElementById("prop-online-mode").checked,
       pvp: document.getElementById("prop-pvp").checked,
       "white-list": document.getElementById("prop-whitelist").checked,
       "allow-flight": document.getElementById("prop-allow-flight").checked,
@@ -3892,6 +4159,9 @@ document.addEventListener("DOMContentLoaded", () => {
       "level-seed": document.getElementById("prop-level-seed").value.trim(),
       "spawn-protection": spEl ? spEl.value : "0",
     };
+    if (onlineModeEl && !onlineModeEl.disabled) {
+      updates["online-mode"] = onlineModeEl.checked;
+    }
     await runWithButtonBusy(submitBtn, "Saving...", async () => {
       try {
         const res = await apiFetch("/api/admin/properties", {
@@ -4332,6 +4602,42 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     }
   });
+
+  const btnPushAllLocal = document.getElementById("btn-push-all-local-backups");
+  if (btnPushAllLocal) {
+    armTwoStepConfirm(btnPushAllLocal, "Confirm Push All?", async () => {
+      await runWithButtonBusy(btnPushAllLocal, "⏳ Pushing All...", async () => {
+        try {
+          const res = await apiFetch("/api/admin/backups/push-cloud", {
+            method: "POST",
+            body: JSON.stringify({ all: true }),
+          });
+          if (res.status) {
+            state.status = res.status;
+            renderStatusSummary(res.status);
+          }
+          if (Array.isArray(res.backups)) {
+            renderBackupsList(res.backups);
+          } else {
+            loadAdminBackups();
+          }
+          const r = res.result || {};
+          const pushedCnt = Number(r.pushedCount || 0);
+          const skippedCnt = Number(r.skippedCount || 0);
+          if (pushedCnt > 0) {
+            showToast(
+              `Pushed ${pushedCnt} local backup(s) (${formatBytes(r.pushedBytes || 0)}) to Shared Drive!${skippedCnt > 0 ? ` (${skippedCnt} already synced.)` : ""}`,
+              "success"
+            );
+          } else {
+            showToast("All local backups are already present in the Shared Drive folder.", "info");
+          }
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      });
+    });
+  }
 
   const btnPruneCloud = document.getElementById("btn-prune-cloud-backups");
   if (btnPruneCloud) {

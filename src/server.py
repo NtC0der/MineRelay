@@ -41,7 +41,7 @@ if str(BUNDLE_DIR) not in sys.path:
     sys.path.insert(0, str(BUNDLE_DIR))
 
 from src.models import AUTO_SYNC_DEFAULT_MINUTES, AUTO_SYNC_MAX_MINUTES, _safe_bool
-from src.bootstrap_runtime import check_latest_minerelay_release, is_version_older
+from src.bootstrap_runtime import AutoUpdateManager, check_latest_minerelay_release, is_version_older
 from src.sync_engine import SyncEngine, HostLockConflictError
 from src.auth_service import AuthService, AuthError, PermissionDeniedError
 from src.tunnel_manager import TunnelManager
@@ -70,7 +70,7 @@ class AppContext:
         self.sse_mutex = threading.Lock()
         self._cluster_version_recorded: str = ""
 
-        self.sync_engine = SyncEngine(base_data, event_callback=self.broadcast_event)
+        self.sync_engine = SyncEngine(base_data, event_callback=self._on_engine_event)
         self.auth_service = AuthService(self.sync_engine)
         self.tunnel_manager = TunnelManager(self.sync_engine, event_callback=self.broadcast_event)
         self.mc_manager = MinecraftManager(
@@ -78,6 +78,7 @@ class AppContext:
             self.tunnel_manager,
             event_callback=self.broadcast_event,
         )
+        self.auto_updater = AutoUpdateManager(Path(base_data), event_callback=self._on_updater_event)
 
         if os.environ.get("MINERELAY_TEST_MODE") != "1":
             threading.Thread(
@@ -86,12 +87,33 @@ class AppContext:
                 name="RemoteLockWatcher",
             ).start()
             threading.Thread(
-                target=lambda: self.get_version_check(force=True),
+                target=lambda: self.get_version_check(force=True, trigger_download=True),
                 daemon=True,
                 name="InitialReleaseVersionCheck",
             ).start()
 
-    def get_version_check(self, force: bool = False) -> Dict[str, Any]:
+    def _on_engine_event(self, event_type: str, payload: Any) -> None:
+        self.broadcast_event(event_type, payload)
+        if event_type == "lock_lost":
+            try:
+                self.mc_manager.handle_lock_lost(payload if isinstance(payload, dict) else {})
+            except Exception:
+                pass
+
+    def _enrich_auto_update_state(self, au_state: Dict[str, Any]) -> Dict[str, Any]:
+        enriched = dict(au_state or {})
+        enriched["canRestartApply"] = bool(IS_FROZEN and sys.platform.startswith("win"))
+        enriched["canApplyNow"] = bool(
+            self.mc_manager.local_status == "idle" and not self.sync_engine.is_locked_by_current_machine()
+        )
+        return enriched
+
+    def _on_updater_event(self, event_type: str, payload: Any) -> None:
+        if event_type == "update_status" and isinstance(payload, dict):
+            payload = self._enrich_auto_update_state(payload)
+        self.broadcast_event(event_type, payload)
+
+    def get_version_check(self, force: bool = False, trigger_download: bool = True) -> Dict[str, Any]:
         cfg = None
         try:
             cfg = self.sync_engine.load_cluster_config()
@@ -117,6 +139,12 @@ class AppContext:
                     self._cluster_version_recorded = cur_ver
             except Exception:
                 pass
+        if trigger_download and vc.get("isOutdated") and self.auto_updater.is_auto_download_allowed():
+            try:
+                self.auto_updater.ensure_update_downloaded_async(vc, force=False)
+            except Exception:
+                pass
+        vc["autoUpdate"] = self._enrich_auto_update_state(self.auto_updater.get_state())
         return vc
 
     def _remote_lock_watcher_loop(self) -> None:
@@ -260,8 +288,16 @@ class AppContext:
                     getattr(self.mc_manager, "_startup_detail", ""),
                     getattr(self.mc_manager, "_startup_progress", 0),
                 )
-                vc_now = self.get_version_check(force=False)
-                sig = sig + ((vc_now.get("latestVersion"), vc_now.get("isOutdated")),)
+                vc_now = self.get_version_check(force=False, trigger_download=True)
+                au_now = vc_now.get("autoUpdate") or {}
+                sig = sig + (
+                    (
+                        vc_now.get("latestVersion"),
+                        vc_now.get("isOutdated"),
+                        au_now.get("status"),
+                        au_now.get("targetVersion"),
+                    ),
+                )
 
                 if has_clients:
                     if last_prog_sig is not None and prog_sig != last_prog_sig:
@@ -279,10 +315,7 @@ class AppContext:
                         summary = self.mc_manager.get_status_summary()
                         summary["versionCheck"] = vc_now
                         if remote_epoch_changed or logs_reset or len(unseen_logs) > 25:
-                            if remote_tel and isinstance(remote_tel.get("logs"), list):
-                                summary["logs"] = list(remote_tel["logs"][-120:])
-                            elif remote_epoch_changed or logs_reset:
-                                summary["logs"] = []
+                            summary["logs"] = self.mc_manager.get_effective_logs(120)
                         self.broadcast_event("status_changed", summary)
                 last_sig = sig
                 last_prog_sig = prog_sig
@@ -420,6 +453,29 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
             else:
                 self._send_json(500, {"error": str(e), "code": "INTERNAL_ERROR"})
 
+        def _validate_local_request(self) -> bool:
+            allowed = {"localhost", "127.0.0.1", "::1"}
+            host_hdr = (self.headers.get("Host") or "").strip()
+            if host_hdr:
+                if host_hdr.startswith("["):
+                    end_idx = host_hdr.find("]")
+                    host_name = host_hdr[1:end_idx].lower() if end_idx != -1 else host_hdr.lower()
+                else:
+                    host_name = host_hdr.split(":", 1)[0].lower()
+                if host_name not in allowed:
+                    self._send_json(403, {"error": "Forbidden Host header.", "code": "FORBIDDEN"})
+                    return False
+            origin_hdr = (self.headers.get("Origin") or "").strip()
+            if origin_hdr:
+                try:
+                    org_host = (urlparse(origin_hdr).hostname or "").lower()
+                except Exception:
+                    org_host = ""
+                if org_host not in allowed:
+                    self._send_json(403, {"error": "Forbidden Origin header.", "code": "FORBIDDEN"})
+                    return False
+            return True
+
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
@@ -428,8 +484,36 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
             if not path.startswith("/api/"):
                 return self._serve_static(path)
 
+            if not self._validate_local_request():
+                return
+
             try:
                 token = self._get_token(parsed)
+
+                if path == "/api/app/update/file":
+                    ready = ctx.auto_updater.get_ready_update_path()
+                    if ready is None or not ready.exists() or not ready.is_file():
+                        raise FileNotFoundError("No verified update installer is ready yet.")
+                    au_state = ctx.auto_updater.get_state()
+                    ver_tag = str(au_state.get("targetVersion") or "latest").strip()
+                    safe_ver = "".join(c for c in ver_tag if c.isalnum() or c in (".", "-", "_")) or "latest"
+                    st = ready.stat()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Disposition", f'attachment; filename="MineRelay-v{safe_ver}.exe"')
+                    self.send_header("Content-Length", str(st.st_size))
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    try:
+                        with open(ready, "rb") as uf:
+                            while True:
+                                chunk = uf.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                        self.close_connection = True
+                    return
 
                 if path == "/api/setup/status":
                     cfg = ctx.sync_engine.load_cluster_config()
@@ -594,13 +678,21 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     bk_path, _loc = resolved
                     if not bk_path.exists() or not bk_path.is_file():
                         raise FileNotFoundError(f"Backup '{name}' not found.")
-                    data_bytes = bk_path.read_bytes()
+                    st = bk_path.stat()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/zip")
                     self.send_header("Content-Disposition", f'attachment; filename="{name}"')
-                    self.send_header("Content-Length", str(len(data_bytes)))
+                    self.send_header("Content-Length", str(st.st_size))
                     self.end_headers()
-                    self.wfile.write(data_bytes)
+                    try:
+                        with open(bk_path, "rb") as bf:
+                            while True:
+                                chunk = bf.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                self.wfile.write(chunk)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                        self.close_connection = True
                     return
 
                 if path == "/api/admin/gamerules":
@@ -643,17 +735,64 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
             path = parsed.path
             qs = parse_qs(parsed.query)
 
+            if not self._validate_local_request():
+                return
+
             try:
                 token = self._get_token(parsed)
                 body = self._read_json_body()
 
                 if path == "/api/app/version-check":
-                    vc = ctx.get_version_check(force=True)
+                    vc = ctx.get_version_check(force=True, trigger_download=True)
                     if vc.get("isOutdated"):
                         summary = ctx.mc_manager.get_status_summary()
                         summary["versionCheck"] = vc
                         ctx.broadcast_event("status_changed", summary)
                     self._send_json(200, {"versionCheck": vc})
+                    return
+
+                if path == "/api/app/update/download":
+                    vc = ctx.get_version_check(force=True, trigger_download=False)
+                    au = ctx._enrich_auto_update_state(ctx.auto_updater.ensure_update_downloaded_async(vc, force=True))
+                    vc["autoUpdate"] = au
+                    summary = ctx.mc_manager.get_status_summary()
+                    summary["versionCheck"] = vc
+                    ctx.broadcast_event("status_changed", summary)
+                    self._send_json(200, {"versionCheck": vc, "autoUpdate": au})
+                    return
+
+                if path == "/api/app/update/apply":
+                    if ctx.mc_manager.local_status != "idle" or ctx.sync_engine.is_locked_by_current_machine():
+                        raise HostLockConflictError(
+                            "Stop the Minecraft server and finish world sync before restarting to apply the update."
+                        )
+                    ready = ctx.auto_updater.get_ready_update_path()
+                    if ready is None or not ready.exists() or not ready.is_file():
+                        raise FileNotFoundError("No verified update installer is ready yet.")
+                    au_state = ctx._enrich_auto_update_state(ctx.auto_updater.get_state())
+                    if not (IS_FROZEN and sys.platform.startswith("win")):
+                        self._send_json(200, {
+                            "applied": False,
+                            "restartScheduled": False,
+                            "version": au_state.get("targetVersion", ""),
+                            "downloadUrl": "/api/app/update/file",
+                            "filePath": str(ready),
+                            "message": "Update downloaded and verified. Running from source — download or launch the updated executable directly.",
+                        })
+                        return
+                    target_exe = Path(sys.executable).resolve()
+                    ctx.auto_updater.spawn_windows_relaunch_helper(
+                        target_exe,
+                        ready,
+                        staged_already=bool(au_state.get("stagedToExe")),
+                        extra_args=sys.argv[1:],
+                    )
+                    self._send_json(200, {
+                        "applied": True,
+                        "restartScheduled": True,
+                        "version": au_state.get("targetVersion", ""),
+                    })
+                    threading.Timer(0.45, lambda: os._exit(0)).start()
                     return
 
                 if path == "/api/setup/init":
@@ -662,9 +801,6 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     custom_passkey = body.get("customPasskey")
                     shared_sync_dir = body.get("sharedSyncDir")
                     machine_name = body.get("machineName")
-                    if machine_name:
-                        ctx.sync_engine.local_config.machine_name = str(machine_name).strip()
-                        ctx.sync_engine.save_local_config()
 
                     cfg, admin_acc, raw_pk, session_tok = ctx.auth_service.initialize_cluster(
                         admin_username=admin_username,
@@ -672,6 +808,9 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         custom_admin_passkey=custom_passkey,
                         shared_sync_dir=shared_sync_dir,
                     )
+                    if machine_name and str(machine_name).strip():
+                        ctx.sync_engine.local_config.machine_name = str(machine_name).strip()
+                        ctx.sync_engine.save_local_config()
                     self._send_json(200, {
                         "initialized": True,
                         "token": session_tok,
@@ -689,6 +828,11 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     machine_name = str(body.get("machineName", "")).strip()
                     if not new_dir or "\x00" in new_dir:
                         raise ValueError("Shared Sync Folder path is required.")
+                    if new_dir.startswith("\\\\") or new_dir.startswith("//"):
+                        raise ValueError("Network UNC paths are not supported for Shared Sync Folder; use a local or mounted drive path.")
+                    transfer_msg = ctx.sync_engine._has_active_cloud_transfer()
+                    if transfer_msg:
+                        raise ValueError(f"{transfer_msg} Wait for cloud sync to finish before switching folders.")
                     target_dir = Path(new_dir)
                     if target_dir.exists() and not target_dir.is_dir():
                         raise ValueError("Selected Shared Sync path is a file, not a directory.")
@@ -719,11 +863,11 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                 if path == "/api/auth/login":
                     passkey = str(body.get("passkey", ""))
                     machine_name = str(body.get("machineName", "")).strip()
+                    acc, session_tok = ctx.auth_service.login_with_passkey(passkey)
                     if machine_name:
                         ctx.sync_engine.local_config.machine_name = machine_name
                         ctx.sync_engine.save_local_config()
                         _sync_local_lock_machine_name(ctx, machine_name)
-                    acc, session_tok = ctx.auth_service.login_with_passkey(passkey)
                     vc = ctx.get_version_check(force=False)
                     status_summary = ctx.mc_manager.get_status_summary()
                     status_summary["versionCheck"] = vc
@@ -931,6 +1075,9 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     if location and location not in ("local", "cloud"):
                         raise ValueError("Backup location must be 'local' or 'cloud'.")
                     res = ctx.sync_engine.restore_backup(name, location=location)
+                    ctx.mc_manager._world_info_cache = None
+                    ctx.mc_manager._world_info_cache_ts = 0.0
+                    ctx.mc_manager._runtime_json_cache.clear()
                     ctx.mc_manager._log(f"Restored world backup '{name}' to runtime and shared snapshot.", "INFO", "SyncEngine")
                     ctx.mc_manager._emit("status_changed", ctx.mc_manager.get_status_summary())
                     res["properties"] = ctx.mc_manager.get_server_properties()
@@ -967,6 +1114,35 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                     })
                     return
 
+                if path == "/api/admin/backups/push-cloud":
+                    ctx.auth_service.require_admin(token)
+                    _ensure_no_remote_lock(ctx, "push local backups to Shared Drive")
+                    if ctx.mc_manager.local_status not in ("idle", "running"):
+                        raise HostLockConflictError(
+                            f"Cannot push local backups while the server is transitioning ({ctx.mc_manager.local_status})."
+                        )
+                    push_all = bool(body.get("all", False))
+                    name = str(body.get("name", "") or "").strip()
+                    if not push_all and not name:
+                        raise ValueError("Backup name is required unless 'all' is true.")
+                    res = ctx.sync_engine.push_local_backup_to_cloud(backup_name=name, push_all=push_all)
+                    pushed_cnt = int(res.get("pushedCount", 0) or 0)
+                    pushed_mb = round(float(res.get("pushedBytes", 0) or 0) / (1024.0 * 1024.0), 2)
+                    if pushed_cnt > 0:
+                        ctx.mc_manager._log(
+                            f"Pushed {pushed_cnt} local backup(s) ({pushed_mb} MB) to Shared Drive folder.",
+                            "INFO",
+                            "SyncEngine",
+                        )
+                    summary = ctx.mc_manager.get_status_summary()
+                    ctx.broadcast_event("status_changed", summary)
+                    self._send_json(200, {
+                        "result": res,
+                        "backups": ctx.sync_engine.list_backups(),
+                        "status": summary,
+                    })
+                    return
+
                 if path == "/api/admin/files/write":
                     ctx.auth_service.require_admin(token)
                     rel_path = str(body.get("path", "")).strip()
@@ -988,6 +1164,10 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
 
                 if path == "/api/admin/tunnel/download":
                     ctx.auth_service.require_admin(token)
+                    with ctx.tunnel_manager._mutex:
+                        t_running = ctx.tunnel_manager._proc is not None and ctx.tunnel_manager._proc.poll() is None
+                    if t_running or ctx.mc_manager.local_status != "idle":
+                        raise HostLockConflictError("Stop the server before downloading or updating the playit.gg agent.")
                     threading.Thread(target=ctx.tunnel_manager.download_playit_binary, daemon=True).start()
                     self._send_json(200, {"started": True})
                     return
@@ -1056,6 +1236,9 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
         def do_PUT(self) -> None:
             parsed = urlparse(self.path)
             path = parsed.path
+
+            if not self._validate_local_request():
+                return
 
             try:
                 token = self._get_token(parsed)
@@ -1132,10 +1315,12 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                             else cfg.tunnel_enabled
                         )
                         new_tunnel_provider = (
-                            str(body["tunnelProvider"]).strip()
+                            str(body["tunnelProvider"]).strip().lower()
                             if "tunnelProvider" in body
                             else cfg.tunnel_provider
                         )
+                        if new_tunnel_provider not in ("playit", "custom", "none"):
+                            raise ValueError("tunnelProvider must be 'playit', 'custom', or 'none'.")
 
                         new_idle_min = cfg.idle_shutdown_minutes
                         if "idleShutdownMinutes" in body:
@@ -1250,6 +1435,9 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
             path = parsed.path
             qs = parse_qs(parsed.query)
 
+            if not self._validate_local_request():
+                return
+
             try:
                 token = self._get_token(parsed)
 
@@ -1340,10 +1528,16 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
                         ctx.sse_clients.remove(client_q)
 
         def _serve_static(self, req_path: str) -> None:
-            clean = req_path.lstrip("/") or "index.html"
+            clean = unquote(req_path).lstrip("/") or "index.html"
             base_pub = public_dir.resolve()
             target = (base_pub / clean).resolve()
-            if not target.is_relative_to(base_pub) or not target.exists() or target.is_dir():
+            if not target.is_relative_to(base_pub):
+                self._send_json(403, {"error": "Forbidden static path."})
+                return
+            if not target.exists() or target.is_dir():
+                if Path(clean).suffix.lower() in (".js", ".css", ".png", ".svg", ".ico", ".map", ".json", ".woff2", ".wasm"):
+                    self._send_json(404, {"error": f"Static asset '{clean}' not found."})
+                    return
                 target = base_pub / "index.html"
             if not target.exists():
                 self._send_json(404, {"error": "Static UI files not found."})
@@ -1357,7 +1551,10 @@ def create_request_handler(ctx: AppContext, public_dir: Path):
             self.send_header("Content-Length", str(len(content)))
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.wfile.write(content)
+            try:
+                self.wfile.write(content)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+                self.close_connection = True
 
     return DashboardRequestHandler
 
@@ -1414,16 +1611,37 @@ if __name__ == "__main__":
     port_arg = int(os.environ.get("MINERELAY_PORT", "3080"))
     auto_open = "--no-browser" not in sys.argv
 
-    # If a previous dashboard instance is still holding port_arg, terminate it cleanly first
+    # If a previous dashboard instance is still holding port_arg, reuse it unless --replace was passed
+    replace_existing = "--replace" in sys.argv
     try:
         import socket
-        import psutil  # type: ignore
+        import urllib.request
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.3)
             port_busy = s.connect_ex(("127.0.0.1", port_arg)) == 0
 
+        if port_busy and not replace_existing:
+            try:
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port_arg}/api/setup/status",
+                    headers={"Host": f"localhost:{port_arg}"},
+                )
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    if resp.status == 200:
+                        probe = json.loads(resp.read(8192).decode("utf-8", errors="replace"))
+                        if isinstance(probe, dict) and "initialized" in probe:
+                            url = f"http://localhost:{port_arg}"
+                            print(f"MineRelay dashboard is already running at {url}.")
+                            if auto_open:
+                                webbrowser.open(url)
+                            sys.exit(0)
+            except Exception:
+                pass
+
         if port_busy:
+            import psutil  # type: ignore
+
             my_pid = os.getpid()
             my_ppid = os.getppid()
             protected_pids = {my_pid, my_ppid}
@@ -1446,6 +1664,8 @@ if __name__ == "__main__":
                         p.wait(timeout=8)
                 except Exception:
                     pass
+    except SystemExit:
+        raise
     except Exception:
         pass
 
@@ -1472,7 +1692,9 @@ if __name__ == "__main__":
                         ctx.mc_manager._stop_any_runtime_java_processes()
                         ctx.tunnel_manager.stop_tunnel()
                         if ctx.sync_engine.is_locked_by_current_machine():
-                            ctx.sync_engine.release_lock()
+                            cur_lk = ctx.sync_engine.get_lock()
+                            if cur_lk.status != "sync_failed":
+                                ctx.sync_engine.release_lock()
                     except Exception:
                         pass
 

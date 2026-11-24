@@ -1,9 +1,12 @@
+import os
+import json
 import time
 import uuid
 import hmac
 import hashlib
 import secrets
 import threading
+from pathlib import Path
 from typing import Optional, Dict, Tuple, List, Any
 from src.models import ClusterConfig, UserAccount
 from src.sync_engine import SyncEngine
@@ -23,11 +26,58 @@ class AuthService:
 
     def __init__(self, sync_engine: SyncEngine):
         self.sync_engine = sync_engine
-        # Active session token -> user_id mapping in memory
+        # Active session token -> user_id & salt mappings in memory + hashed persistence on local disk
         self._sessions: Dict[str, str] = {}
         self._session_times: Dict[str, float] = {}
+        self._session_salts: Dict[str, str] = {}
+        self._persisted_sessions: Dict[str, Dict[str, Any]] = {}
+        self._sessions_path = self.sync_engine.base_data_dir / ".sessions.json"
         self._session_mutex = threading.RLock()
-        self._config_mutex = threading.RLock()
+        self._config_mutex = getattr(sync_engine, "_config_mutex", None) or getattr(sync_engine, "_cluster_merge_lock", None) or threading.RLock()
+        self._load_persisted_sessions()
+
+    @staticmethod
+    def _hash_session_token(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _load_persisted_sessions(self) -> None:
+        now = time.time()
+        loaded: Dict[str, Dict[str, Any]] = {}
+        try:
+            if self._sessions_path.exists():
+                raw = json.loads(self._sessions_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    for tok_hash, meta in raw.items():
+                        if not isinstance(tok_hash, str) or len(tok_hash) != 64 or not isinstance(meta, dict):
+                            continue
+                        uid = str(meta.get("userId") or "").strip()
+                        ts = float(meta.get("issuedAt") or 0.0)
+                        salt = str(meta.get("salt") or "")
+                        if uid and ts > 0 and (now - ts) <= self.SESSION_TTL_SEC:
+                            loaded[tok_hash] = {"userId": uid, "issuedAt": ts, "salt": salt}
+        except Exception:
+            loaded = {}
+        with self._session_mutex:
+            self._persisted_sessions = loaded
+
+    def _save_persisted_sessions(self) -> None:
+        try:
+            with self._session_mutex:
+                payload = dict(self._persisted_sessions)
+            self._sessions_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_p = self._sessions_path.with_name(f".sessions.tmp.{os.getpid()}.{threading.get_ident()}")
+            tmp_p.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp_p, self._sessions_path)
+        except Exception:
+            pass
+
+    def clear_local_sessions(self) -> None:
+        with self._session_mutex:
+            self._sessions.clear()
+            self._session_times.clear()
+            self._session_salts.clear()
+            self._persisted_sessions.clear()
+            self._save_persisted_sessions()
 
     @staticmethod
     def generate_passkey(role: str = "member") -> str:
@@ -73,20 +123,10 @@ class AuthService:
     ) -> Tuple[ClusterConfig, UserAccount, str, str]:
         """
         Initializes a new cluster with the single Admin account.
+        Validates preconditions before mutating local shared_sync_dir or config.
         Returns (cluster_config, admin_account, raw_admin_passkey, session_token).
         """
         with self._config_mutex:
-            if shared_sync_dir:
-                prev_dir = self.sync_engine.local_config.shared_sync_dir
-                self.sync_engine.local_config.shared_sync_dir = shared_sync_dir
-                self.sync_engine.save_local_config()
-                if prev_dir != shared_sync_dir:
-                    self.sync_engine.reset_sync_state()
-
-            existing = self.sync_engine.load_cluster_config()
-            if existing and any(a.role == "admin" for a in existing.accounts):
-                raise AuthError("Cluster is already initialized with an Admin account.")
-
             admin_username = admin_username.strip() or "Admin"
             if custom_admin_passkey and custom_admin_passkey.strip():
                 raw_passkey = self.normalize_passkey(custom_admin_passkey)
@@ -94,6 +134,53 @@ class AuthService:
                     raise ValueError("Custom admin passkey must be at least 6 characters.")
             else:
                 raw_passkey = self.generate_passkey("admin")
+
+            target_dir = Path(shared_sync_dir).resolve() if (shared_sync_dir and shared_sync_dir.strip()) else self.sync_engine.shared_dir
+            if target_dir.exists() and not target_dir.is_dir():
+                raise ValueError(f"Shared sync path '{target_dir}' is not a directory.")
+
+            target_cfg_path = target_dir / "cluster-config.json"
+            target_snap_path = target_dir / "snapshots" / "latest-server.zip"
+            if target_cfg_path.exists():
+                existing_target_cfg: Optional[ClusterConfig] = None
+                try:
+                    existing_target_cfg = self.sync_engine.load_cluster_config() if target_dir == self.sync_engine.shared_dir else ClusterConfig.from_dict(
+                        __import__("json").loads(target_cfg_path.read_text(encoding="utf-8"))
+                    )
+                except Exception:
+                    existing_target_cfg = None
+                if existing_target_cfg and any(a.role == "admin" for a in existing_target_cfg.accounts):
+                    raise AuthError("Cluster is already initialized with an Admin account.")
+                if target_cfg_path.stat().st_size > 0 or existing_target_cfg is not None:
+                    raise AuthError("Cluster configuration file already exists in this Shared Folder.")
+
+            if target_snap_path.exists():
+                raise AuthError("Existing world snapshot detected in this Shared Folder — wait for cloud sync or sign in instead of overwriting it.")
+
+            marker_names = (".tmp.drivedownload", ".tmp.driveupload", ".dropbox.cache")
+            for chk_dir in (target_dir, target_dir / "snapshots"):
+                if chk_dir.exists():
+                    for m in marker_names:
+                        mp = chk_dir / m
+                        try:
+                            if mp.is_dir() and any(True for _ in mp.iterdir()):
+                                raise AuthError("Cloud sync is currently downloading or uploading files in this folder; wait for it to finish.")
+                        except OSError:
+                            pass
+
+            if shared_sync_dir and shared_sync_dir.strip():
+                prev_dir = self.sync_engine.local_config.shared_sync_dir
+                self.sync_engine.local_config.shared_sync_dir = shared_sync_dir
+                self.sync_engine.save_local_config()
+                self.sync_engine._ensure_shared_dirs()
+                if prev_dir != shared_sync_dir:
+                    self.sync_engine.reset_sync_state()
+                    self.clear_local_sessions()
+
+            existing = self.sync_engine.load_cluster_config()
+            if existing and any(a.role == "admin" for a in existing.accounts):
+                raise AuthError("Cluster is already initialized with an Admin account.")
+
             pk_hash, pk_salt = self.hash_passkey(raw_passkey)
             now = time.time()
 
@@ -115,7 +202,7 @@ class AuthService:
             self.sync_engine.save_cluster_config(config)
             self.sync_engine._ensure_default_runtime_files()
 
-        token = self.create_session(admin_account.id)
+        token = self.create_session(admin_account.id, salt=pk_salt)
         return config, admin_account, raw_passkey, token
 
     def login_with_passkey(self, passkey: str) -> Tuple[UserAccount, str]:
@@ -159,40 +246,103 @@ class AuthService:
                         matched_account.last_active_at = now
                         self.sync_engine.save_cluster_config(fresh_cfg)
                         break
-        token = self.create_session(matched_account.id)
+        token = self.create_session(matched_account.id, salt=matched_account.passkey_salt)
         return matched_account, token
 
-    def create_session(self, user_id: str) -> str:
+    def create_session(self, user_id: str, salt: str = "") -> str:
+        eff_salt = str(salt or "")
+        if not eff_salt:
+            try:
+                cfg = self.sync_engine.load_cluster_config()
+                if cfg:
+                    for acc in cfg.accounts:
+                        if acc.id == user_id:
+                            eff_salt = str(acc.passkey_salt or "")
+                            break
+            except Exception:
+                pass
         token = secrets.token_urlsafe(32)
+        tok_hash = self._hash_session_token(token)
         now = time.time()
         with self._session_mutex:
             expired = [t for t, ts in self._session_times.items() if (now - ts) > self.SESSION_TTL_SEC]
             for t in expired:
                 self._sessions.pop(t, None)
                 self._session_times.pop(t, None)
+                self._session_salts.pop(t, None)
+            expired_persisted = [
+                h for h, meta in self._persisted_sessions.items()
+                if (now - float(meta.get("issuedAt") or 0.0)) > self.SESSION_TTL_SEC
+            ]
+            for h in expired_persisted:
+                self._persisted_sessions.pop(h, None)
+
             while len(self._sessions) >= self.MAX_SESSIONS and self._session_times:
                 oldest = min(self._session_times, key=self._session_times.get)  # type: ignore[arg-type]
                 self._sessions.pop(oldest, None)
                 self._session_times.pop(oldest, None)
+                self._session_salts.pop(oldest, None)
+                self._persisted_sessions.pop(self._hash_session_token(oldest), None)
+            while len(self._persisted_sessions) >= self.MAX_SESSIONS and self._persisted_sessions:
+                oldest_h = min(
+                    self._persisted_sessions,
+                    key=lambda h: float(self._persisted_sessions[h].get("issuedAt") or 0.0),
+                )
+                self._persisted_sessions.pop(oldest_h, None)
+
             self._sessions[token] = user_id
             self._session_times[token] = now
+            self._session_salts[token] = eff_salt
+            self._persisted_sessions[tok_hash] = {
+                "userId": user_id,
+                "issuedAt": now,
+                "salt": eff_salt,
+            }
+            self._save_persisted_sessions()
         return token
 
     def logout_session(self, token: str) -> None:
+        if not token:
+            return
+        tok_hash = self._hash_session_token(token)
         with self._session_mutex:
             self._sessions.pop(token, None)
             self._session_times.pop(token, None)
+            self._session_salts.pop(token, None)
+            if tok_hash in self._persisted_sessions:
+                self._persisted_sessions.pop(tok_hash, None)
+                self._save_persisted_sessions()
+
+    def _revoke_token_locked(self, token: str) -> None:
+        tok_hash = self._hash_session_token(token)
+        self._sessions.pop(token, None)
+        self._session_times.pop(token, None)
+        self._session_salts.pop(token, None)
+        if tok_hash in self._persisted_sessions:
+            self._persisted_sessions.pop(tok_hash, None)
+            self._save_persisted_sessions()
 
     def get_user_by_token(self, token: Optional[str]) -> Optional[UserAccount]:
         if not token:
             return None
         now = time.time()
+        tok_hash = self._hash_session_token(token)
         with self._session_mutex:
             user_id = self._sessions.get(token)
             issued_at = self._session_times.get(token, now)
+            sess_salt = self._session_salts.get(token, "")
+            if not user_id:
+                pmeta = self._persisted_sessions.get(tok_hash)
+                if pmeta:
+                    user_id = str(pmeta.get("userId") or "")
+                    issued_at = float(pmeta.get("issuedAt") or 0.0)
+                    sess_salt = str(pmeta.get("salt") or "")
+                    if user_id and (now - issued_at) <= self.SESSION_TTL_SEC:
+                        self._sessions[token] = user_id
+                        self._session_times[token] = issued_at
+                        self._session_salts[token] = sess_salt
             if user_id and (now - issued_at) > self.SESSION_TTL_SEC:
-                self._sessions.pop(token, None)
-                self._session_times.pop(token, None)
+                self._revoke_token_locked(token)
                 user_id = None
         if not user_id:
             return None
@@ -205,11 +355,15 @@ class AuthService:
                 return None
         for acc in config.accounts:
             if acc.id == user_id:
+                # Reject sessions whose passkey was rotated on another PC
+                if (sess_salt or acc.passkey_salt) and not hmac.compare_digest(str(sess_salt or ""), str(acc.passkey_salt or "")):
+                    with self._session_mutex:
+                        self._revoke_token_locked(token)
+                    return None
                 return acc
         # User was revoked by Admin! Remove session immediately.
         with self._session_mutex:
-            self._sessions.pop(token, None)
-            self._session_times.pop(token, None)
+            self._revoke_token_locked(token)
         return None
 
     def require_auth(self, token: Optional[str]) -> UserAccount:
@@ -356,8 +510,13 @@ class AuthService:
             target.passkey_hint = self.make_passkey_hint(new_raw_passkey)
             self.sync_engine.save_cluster_config(config)
 
-        # Invalidate sessions for that user (preserving current admin_token if Admin rotated their own key)
+        # Invalidate sessions for that user (preserving & updating salt on current admin_token if Admin rotated their own key)
+        admin_tok_hash = self._hash_session_token(admin_token) if (admin_token and target.role == "admin") else ""
         with self._session_mutex:
+            if admin_token and target.role == "admin" and admin_token in self._sessions and self._sessions[admin_token] == target_user_id:
+                self._session_salts[admin_token] = pk_salt
+                if admin_tok_hash in self._persisted_sessions:
+                    self._persisted_sessions[admin_tok_hash]["salt"] = pk_salt
             to_remove = [
                 tok
                 for tok, uid in self._sessions.items()
@@ -366,6 +525,14 @@ class AuthService:
             for tok in to_remove:
                 self._sessions.pop(tok, None)
                 self._session_times.pop(tok, None)
+                self._session_salts.pop(tok, None)
+            bad_hashes = [
+                h for h, meta in self._persisted_sessions.items()
+                if meta.get("userId") == target_user_id and h != admin_tok_hash
+            ]
+            for h in bad_hashes:
+                self._persisted_sessions.pop(h, None)
+            self._save_persisted_sessions()
 
         return target, new_raw_passkey
 
@@ -394,7 +561,7 @@ class AuthService:
             if not isinstance(config.deleted_accounts, dict):
                 config.deleted_accounts = {}
             now = time.time()
-            config.deleted_accounts[target_user_id] = now
+            config.deleted_accounts[target_user_id] = max(now, float(target.created_at or 0.0) + 1.0)
             if len(config.deleted_accounts) > 200:
                 cutoff = now - (30 * 86400)
                 config.deleted_accounts = {
@@ -408,4 +575,12 @@ class AuthService:
             for tok in to_remove:
                 self._sessions.pop(tok, None)
                 self._session_times.pop(tok, None)
+                self._session_salts.pop(tok, None)
+            bad_hashes = [
+                h for h, meta in self._persisted_sessions.items()
+                if meta.get("userId") == target_user_id
+            ]
+            for h in bad_hashes:
+                self._persisted_sessions.pop(h, None)
+            self._save_persisted_sessions()
         return True

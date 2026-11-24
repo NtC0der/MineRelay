@@ -1,3 +1,4 @@
+import math
 import uuid
 import socket
 import time
@@ -9,7 +10,7 @@ LOCK_STALE_TIMEOUT_SEC = 240
 AUTO_SYNC_DEFAULT_MINUTES = 10
 AUTO_SYNC_MAX_MINUTES = 1440
 
-APP_VERSION = "1.0.6"
+APP_VERSION = "1.0.7"
 GITHUB_REPO = "NtC0der/MineRelay"
 GITHUB_RELEASES_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
@@ -35,7 +36,8 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
     if val is None or isinstance(val, bool):
         return default
     try:
-        return float(val)
+        res = float(val)
+        return res if math.isfinite(res) else default
     except (ValueError, TypeError):
         return default
 
@@ -64,6 +66,10 @@ class UserAccount:
 
     def to_public_dict(self) -> Dict[str, Any]:
         raw_hint = (self.passkey_hint or "").strip().upper()
+        for prefix in ("MC-ADMIN-", "MC-HOST-"):
+            if raw_hint.startswith(prefix) and len(raw_hint) > len(prefix):
+                raw_hint = raw_hint[len(prefix):]
+                break
         clean_chars = [c for c in raw_hint if c not in ("•", ".")]
         first_two = "".join(clean_chars[:2])
         short_hint = f"{first_two}••••" if first_two else "••••"
@@ -249,11 +255,12 @@ class ClusterConfig:
             for acc in raw_accounts:
                 if not isinstance(acc, dict):
                     continue
+                acc_role = _safe_str(acc.get("role"), "member").strip().lower()
                 accounts.append(
                     UserAccount(
-                        id=_safe_str(acc.get("id"), str(uuid.uuid4())),
+                        id=_safe_str(acc.get("id"), "").strip() or str(uuid.uuid4()),
                         username=_safe_str(acc.get("username"), "Member"),
-                        role=_safe_str(acc.get("role"), "member") or "member",
+                        role="admin" if acc_role == "admin" else "member",
                         passkey_hash=_safe_str(acc.get("passkey_hash", acc.get("passkeyHash")), ""),
                         passkey_salt=_safe_str(acc.get("passkey_salt", acc.get("passkeySalt")), ""),
                         passkey_hint=_safe_str(acc.get("passkey_hint", acc.get("passkeyHint")), ""),

@@ -11,6 +11,7 @@ import platform
 import threading
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Optional, Callable, Dict, List, Any, Tuple
@@ -191,13 +192,31 @@ def _build_version_check_payload(
             source = "cluster"
 
     outdated = is_version_older(current_ver, effective_latest) if effective_latest else False
+    if source == "cluster":
+        release_url = GITHUB_RELEASES_URL
+        download_url = GITHUB_DOWNLOAD_URL
+        release_name = f"MineRelay v{effective_latest}"
+        asset_name = "MineRelay.exe"
+        asset_size = 0
+        asset_sha256 = ""
+    else:
+        release_url = str((gh_data or {}).get("releaseUrl") or GITHUB_RELEASES_URL)
+        download_url = str((gh_data or {}).get("downloadUrl") or GITHUB_DOWNLOAD_URL)
+        release_name = str((gh_data or {}).get("releaseName") or (f"MineRelay v{effective_latest}" if effective_latest else ""))
+        asset_name = str((gh_data or {}).get("assetName") or "MineRelay.exe")
+        asset_size = int((gh_data or {}).get("assetSize") or 0)
+        asset_sha256 = str((gh_data or {}).get("assetSha256") or "").strip().lower()
+
     return {
         "currentVersion": current_ver,
         "latestVersion": effective_latest,
         "isOutdated": outdated,
-        "releaseUrl": str((gh_data or {}).get("releaseUrl") or GITHUB_RELEASES_URL),
-        "downloadUrl": str((gh_data or {}).get("downloadUrl") or GITHUB_DOWNLOAD_URL),
-        "releaseName": str((gh_data or {}).get("releaseName") or (f"MineRelay v{effective_latest}" if effective_latest else "")),
+        "releaseUrl": release_url,
+        "downloadUrl": download_url,
+        "releaseName": release_name,
+        "assetName": asset_name,
+        "assetSize": asset_size,
+        "assetSha256": asset_sha256,
         "checkedAt": float((gh_data or {}).get("checkedAt") or 0.0),
         "source": source,
         "error": str((gh_data or {}).get("error") or ""),
@@ -223,20 +242,37 @@ def _fetch_latest_github_release_sync(api_url: str, current_ver: str) -> Dict[st
         release_url = str(payload.get("html_url") or GITHUB_RELEASES_URL).strip() or GITHUB_RELEASES_URL
         release_name = str(payload.get("name") or tag or "").strip()
         download_url = GITHUB_DOWNLOAD_URL
+        asset_name = "MineRelay.exe"
+        asset_size = 0
+        asset_sha256 = ""
         assets = payload.get("assets")
         if isinstance(assets, list):
             for asset in assets:
                 if isinstance(asset, dict):
-                    aname = str(asset.get("name") or "").lower()
+                    aname_raw = str(asset.get("name") or "").strip()
+                    aname = aname_raw.lower()
                     burl = str(asset.get("browser_download_url") or "").strip()
                     if burl and (aname.endswith(".exe") or "minerelay" in aname):
                         download_url = burl
+                        asset_name = aname_raw or "MineRelay.exe"
+                        try:
+                            asset_size = max(0, int(asset.get("size") or 0))
+                        except (ValueError, TypeError):
+                            asset_size = 0
+                        raw_digest = str(asset.get("digest") or "").strip().lower()
+                        if raw_digest.startswith("sha256:"):
+                            cand_hex = raw_digest.split(":", 1)[1].strip()
+                            if len(cand_hex) == 64 and all(c in "0123456789abcdef" for c in cand_hex):
+                                asset_sha256 = cand_hex
                         break
         return {
             "latestVersion": latest_ver,
             "releaseUrl": release_url,
             "downloadUrl": download_url,
             "releaseName": release_name,
+            "assetName": asset_name,
+            "assetSize": asset_size,
+            "assetSha256": asset_sha256,
             "checkedAt": now,
             "error": "",
         }
@@ -246,6 +282,9 @@ def _fetch_latest_github_release_sync(api_url: str, current_ver: str) -> Dict[st
             "releaseUrl": GITHUB_RELEASES_URL,
             "downloadUrl": GITHUB_DOWNLOAD_URL,
             "releaseName": "",
+            "assetName": "MineRelay.exe",
+            "assetSize": 0,
+            "assetSha256": "",
             "checkedAt": now,
             "error": str(e),
         }
@@ -326,14 +365,396 @@ def check_latest_minerelay_release(force: bool = False, cluster_latest: str = ""
     return _build_version_check_payload(current_ver, cached_snap, cluster_latest=cluster_latest)
 
 
+class AutoUpdateManager:
+    """
+    Background GitHub release binary auto-downloader & safe Windows self-staging manager.
+    Downloads verified MineRelay-v<ver>.exe binaries into `<data>/updates/` and stages atomic
+    executable replacement when running frozen on Windows without interrupting active hosting.
+    """
+
+    ERROR_COOLDOWN_SEC = 120.0
+
+    def __init__(self, base_data_dir: Path, event_callback: Optional[Callable[[str, Any], None]] = None):
+        self.base_data_dir = Path(base_data_dir).resolve()
+        self.updates_dir = self.base_data_dir / "updates"
+        self.updates_dir.mkdir(parents=True, exist_ok=True)
+        self.event_callback = event_callback
+        self._lock = threading.RLock()
+        self._last_emit_ts: float = 0.0
+        self._last_emit_pct: int = -1
+        self._last_error_at: float = 0.0
+        self._last_error_ver: str = ""
+        self._staged_version: str = ""
+        self._state: Dict[str, Any] = {
+            "enabled": self.is_auto_download_allowed(),
+            "status": "idle",  # idle | downloading | downloaded | ready_to_restart | error
+            "targetVersion": "",
+            "progress": 0,
+            "downloadedBytes": 0,
+            "totalBytes": 0,
+            "downloadedPath": "",
+            "sha256": "",
+            "stagedToExe": False,
+            "canRestartApply": bool(getattr(sys, "frozen", False) and sys.platform.startswith("win")),
+            "error": "",
+            "updatedAt": 0.0,
+        }
+        self._cleanup_old_exe_leftovers()
+
+    @staticmethod
+    def _cleanup_old_exe_leftovers() -> None:
+        if getattr(sys, "frozen", False) and sys.platform.startswith("win"):
+            try:
+                cur_exe = Path(sys.executable).resolve()
+                old_exe = cur_exe.parent / f"{cur_exe.stem}.old{cur_exe.suffix}"
+                if old_exe.exists():
+                    old_exe.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def is_auto_download_allowed() -> bool:
+        if os.environ.get("MINERELAY_AUTO_DOWNLOAD_UPDATES", "").strip() == "0":
+            return False
+        if os.environ.get("MINERELAY_TEST_MODE") == "1":
+            return os.environ.get("MINERELAY_AUTO_UPDATE_TEST", "").strip() == "1"
+        return True
+
+    def get_state(self) -> Dict[str, Any]:
+        with self._lock:
+            snap = dict(self._state)
+            snap["enabled"] = self.is_auto_download_allowed()
+            return snap
+
+    def _emit_state(self, force: bool = False) -> None:
+        with self._lock:
+            now = time.monotonic()
+            pct = int(self._state.get("progress") or 0)
+            if not force and abs(pct - self._last_emit_pct) < 4 and (now - self._last_emit_ts) < 0.45:
+                return
+            self._last_emit_ts = now
+            self._last_emit_pct = pct
+            snap = dict(self._state)
+            snap["enabled"] = self.is_auto_download_allowed()
+        if self.event_callback:
+            try:
+                self.event_callback("update_status", snap)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _verify_downloaded_exe(path: Path, expected_size: int = 0, expected_sha256: str = "") -> str:
+        if not path.exists() or not path.is_file():
+            raise RuntimeError("Downloaded update binary is missing.")
+        st_size = path.stat().st_size
+        min_bytes = 64 if (os.environ.get("MINERELAY_TEST_MODE") == "1" or os.environ.get("MINERELAY_AUTO_UPDATE_TEST") == "1") else 65536
+        if st_size < min_bytes:
+            raise RuntimeError(f"Downloaded update binary is unexpectedly small ({st_size} bytes).")
+        if expected_size > 0 and st_size != expected_size:
+            raise RuntimeError(f"Downloaded update size mismatch (expected {expected_size} bytes, got {st_size}).")
+        if sys.platform.startswith("win") or path.suffix.lower() == ".exe":
+            with open(path, "rb") as f:
+                magic = f.read(2)
+            if magic != b"MZ":
+                raise RuntimeError("Downloaded file is not a valid Windows PE (.exe) binary.")
+        actual_sha = _file_digest_hex(path, "sha256")
+        exp_sha = (expected_sha256 or "").strip().lower()
+        if len(exp_sha) == 64 and actual_sha != exp_sha:
+            raise RuntimeError(f"Downloaded update SHA-256 mismatch (expected {exp_sha[:12]}..., got {actual_sha[:12]}...).")
+        return actual_sha
+
+    def _try_stage_frozen_exe(self, downloaded_file: Path, target_exe_override: Optional[Path] = None) -> bool:
+        if target_exe_override is None:
+            if not (getattr(sys, "frozen", False) and sys.platform.startswith("win")):
+                return False
+            target_exe = Path(sys.executable).resolve()
+        else:
+            target_exe = Path(target_exe_override).resolve()
+        if not sys.platform.startswith("win") or not target_exe.exists():
+            return False
+        tmp_staged = target_exe.parent / f".{target_exe.name}.update.{os.getpid()}.tmp"
+        old_exe = target_exe.parent / f"{target_exe.stem}.old{target_exe.suffix}"
+        try:
+            shutil.copyfile(downloaded_file, tmp_staged)
+            try:
+                if old_exe.exists():
+                    old_exe.unlink(missing_ok=True)
+            except OSError:
+                pass
+            target_exe.replace(old_exe)
+            try:
+                tmp_staged.replace(target_exe)
+                return True
+            except Exception:
+                try:
+                    if not target_exe.exists() and old_exe.exists():
+                        old_exe.replace(target_exe)
+                except OSError:
+                    pass
+                return False
+        except OSError:
+            return False
+        finally:
+            try:
+                if tmp_staged.exists():
+                    tmp_staged.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _prune_old_updates(self, keep_name: str = "") -> None:
+        try:
+            candidates = sorted(
+                self.updates_dir.glob("MineRelay-v*.exe"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            kept = 0
+            for p in candidates:
+                if keep_name and p.name == keep_name:
+                    kept += 1
+                    continue
+                if kept < 2:
+                    kept += 1
+                    continue
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def get_ready_update_path(self) -> Optional[Path]:
+        with self._lock:
+            p_str = str(self._state.get("downloadedPath") or "").strip()
+            status = str(self._state.get("status") or "")
+        if not p_str or status not in ("downloaded", "ready_to_restart"):
+            return None
+        p = Path(p_str)
+        return p if (p.exists() and p.is_file()) else None
+
+    def ensure_update_downloaded_async(self, version_check: Dict[str, Any], force: bool = False) -> Dict[str, Any]:
+        is_outdated = bool(version_check.get("isOutdated"))
+        latest_ver = str(version_check.get("latestVersion") or "").strip()
+        dl_url = str(version_check.get("downloadUrl") or "").strip()
+        exp_size = int(version_check.get("assetSize") or 0)
+        exp_sha256 = str(version_check.get("assetSha256") or "").strip().lower()
+
+        if (not is_outdated) or (not latest_ver) or (not re.match(r"^https?://", dl_url, re.IGNORECASE)):
+            with self._lock:
+                if self._state.get("status") not in ("downloading",):
+                    self._state.update({
+                        "status": "idle",
+                        "targetVersion": "",
+                        "progress": 0,
+                        "downloadedBytes": 0,
+                        "totalBytes": 0,
+                        "downloadedPath": "",
+                        "sha256": "",
+                        "stagedToExe": False,
+                        "error": "",
+                        "updatedAt": time.time(),
+                    })
+            return self.get_state()
+
+        if not force and not self.is_auto_download_allowed():
+            return self.get_state()
+
+        safe_ver = "".join(c for c in latest_ver if c.isalnum() or c in (".", "-", "_")) or "latest"
+        target_file = self.updates_dir / f"MineRelay-v{safe_ver}.exe"
+
+        with self._lock:
+            if self._state.get("status") == "downloading" and self._state.get("targetVersion") == latest_ver:
+                return self.get_state()
+            if (
+                not force
+                and self._state.get("status") == "error"
+                and self._last_error_ver == latest_ver
+                and (time.time() - self._last_error_at) < self.ERROR_COOLDOWN_SEC
+            ):
+                return self.get_state()
+
+        if target_file.exists():
+            try:
+                verified_sha = self._verify_downloaded_exe(target_file, expected_size=exp_size, expected_sha256=exp_sha256)
+                with self._lock:
+                    staged = bool(self._state.get("stagedToExe") and self._staged_version == latest_ver)
+                if not staged and getattr(sys, "frozen", False) and sys.platform.startswith("win"):
+                    staged = self._try_stage_frozen_exe(target_file)
+                    if staged:
+                        with self._lock:
+                            self._staged_version = latest_ver
+                sz = target_file.stat().st_size
+                with self._lock:
+                    self._state.update({
+                        "status": "ready_to_restart" if staged else "downloaded",
+                        "targetVersion": latest_ver,
+                        "progress": 100,
+                        "downloadedBytes": sz,
+                        "totalBytes": sz,
+                        "downloadedPath": str(target_file),
+                        "sha256": verified_sha,
+                        "stagedToExe": staged,
+                        "canRestartApply": bool(getattr(sys, "frozen", False) and sys.platform.startswith("win")),
+                        "error": "",
+                        "updatedAt": time.time(),
+                    })
+                self._emit_state(force=True)
+                return self.get_state()
+            except Exception:
+                try:
+                    target_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        with self._lock:
+            self._last_emit_pct = -1
+            self._state.update({
+                "status": "downloading",
+                "targetVersion": latest_ver,
+                "progress": 0,
+                "downloadedBytes": 0,
+                "totalBytes": exp_size,
+                "downloadedPath": "",
+                "sha256": "",
+                "stagedToExe": False,
+                "canRestartApply": bool(getattr(sys, "frozen", False) and sys.platform.startswith("win")),
+                "error": "",
+                "updatedAt": time.time(),
+            })
+        self._emit_state(force=True)
+
+        def _worker() -> None:
+            tmp_part = self.updates_dir / f".MineRelay-v{safe_ver}.part.{os.getpid()}.{threading.get_ident()}"
+            try:
+                self.updates_dir.mkdir(parents=True, exist_ok=True)
+
+                def _on_dl_prog(pct: int, done_b: int, total_b: int) -> None:
+                    with self._lock:
+                        self._state.update({
+                            "status": "downloading",
+                            "progress": max(0, min(99, int(pct))),
+                            "downloadedBytes": int(done_b),
+                            "totalBytes": int(total_b or exp_size),
+                            "updatedAt": time.time(),
+                        })
+                    self._emit_state(force=False)
+
+                _download_to_file_verified(
+                    dl_url,
+                    tmp_part,
+                    expected_sha256=exp_sha256,
+                    timeout=120,
+                    attempts=3,
+                    progress_cb=_on_dl_prog,
+                )
+                verified_sha = self._verify_downloaded_exe(
+                    tmp_part,
+                    expected_size=exp_size,
+                    expected_sha256=exp_sha256,
+                )
+                _os_replace_retry(tmp_part, target_file)
+                self._prune_old_updates(keep_name=target_file.name)
+
+                staged = self._try_stage_frozen_exe(target_file)
+                if staged:
+                    with self._lock:
+                        self._staged_version = latest_ver
+                final_sz = target_file.stat().st_size
+                with self._lock:
+                    self._last_error_at = 0.0
+                    self._last_error_ver = ""
+                    self._state.update({
+                        "status": "ready_to_restart" if staged else "downloaded",
+                        "targetVersion": latest_ver,
+                        "progress": 100,
+                        "downloadedBytes": final_sz,
+                        "totalBytes": final_sz,
+                        "downloadedPath": str(target_file),
+                        "sha256": verified_sha,
+                        "stagedToExe": staged,
+                        "canRestartApply": bool(getattr(sys, "frozen", False) and sys.platform.startswith("win")),
+                        "error": "",
+                        "updatedAt": time.time(),
+                    })
+                self._emit_state(force=True)
+            except Exception as e:
+                with self._lock:
+                    self._last_error_at = time.time()
+                    self._last_error_ver = latest_ver
+                    self._state.update({
+                        "status": "error",
+                        "targetVersion": latest_ver,
+                        "progress": 0,
+                        "error": str(e),
+                        "updatedAt": time.time(),
+                    })
+                self._emit_state(force=True)
+            finally:
+                try:
+                    if tmp_part.exists():
+                        tmp_part.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+        threading.Thread(target=_worker, daemon=True, name="AutoUpdateDownloader").start()
+        return self.get_state()
+
+    @staticmethod
+    def spawn_windows_relaunch_helper(
+        target_exe: Path,
+        downloaded_update: Path,
+        staged_already: bool = False,
+        extra_args: Optional[List[str]] = None,
+    ) -> None:
+        if not sys.platform.startswith("win"):
+            raise RuntimeError("Self-replace relaunch is only supported on Windows executables.")
+        cur_pid = os.getpid()
+        tgt_esc = str(Path(target_exe).resolve()).replace("'", "''")
+        upd_esc = str(Path(downloaded_update).resolve()).replace("'", "''")
+        args_list = [str(a).replace("'", "''") for a in (extra_args or [])]
+        arg_clause = ""
+        if args_list:
+            joined = ", ".join(f"'{a}'" for a in args_list)
+            arg_clause = f" -ArgumentList @({joined})"
+        copy_block = (
+            ""
+            if staged_already
+            else f"Copy-Item -LiteralPath '{upd_esc}' -Destination '{tgt_esc}' -Force; "
+        )
+        ps_script = (
+            f"$p = {cur_pid}; "
+            f"for ($i = 0; $i -lt 80; $i++) {{ "
+            f"if (-not (Get-Process -Id $p -ErrorAction SilentlyContinue)) {{ break }}; "
+            f"Start-Sleep -Milliseconds 250 }}; "
+            f"try {{ {copy_block}"
+            f"Start-Process -FilePath '{tgt_esc}'{arg_clause} }} catch {{}}"
+        )
+        flags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+
+
 def get_java_major_version(java_cmd: str) -> int:
     """Returns the major version of a Java binary (e.g. 25, 21, 17), or 0 if invalid."""
     try:
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
         res = subprocess.run(
             [java_cmd, "-version"],
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=5,
             creationflags=creationflags,
         )
@@ -359,9 +780,12 @@ def required_java_major_for_mc(mc_version: str) -> int:
     return 21
 
 
+_JRE_INSTALL_LOCK = threading.Lock()
+
+
 def find_portable_java(bin_dir: Path, min_major: int = 21) -> Optional[str]:
     """
-    Looks for a portable java.exe inside data/bin/jre25 or data/bin/jre21
+    Looks for a verified portable java.exe inside data/bin/jre25 or data/bin/jre21
     that satisfies `min_major`. Always prefers Java 25 if present.
     """
     exe_name = "java.exe" if sys.platform.startswith("win") else "java"
@@ -373,7 +797,9 @@ def find_portable_java(bin_dir: Path, min_major: int = 21) -> Optional[str]:
             continue
         for candidate in jre_root.rglob(exe_name):
             if candidate.parent.name == "bin":
-                return str(candidate.resolve())
+                resolved = str(candidate.resolve())
+                if get_java_major_version(resolved) >= min_major:
+                    return resolved
     return None
 
 
@@ -384,108 +810,114 @@ def ensure_portable_java(
 ) -> str:
     """
     Ensures a Portable Java Runtime (>= min_major, defaulting to Java 25 for MC 26.3 support)
-    is available inside data/bin/jre25.
+    is available inside data/bin/jre25. Serialized via _JRE_INSTALL_LOCK.
     """
-    existing = find_portable_java(bin_dir, min_major=min_major)
-    if existing:
+    with _JRE_INSTALL_LOCK:
+        existing = find_portable_java(bin_dir, min_major=min_major)
+        if existing:
+            if log_fn:
+                log_fn(f"Portable Java Runtime ready at: {existing}")
+            return existing
+
+        target_major = 25 if min_major >= 22 else 21
+        os_name = "windows" if sys.platform.startswith("win") else ("mac" if sys.platform == "darwin" else "linux")
+        machine = platform.machine().lower()
+        arch = "aarch64" if machine in ("arm64", "aarch64") else "x64"
+        api_url = ADOPTIUM_JRE_API_TMPL.format(major=target_major, os_name=os_name, arch=arch)
+        folder_name = f"jre{target_major}"
+
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        jre_root = bin_dir / folder_name
+        ext = ".zip" if os_name == "windows" else ".tar.gz"
+        archive_path = bin_dir / f"temurin{target_major}-jre.{os.getpid()}.{threading.get_ident()}{ext}"
+        staging_root = bin_dir / f".jre{target_major}_staging_{os.getpid()}_{threading.get_ident()}"
+
         if log_fn:
-            log_fn(f"Portable Java Runtime ready at: {existing}")
-        return existing
-
-    target_major = 25 if min_major >= 22 else 21
-    os_name = "windows" if sys.platform.startswith("win") else ("mac" if sys.platform == "darwin" else "linux")
-    machine = platform.machine().lower()
-    arch = "aarch64" if machine in ("arm64", "aarch64") else "x64"
-    api_url = ADOPTIUM_JRE_API_TMPL.format(major=target_major, os_name=os_name, arch=arch)
-    folder_name = f"jre{target_major}"
-
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    jre_root = bin_dir / folder_name
-    ext = ".zip" if os_name == "windows" else ".tar.gz"
-    archive_path = bin_dir / f"temurin{target_major}-jre.{os.getpid()}.{threading.get_ident()}{ext}"
-    staging_root = bin_dir / f".jre{target_major}_staging_{os.getpid()}_{threading.get_ident()}"
-
-    if log_fn:
-        log_fn(
-            f"Downloading Portable Java {target_major} Runtime (Eclipse Temurin {target_major} JRE for Minecraft)... (~53 MB)"
-        )
-
-    last_pct = [-1]
-
-    def _on_progress(pct: int, downloaded: int, total: int) -> None:
-        if pct // 20 > last_pct[0] // 20 and log_fn:
-            last_pct[0] = pct
             log_fn(
-                f"Downloading Portable Java {target_major} JRE: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
+                f"Downloading Portable Java {target_major} Runtime (Eclipse Temurin {target_major} JRE for Minecraft)... (~53 MB)"
             )
 
-    try:
-        _download_to_file_verified(
-            api_url,
-            archive_path,
-            timeout=120,
-            attempts=3,
-            progress_cb=_on_progress,
-        )
+        last_pct = [-1]
 
-        if log_fn:
-            log_fn(f"Extracting Portable Java {target_major} JRE...")
-        if staging_root.exists():
-            shutil.rmtree(staging_root, ignore_errors=True)
-        staging_root.mkdir(parents=True, exist_ok=True)
-        staging_resolved = staging_root.resolve()
-        if os_name == "windows":
-            with zipfile.ZipFile(archive_path, "r") as zf:
-                for member in zf.infolist():
-                    target_path = (staging_root / member.filename).resolve()
-                    if not (target_path == staging_resolved or target_path.is_relative_to(staging_resolved)):
-                        raise ValueError(f"Zip path traversal detected in JRE archive: {member.filename}")
-                    zf.extract(member, staging_root)
-        else:
-            with tarfile.open(archive_path, "r:gz") as tf:
-                for member in tf.getmembers():
-                    target_path = (staging_root / member.name).resolve()
-                    if not (target_path == staging_resolved or target_path.is_relative_to(staging_resolved)):
-                        raise ValueError(f"Tar path traversal detected in JRE archive: {member.name}")
-                    if member.issym() or member.islnk():
-                        link_target = (target_path.parent / member.linkname).resolve()
-                        if not link_target.is_relative_to(staging_resolved):
-                            raise ValueError(f"Unsafe symlink in JRE archive: {member.name}")
-                tf.extractall(staging_root)
+        def _on_progress(pct: int, downloaded: int, total: int) -> None:
+            if pct // 20 > last_pct[0] // 20 and log_fn:
+                last_pct[0] = pct
+                log_fn(
+                    f"Downloading Portable Java {target_major} JRE: {pct}% ({round(downloaded / (1024*1024), 1)} MB)"
+                )
 
-        exe_name = "java.exe" if sys.platform.startswith("win") else "java"
-        staged_java = next(
-            (c for c in staging_root.rglob(exe_name) if c.parent.name == "bin"),
-            None,
-        )
-        if not staged_java:
-            raise RuntimeError(f"Downloaded Java {target_major} archive but could not locate bin/{exe_name} inside.")
-
-        if jre_root.exists():
-            shutil.rmtree(jre_root, ignore_errors=True)
-        _os_replace_retry(staging_root, jre_root)
-    finally:
         try:
-            if archive_path.exists():
-                archive_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
+            _download_to_file_verified(
+                api_url,
+                archive_path,
+                timeout=120,
+                attempts=3,
+                progress_cb=_on_progress,
+            )
+
+            if log_fn:
+                log_fn(f"Extracting Portable Java {target_major} JRE...")
             if staging_root.exists():
                 shutil.rmtree(staging_root, ignore_errors=True)
-        except OSError:
-            pass
+            staging_root.mkdir(parents=True, exist_ok=True)
+            staging_resolved = staging_root.resolve()
+            if os_name == "windows":
+                with zipfile.ZipFile(archive_path, "r") as zf:
+                    for member in zf.infolist():
+                        target_path = (staging_root / member.filename).resolve()
+                        if not (target_path == staging_resolved or target_path.is_relative_to(staging_resolved)):
+                            raise ValueError(f"Zip path traversal detected in JRE archive: {member.filename}")
+                        zf.extract(member, staging_root)
+            else:
+                with tarfile.open(archive_path, "r:gz") as tf:
+                    for member in tf.getmembers():
+                        target_path = (staging_root / member.name).resolve()
+                        if not (target_path == staging_resolved or target_path.is_relative_to(staging_resolved)):
+                            raise ValueError(f"Tar path traversal detected in JRE archive: {member.name}")
+                        if member.issym():
+                            link_target = (target_path.parent / member.linkname).resolve()
+                            if not link_target.is_relative_to(staging_resolved):
+                                raise ValueError(f"Unsafe symlink in JRE archive: {member.name}")
+                        elif member.islnk():
+                            link_target = (staging_root / member.linkname).resolve()
+                            if not link_target.is_relative_to(staging_resolved):
+                                raise ValueError(f"Unsafe hardlink in JRE archive: {member.name}")
+                    tf.extractall(staging_root)
 
-    found = find_portable_java(bin_dir, min_major=min_major)
-    if not found:
-        raise RuntimeError(f"Downloaded Java {target_major} archive but could not locate bin/java inside.")
-    if log_fn:
-        log_fn(f"Portable Java {target_major} JRE ready at: {found}")
-    return found
+            exe_name = "java.exe" if sys.platform.startswith("win") else "java"
+            staged_java = next(
+                (c for c in staging_root.rglob(exe_name) if c.parent.name == "bin"),
+                None,
+            )
+            if not staged_java:
+                raise RuntimeError(f"Downloaded Java {target_major} archive but could not locate bin/{exe_name} inside.")
+
+            if jre_root.exists():
+                shutil.rmtree(jre_root, ignore_errors=True)
+            _os_replace_retry(staging_root, jre_root)
+        finally:
+            try:
+                if archive_path.exists():
+                    archive_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            try:
+                if staging_root.exists():
+                    shutil.rmtree(staging_root, ignore_errors=True)
+            except OSError:
+                pass
+
+        found = find_portable_java(bin_dir, min_major=min_major)
+        if not found:
+            raise RuntimeError(f"Downloaded Java {target_major} archive failed verification or could not locate bin/{exe_name}.")
+        if log_fn:
+            log_fn(f"Portable Java {target_major} JRE ready at: {found}")
+        return found
 
 
 _VERSIONS_CACHE: Optional[Dict[str, Any]] = None
 _VERSIONS_CACHE_TS: float = 0.0
+_VERSIONS_CACHE_FAIL_TS: float = 0.0
 _VERSIONS_CACHE_LOCK = threading.Lock()
 
 
@@ -493,10 +925,10 @@ def fetch_live_minecraft_versions() -> Dict[str, Any]:
     """
     Queries Mojang's official version_manifest_v2.json and PaperMC's Fill v3 API
     to return the latest release version and supported version lists.
-    Caches the live result for 10 minutes so Admin tab loads are instant.
+    Caches live results for 10 minutes and offline failures for 45 seconds.
     Falls back to a curated list including 26.3 if offline.
     """
-    global _VERSIONS_CACHE, _VERSIONS_CACHE_TS
+    global _VERSIONS_CACHE, _VERSIONS_CACHE_TS, _VERSIONS_CACHE_FAIL_TS
     import time as _time
 
     fallback_releases = [
@@ -531,6 +963,8 @@ def fetch_live_minecraft_versions() -> Dict[str, Any]:
     with _VERSIONS_CACHE_LOCK:
         if _VERSIONS_CACHE is not None and (now - _VERSIONS_CACHE_TS) < 600:
             return dict(_VERSIONS_CACHE)
+        if _VERSIONS_CACHE_FAIL_TS > 0 and (now - _VERSIONS_CACHE_FAIL_TS) < 45:
+            return dict(result)
 
     mojang_ok = False
     paper_ok = False
@@ -576,19 +1010,28 @@ def fetch_live_minecraft_versions() -> Dict[str, Any]:
         elif isinstance(versions_map, list):
             paper_list = [str(v) for v in versions_map if "-" not in str(v)]
         if paper_list:
-            # Prefer newest-first ordering using Mojang release order when available
-            if mojang_ok and result["vanilla"]:
-                order_idx = {v: i for i, v in enumerate(result["vanilla"])}
-                paper_list.sort(key=lambda v: (0, order_idx[v]) if v in order_idx else (1, 0))
+            # Prefer newest-first ordering using Mojang release order, falling back to descending semver tuple
+            order_idx = {v: i for i, v in enumerate(result["vanilla"])} if (mojang_ok and result["vanilla"]) else {}
+
+            def _paper_sort_key(ver_str: str) -> Tuple[Any, ...]:
+                if ver_str in order_idx:
+                    return (0, order_idx[ver_str], (0, 0, 0))
+                sv = parse_semver(ver_str)[:3]
+                return (1, 0, (-sv[0], -sv[1], -sv[2]))
+
+            paper_list.sort(key=_paper_sort_key)
             result["paper"] = paper_list[:25]
             paper_ok = True
     except Exception:
         pass
 
-    if mojang_ok or paper_ok:
-        with _VERSIONS_CACHE_LOCK:
+    with _VERSIONS_CACHE_LOCK:
+        if mojang_ok or paper_ok:
             _VERSIONS_CACHE = dict(result)
             _VERSIONS_CACHE_TS = now
+            _VERSIONS_CACHE_FAIL_TS = 0.0
+        else:
+            _VERSIONS_CACHE_FAIL_TS = now
     return result
 
 
@@ -599,17 +1042,18 @@ def _resolve_mojang_server_with_sha1(version: str) -> Tuple[str, str, str]:
     with urllib.request.urlopen(req, timeout=20) as resp:
         manifest = json.loads(resp.read().decode("utf-8"))
     versions = manifest.get("versions", [])
-    resolved_ver = version
     if not versions:
         raise RuntimeError("Mojang version manifest returned no versions.")
     ver_url = next((v["url"] for v in versions if v.get("id") == version), None)
     if not ver_url:
-        resolved_ver = manifest.get("latest", {}).get("release", versions[0]["id"])
-        ver_url = next((v["url"] for v in versions if v.get("id") == resolved_ver), versions[0]["url"])
+        raise RuntimeError(
+            f"Minecraft version '{version}' was not found in Mojang's official release manifest. "
+            "Check Server Config and choose an exact supported version."
+        )
     with urllib.request.urlopen(urllib.request.Request(ver_url, headers={"User-Agent": USER_AGENT}), timeout=20) as resp:
         ver_data = json.loads(resp.read().decode("utf-8"))
     srv_info = ver_data["downloads"]["server"]
-    return srv_info["url"], resolved_ver, str(srv_info.get("sha1") or "").strip().lower()
+    return srv_info["url"], version, str(srv_info.get("sha1") or "").strip().lower()
 
 
 def resolve_mojang_server_url(version: str) -> Tuple[str, str]:
@@ -625,32 +1069,42 @@ def _resolve_papermc_or_mojang_with_checksum(
 ) -> Tuple[str, str, str, str, str]:
     """
     Returns (download_url, resolved_software, resolved_version, sha256_hex, sha1_hex).
+    Never silently substitutes Vanilla for Paper so existing Paper worlds and plugins cannot be corrupted.
     """
     headers = {"User-Agent": USER_AGENT}
     if software == "paper":
-        builds_url = f"https://fill.papermc.io/v3/projects/paper/versions/{version}/builds"
+        quoted_ver = urllib.parse.quote(version.strip(), safe="")
+        builds_url = f"https://fill.papermc.io/v3/projects/paper/versions/{quoted_ver}/builds"
         try:
             req = urllib.request.Request(builds_url, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as resp:
                 builds_data = json.loads(resp.read().decode("utf-8"))
-            if isinstance(builds_data, list) and len(builds_data) > 0:
-                sorted_builds = sorted(builds_data, key=lambda b: int(b.get("id", 0)), reverse=True)
-                chosen = next(
-                    (b for b in sorted_builds if b.get("channel") in ("STABLE", "RECOMMENDED")),
-                    sorted_builds[0],
-                )
-                dl = chosen.get("downloads", {})
-                for key in ("server:default", "application"):
-                    if key in dl and "url" in dl[key]:
-                        checksums = dl[key].get("checksums") if isinstance(dl[key], dict) else None
-                        sha256_hex = str((checksums or {}).get("sha256") or "").strip().lower()
-                        return dl[key]["url"], "paper", version, sha256_hex, ""
-        except Exception:
-            pass
-        if log_fn:
-            log_fn(
-                f"Note: PaperMC build not published yet for {version}; using official Mojang Vanilla {version} server.jar."
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                raise RuntimeError(
+                    f"PaperMC does not have a published build for Minecraft '{version}'. "
+                    "Choose another Paper version or explicitly switch Server Software to Vanilla in Server Config."
+                ) from e
+            raise RuntimeError(f"Failed to query PaperMC builds for Minecraft {version} (HTTP {e.code}).") from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to query PaperMC builds for Minecraft {version}: {e}") from e
+
+        if isinstance(builds_data, list) and len(builds_data) > 0:
+            sorted_builds = sorted(builds_data, key=lambda b: int(b.get("id", 0)), reverse=True)
+            chosen = next(
+                (b for b in sorted_builds if b.get("channel") in ("STABLE", "RECOMMENDED")),
+                sorted_builds[0],
             )
+            dl = chosen.get("downloads", {})
+            for key in ("server:default", "application"):
+                if key in dl and "url" in dl[key]:
+                    checksums = dl[key].get("checksums") if isinstance(dl[key], dict) else None
+                    sha256_hex = str((checksums or {}).get("sha256") or "").strip().lower()
+                    return dl[key]["url"], "paper", version, sha256_hex, ""
+        raise RuntimeError(
+            f"PaperMC returned no downloadable server builds for Minecraft '{version}'. "
+            "Select a supported version or explicitly switch Server Software to Vanilla."
+        )
 
     url, resolved_ver, sha1_hex = _resolve_mojang_server_with_sha1(version)
     return url, "vanilla", resolved_ver, "", sha1_hex
@@ -663,8 +1117,6 @@ def resolve_papermc_or_mojang_url(
 ) -> Tuple[str, str, str]:
     """
     Returns (download_url, resolved_software, resolved_version).
-    Uses PaperMC Fill v3 API (/v3/projects/paper/versions/{version}/builds)
-    and automatically falls back to Mojang Official Vanilla if Paper doesn't have a build for that version yet.
     """
     url, resolved_sw, resolved_ver, _, _ = _resolve_papermc_or_mojang_with_checksum(
         software, version, log_fn=log_fn
@@ -684,14 +1136,22 @@ def list_installed_jars(bin_dir: Path) -> List[Dict[str, Any]]:
     jars_dir = bin_dir / "jars"
     if not jars_dir.exists():
         return []
-    out: List[Dict[str, Any]] = []
-    for f in sorted(jars_dir.glob("server-*.jar"), key=lambda p: p.stat().st_mtime, reverse=True):
-        out.append({
-            "name": f.name,
-            "path": str(f),
-            "sizeMb": round(f.stat().st_size / (1024 * 1024), 2),
-        })
-    return out
+    items: List[Tuple[float, Dict[str, Any]]] = []
+    for f in jars_dir.glob("server-*.jar"):
+        try:
+            st = f.stat()
+            items.append((
+                st.st_mtime,
+                {
+                    "name": f.name,
+                    "path": str(f),
+                    "sizeMb": round(st.st_size / (1024 * 1024), 2),
+                },
+            ))
+        except OSError:
+            continue
+    items.sort(key=lambda pair: pair[0], reverse=True)
+    return [entry for _, entry in items]
 
 
 def ensure_paperclip_mojang_cache(
@@ -737,7 +1197,7 @@ def ensure_paperclip_mojang_cache(
 
         if log_fn:
             log_fn(f"Pre-caching Paperclip base jar ({filename}) for fast startup...")
-        tmp_cache = target_cache_jar.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}.jar")
+        tmp_cache = target_cache_jar.parent / f".{target_cache_jar.name}.tmp.{os.getpid()}.{threading.get_ident()}.part"
         last_pct = [-1]
 
         def _on_progress(pct: int, downloaded: int, total: int) -> None:
@@ -815,7 +1275,7 @@ def ensure_server_jar(
     if log_fn:
         log_fn(f"Downloading Minecraft {resolved_sw.upper()} {resolved_ver} server.jar...")
 
-    tmp_jar = target_jar.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}.jar")
+    tmp_jar = target_jar.parent / f".{target_jar.name}.tmp.{os.getpid()}.{threading.get_ident()}.part"
     last_pct = [-1]
 
     def _on_progress(pct: int, downloaded: int, total: int) -> None:
